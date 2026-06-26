@@ -430,6 +430,10 @@ struct Inner {
     /// Lifetime delivered work (diff-1 share units) + accepted shares.
     delivered_work: f64,
     accepted_shares: u64,
+    /// Shares the miner submitted (for the accept-ratio health/fraud signal).
+    submitted_shares: u64,
+    /// Edge-trigger so the low-accept-ratio warning is logged once.
+    accept_low_logged: bool,
     label: String,
 }
 
@@ -652,6 +656,19 @@ impl Sv2Session {
                 }
                 debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted shares");
             }
+            // Accept-ratio health/fraud signal (logged once).
+            if !i.accept_low_logged
+                && crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares)
+            {
+                i.accept_low_logged = true;
+                warn!(
+                    worker = %i.label,
+                    accepted = i.accepted_shares,
+                    submitted = i.submitted_shares,
+                    ratio = crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
+                    "low accept ratio — possible pool under-reporting or misbehaving miner"
+                );
+            }
         }
 
         // Forward to the miner with the channel id remapped.
@@ -682,6 +699,9 @@ impl Sv2Session {
             hashrate_hs: i.hashrate.hashes_per_second(),
             delivered_work: i.delivered_work,
             accepted_shares: i.accepted_shares,
+            submitted_shares: i.submitted_shares,
+            accept_ratio: crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
+            accept_ratio_low: crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares),
             protocol: "sv2",
         }
     }
@@ -765,6 +785,8 @@ pub async fn handle_seller_miner_sv2(
             hashrate: HashrateWindow::new(Duration::from_secs(600)),
             delivered_work: 0.0,
             accepted_shares: 0,
+            submitted_shares: 0,
+            accept_low_logged: false,
             label: worker.clone(),
         }),
     });
@@ -832,13 +854,30 @@ pub async fn handle_seller_miner_sv2(
                     }
                 }
             } else if wire::is_channel_scoped(mt) {
-                let i = session.inner.lock().await;
-                let down_cid = wire::read_channel_id(&mut frame);
-                if let Some(up_cid) = i.up_for_down(down_cid) {
-                    wire::rewrite_channel_id(&mut frame, up_cid);
-                    let _ = i.active.to_up.send(frame.into());
-                } else {
-                    debug!(down_cid, "no channel mapping for downstream frame; dropping");
+                let is_submit = matches!(
+                    mt,
+                    mining::MESSAGE_TYPE_SUBMIT_SHARES_STANDARD
+                        | mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED
+                );
+                let mut submit_order: Option<String> = None;
+                {
+                    let mut i = session.inner.lock().await;
+                    let down_cid = wire::read_channel_id(&mut frame);
+                    if let Some(up_cid) = i.up_for_down(down_cid) {
+                        if is_submit {
+                            i.submitted_shares += 1;
+                            if let Routing::Rented { order_id, .. } = &i.routing {
+                                submit_order = Some(order_id.clone());
+                            }
+                        }
+                        wire::rewrite_channel_id(&mut frame, up_cid);
+                        let _ = i.active.to_up.send(frame.into());
+                    } else {
+                        debug!(down_cid, "no channel mapping for downstream frame; dropping");
+                    }
+                }
+                if let Some(order_id) = submit_order {
+                    session.orders.add_submitted(&order_id, 1).await;
                 }
             } else {
                 debug!(mt, "ignoring non-channel-scoped downstream message");
@@ -1482,6 +1521,7 @@ mod tests {
             credited = orders.get(&order.id).await.unwrap();
         }
         assert_eq!(credited.accepted_shares, k, "accepted shares credited to order");
+        assert_eq!(credited.submitted_shares, k, "submitted shares tracked on order");
         let expected = difficulty_from_target(&diff1_target()) * k as f64;
         assert!(credited.delivered_work > 0.0, "delivered work measured");
         assert!(

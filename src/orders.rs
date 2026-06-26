@@ -55,6 +55,10 @@ pub struct Order {
     /// Count of accepted shares credited to this rental.
     #[serde(default)]
     pub accepted_shares: u64,
+    /// Count of shares the miner submitted during this rental. Together with
+    /// `accepted_shares` gives the accept-ratio (a fraud/health signal).
+    #[serde(default)]
+    pub submitted_shares: u64,
 }
 
 impl Order {
@@ -92,6 +96,7 @@ impl OrderStore {
             status: OrderStatus::Active,
             delivered_work: 0.0,
             accepted_shares: 0,
+            submitted_shares: 0,
         };
         self.inner.lock().await.insert(id, order.clone());
         let _ = self.save().await;
@@ -123,6 +128,14 @@ impl OrderStore {
         if let Some(o) = map.get_mut(id) {
             o.delivered_work += work;
             o.accepted_shares += accepted_shares;
+        }
+    }
+
+    /// Count submitted shares against an order (for the accept-ratio).
+    pub async fn add_submitted(&self, id: &str, submitted: u64) {
+        let mut map = self.inner.lock().await;
+        if let Some(o) = map.get_mut(id) {
+            o.submitted_shares += submitted;
         }
     }
 

@@ -58,6 +58,10 @@ struct Inner {
     /// Lifetime delivered work (diff-1 share units) + accepted shares.
     delivered_work: f64,
     accepted_shares: u64,
+    /// Shares the miner submitted (for the accept-ratio health/fraud signal).
+    submitted_shares: u64,
+    /// Edge-trigger so the low-accept-ratio warning is logged once.
+    accept_low_logged: bool,
     routing: Routing,
     default_target: UpstreamTarget,
     /// Miner's `mining.configure` (remembered to replay to each upstream).
@@ -187,6 +191,18 @@ impl Session {
                             debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted share");
                         }
                     }
+                    if !i.accept_low_logged
+                        && crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares)
+                    {
+                        i.accept_low_logged = true;
+                        warn!(
+                            worker = %i.label,
+                            accepted = i.accepted_shares,
+                            submitted = i.submitted_shares,
+                            ratio = crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
+                            "low accept ratio — possible pool under-reporting or misbehaving miner"
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -201,40 +217,50 @@ impl Session {
     /// the active upstream. `registry`/`self_arc` let an `authorize` register
     /// the session under the miner's worker name.
     async fn on_miner_msg(self: &Arc<Self>, mut msg: RpcMessage, registry: &Arc<Registry>) {
-        let mut i = self.inner.lock().await;
-        match msg.method.as_deref() {
-            Some("mining.authorize") => {
-                if let Some(w) = msg
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|v| v.as_str())
-                {
-                    i.label = w.to_string();
-                    registry.insert(w.to_string(), AnySession::Sv1(self.clone())).await;
+        let mut submit_order: Option<String> = None;
+        {
+            let mut i = self.inner.lock().await;
+            match msg.method.as_deref() {
+                Some("mining.authorize") => {
+                    if let Some(w) = msg
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                    {
+                        i.label = w.to_string();
+                        registry.insert(w.to_string(), AnySession::Sv1(self.clone())).await;
+                    }
+                    msg.params = Some(json!([i.active.target.user, i.active.target.password]));
                 }
-                msg.params = Some(json!([i.active.target.user, i.active.target.password]));
-            }
-            Some("mining.submit") => {
-                let diff = i.current_difficulty;
-                let g = i.active.generation;
-                i.pending.insert(id_key(&msg.id), (g, diff));
-                if let Some(arr) = msg.params.as_mut().and_then(|p| p.as_array_mut()) {
-                    if let Some(first) = arr.first_mut() {
-                        *first = json!(i.active.target.user);
+                Some("mining.submit") => {
+                    let diff = i.current_difficulty;
+                    let g = i.active.generation;
+                    i.pending.insert(id_key(&msg.id), (g, diff));
+                    i.submitted_shares += 1;
+                    if let Routing::Rented { order_id, .. } = &i.routing {
+                        submit_order = Some(order_id.clone());
+                    }
+                    if let Some(arr) = msg.params.as_mut().and_then(|p| p.as_array_mut()) {
+                        if let Some(first) = arr.first_mut() {
+                            *first = json!(i.active.target.user);
+                        }
                     }
                 }
+                Some("mining.extranonce.subscribe") => {
+                    i.extranonce_capable = true;
+                }
+                Some("mining.configure") => {
+                    i.configure = Some(msg.clone());
+                }
+                _ => {}
             }
-            Some("mining.extranonce.subscribe") => {
-                i.extranonce_capable = true;
-            }
-            Some("mining.configure") => {
-                i.configure = Some(msg.clone());
-            }
-            _ => {}
+            let _ = i.active.to_up.send(msg.to_line());
         }
-        let _ = i.active.to_up.send(msg.to_line());
+        if let Some(order_id) = submit_order {
+            self.orders.add_submitted(&order_id, 1).await;
+        }
     }
 
     pub async fn worker_label(&self) -> String {
@@ -256,6 +282,9 @@ impl Session {
             hashrate_hs: i.hashrate.hashes_per_second(),
             delivered_work: i.delivered_work,
             accepted_shares: i.accepted_shares,
+            submitted_shares: i.submitted_shares,
+            accept_ratio: crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
+            accept_ratio_low: crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares),
             protocol: "sv1",
         }
     }
@@ -435,6 +464,8 @@ pub async fn handle_seller_miner(
             hashrate: HashrateWindow::new(Duration::from_secs(600)),
             delivered_work: 0.0,
             accepted_shares: 0,
+            submitted_shares: 0,
+            accept_low_logged: false,
             routing: Routing::Idle,
             default_target: default_target.clone(),
             configure: None,

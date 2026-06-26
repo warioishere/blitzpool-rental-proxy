@@ -10,6 +10,29 @@ use std::sync::Arc;
 
 use crate::session::UpstreamTarget;
 
+/// Minimum submitted-share sample before the accept-ratio is considered
+/// meaningful (avoids flagging on early startup noise).
+pub const ACCEPT_RATIO_MIN_SAMPLE: u64 = 50;
+/// Accept-ratio (accepted/submitted) below which a session is flagged — a
+/// possible sign the buyer's pool is under-reporting accepted shares (or the
+/// miner is producing many stale/invalid shares). A signal to investigate, not
+/// proof; the UI/operator can apply a stricter policy on the raw counts.
+pub const ACCEPT_RATIO_THRESHOLD: f64 = 0.75;
+
+/// Accept-ratio = accepted/submitted (1.0 when nothing submitted yet).
+pub fn accept_ratio(accepted: u64, submitted: u64) -> f64 {
+    if submitted == 0 {
+        1.0
+    } else {
+        accepted as f64 / submitted as f64
+    }
+}
+
+/// Whether the accept-ratio is low enough to flag (with a meaningful sample).
+pub fn accept_ratio_low(accepted: u64, submitted: u64) -> bool {
+    submitted >= ACCEPT_RATIO_MIN_SAMPLE && accept_ratio(accepted, submitted) < ACCEPT_RATIO_THRESHOLD
+}
+
 /// API-facing snapshot of a live session.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionStatus {
@@ -25,6 +48,13 @@ pub struct SessionStatus {
     pub delivered_work: f64,
     /// Lifetime accepted shares this session.
     pub accepted_shares: u64,
+    /// Lifetime shares submitted by the miner this session.
+    pub submitted_shares: u64,
+    /// accepted/submitted (1.0 if nothing submitted yet).
+    pub accept_ratio: f64,
+    /// True when the accept-ratio is suspiciously low (possible pool
+    /// under-reporting or a misbehaving miner).
+    pub accept_ratio_low: bool,
     /// `"sv1"` or `"sv2"`.
     pub protocol: &'static str,
 }
@@ -90,5 +120,29 @@ impl AnySession {
             #[cfg(feature = "sv2")]
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_ratio_basic() {
+        assert_eq!(accept_ratio(0, 0), 1.0); // nothing submitted yet
+        assert_eq!(accept_ratio(9, 10), 0.9);
+        assert_eq!(accept_ratio(0, 10), 0.0);
+    }
+
+    #[test]
+    fn accept_ratio_flag_needs_sample_and_low_ratio() {
+        // Below threshold but too few samples → not flagged.
+        assert!(!accept_ratio_low(0, 10));
+        // Enough samples, healthy ratio → not flagged.
+        assert!(!accept_ratio_low(95, 100));
+        // Enough samples, low ratio → flagged.
+        assert!(accept_ratio_low(40, 100));
+        // Exactly at the minimum sample, zero accepted → flagged.
+        assert!(accept_ratio_low(0, ACCEPT_RATIO_MIN_SAMPLE));
     }
 }
