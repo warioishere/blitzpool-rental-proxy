@@ -8,4 +8,5 @@
 //! A future `ProtocolAdapter` trait will unify them once SV2 lands; until then
 //! SV1 is wired directly.
 
+pub mod relay;
 pub mod sv1;

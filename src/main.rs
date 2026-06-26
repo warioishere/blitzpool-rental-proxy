@@ -29,6 +29,14 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::from_env();
     info!(listen = %cfg.listen, "stratum-rental-proxy starting");
 
+    // M1: one default upstream for everyone (per-seller config = M3,
+    // rentals = M2). Without it there's nothing to relay to.
+    let upstream = cfg.default_upstream.clone().context(
+        "set RENTAL_PROXY_POOL_URL (+ _USER/_PASS) — milestone 1 relays every \
+         miner to this default upstream",
+    )?;
+    info!(upstream = %upstream.url, "default upstream");
+
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
@@ -42,12 +50,12 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+        let upstream = upstream.clone();
         tokio::spawn(async move {
-            // Next: SV1 handshake + connect the seller's default upstream +
-            // relay (proto::sv1), with the routing/switch driven by the
-            // control layer.
-            info!(%peer, "seller miner connected (relay not yet wired)");
-            let _ = sock;
+            let peer = peer.to_string();
+            if let Err(e) = proto::relay::handle_seller_miner(sock, peer.clone(), upstream).await {
+                warn!(%peer, error = %e, "relay ended with error");
+            }
         });
     }
 }
