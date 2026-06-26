@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::sv1::RpcMessage;
+use crate::orders::OrderStore;
 use crate::registry::Registry;
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 use crate::store::SellerStore;
@@ -372,6 +373,7 @@ pub async fn handle_seller_miner(
     default_target: UpstreamTarget,
     registry: Arc<Registry>,
     sellers: Arc<SellerStore>,
+    orders: Arc<OrderStore>,
 ) -> anyhow::Result<()> {
     let _ = miner.set_nodelay(true);
     let (miner_r, miner_w) = miner.into_split();
@@ -489,10 +491,15 @@ pub async fn handle_seller_miner(
                         None
                     };
                     session.on_miner_msg(msg, &registry).await;
-                    // On authorize, apply this seller's configured default pool
-                    // (if any) when it differs from the process-wide default.
+                    // On authorize: resume an active rental if one exists,
+                    // else apply this seller's configured default pool.
                     if let Some(w) = auth_worker {
-                        if let Some(def) = sellers.get(&w).await {
+                        if let Some(o) = orders.active_for_worker(&w, crate::orders::now_ms()).await {
+                            match session.switch_to(o.id.clone(), o.target.clone()).await {
+                                Ok(()) => info!(worker = %w, order = %o.id, upstream = %o.target.url, "resumed active rental"),
+                                Err(e) => warn!(worker = %w, error = %e, "resume rental failed"),
+                            }
+                        } else if let Some(def) = sellers.get(&w).await {
                             if session.default_target().await != def {
                                 match session.set_default(def.clone()).await {
                                     Ok(()) => info!(worker = %w, upstream = %def.url, "applied seller default pool"),

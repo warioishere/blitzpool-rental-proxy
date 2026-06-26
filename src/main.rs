@@ -11,6 +11,7 @@
 
 mod api;
 mod config;
+mod orders;
 mod proto;
 mod registry;
 mod session;
@@ -47,12 +48,21 @@ async fn main() -> anyhow::Result<()> {
         .into();
     let sellers = store::SellerStore::load(sellers_path).await;
 
+    let orders_path = std::env::var("RENTAL_PROXY_ORDERS")
+        .unwrap_or_else(|_| "orders.json".into())
+        .into();
+    let orders = orders::OrderStore::load(orders_path).await;
+
+    // Auto-revert expired rentals.
+    orders::spawn_expiry(orders.clone(), registry.clone());
+
     // HTTP control API — the proxy is fully steerable here; the web UI calls it.
     let api_addr = std::env::var("RENTAL_PROXY_API").unwrap_or_else(|_| "127.0.0.1:8080".into());
     {
         let state = api::AppState {
             registry: registry.clone(),
             sellers: sellers.clone(),
+            orders: orders.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = api::serve(api_addr, state).await {
@@ -77,11 +87,13 @@ async fn main() -> anyhow::Result<()> {
         let upstream = upstream.clone();
         let registry = registry.clone();
         let sellers = sellers.clone();
+        let orders = orders.clone();
         tokio::spawn(async move {
             let peer = peer.to_string();
-            if let Err(e) =
-                proto::relay::handle_seller_miner(sock, peer.clone(), upstream, registry, sellers)
-                    .await
+            if let Err(e) = proto::relay::handle_seller_miner(
+                sock, peer.clone(), upstream, registry, sellers, orders,
+            )
+            .await
             {
                 warn!(%peer, error = %e, "relay ended with error");
             }

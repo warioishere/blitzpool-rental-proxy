@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::orders::OrderStore;
 use crate::registry::Registry;
 use crate::session::UpstreamTarget;
 use crate::store::SellerStore;
@@ -30,6 +31,7 @@ use crate::store::SellerStore;
 pub struct AppState {
     pub registry: Arc<Registry>,
     pub sellers: Arc<SellerStore>,
+    pub orders: Arc<OrderStore>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -44,6 +46,8 @@ pub fn router(state: AppState) -> Router {
             "/api/sellers/{worker}",
             put(set_seller).delete(delete_seller),
         )
+        .route("/api/orders", get(list_orders).post(create_order))
+        .route("/api/orders/{id}", get(get_order).delete(cancel_order))
         .with_state(state)
 }
 
@@ -173,6 +177,63 @@ async fn delete_seller(
     Ok(Json(json!({"ok": true, "removed": removed})))
 }
 
+async fn list_orders(State(s): State<AppState>) -> Json<Value> {
+    Json(json!({ "orders": s.orders.list().await }))
+}
+
+async fn get_order(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    match s.orders.get(&id).await {
+        Some(o) => Ok(Json(json!(o))),
+        None => Err((StatusCode::NOT_FOUND, "order not found".into())),
+    }
+}
+
+#[derive(Deserialize)]
+struct OrderReq {
+    worker: String,
+    url: String,
+    user: String,
+    #[serde(default)]
+    pass: String,
+    /// Auto-revert deadline in epoch ms; `0`/absent = open-ended.
+    #[serde(default)]
+    until_ms: i64,
+}
+
+/// Create a rental order: records it and, if the worker is connected, switches
+/// its hashrate to the buyer's target now. `applied=false` means the order is
+/// stored and will take effect when the miner connects.
+async fn create_order(
+    State(s): State<AppState>,
+    Json(req): Json<OrderReq>,
+) -> Json<Value> {
+    let target = UpstreamTarget {
+        url: req.url,
+        user: req.user,
+        password: req.pass,
+    };
+    let order = s.orders.create(req.worker.clone(), target.clone(), req.until_ms).await;
+    let mut applied = false;
+    if let Some(sess) = s.registry.get(&req.worker).await {
+        applied = sess.switch_to(order.id.clone(), target).await.is_ok();
+    }
+    Json(json!({"ok": true, "order": order, "applied": applied}))
+}
+
+/// Cancel an order; if the worker is connected, revert it to its default pool.
+async fn cancel_order(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let order = s
+        .orders
+        .cancel(&id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
+    let mut reverted = false;
+    if let Some(sess) = s.registry.get(&order.worker).await {
+        reverted = sess.revert().await.is_ok();
+    }
+    Ok(Json(json!({"ok": true, "reverted": reverted})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,11 +243,15 @@ mod tests {
     use tower::ServiceExt;
 
     async fn app() -> Router {
-        let p = std::env::temp_dir().join(format!("srp_api_{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        let pid = std::process::id();
+        let sp = std::env::temp_dir().join(format!("srp_api_sellers_{pid}.json"));
+        let op = std::env::temp_dir().join(format!("srp_api_orders_{pid}.json"));
+        let _ = std::fs::remove_file(&sp);
+        let _ = std::fs::remove_file(&op);
         router(AppState {
             registry: Registry::new(),
-            sellers: SellerStore::load(p).await,
+            sellers: SellerStore::load(sp).await,
+            orders: crate::orders::OrderStore::load(op).await,
         })
     }
 
@@ -257,5 +322,29 @@ mod tests {
             .unwrap();
         let v = body_json(resp).await;
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["url"], "poolA:3333");
+    }
+
+    #[tokio::test]
+    async fn create_order_for_offline_worker_is_recorded_not_applied() {
+        let app = app().await;
+        let post = Request::post("/api/orders")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"worker":"bc1qSELLER.rig1","url":"buyer:3333","user":"b","pass":"x","until_ms":0}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(post).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["applied"], false); // worker not connected
+        assert_eq!(v["order"]["worker"], "bc1qSELLER.rig1");
+
+        let resp = app
+            .oneshot(Request::get("/api/orders").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["orders"].as_array().unwrap().len(), 1);
     }
 }
