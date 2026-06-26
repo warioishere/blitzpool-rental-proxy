@@ -715,7 +715,7 @@ pub async fn handle_seller_miner_sv2(
             Ok(()) => info!(%worker, order = %order.id, "resumed active rental"),
             Err(e) => warn!(%worker, error = %e, "resume rental failed"),
         }
-    } else if let Some(def) = ctx.sellers.get(&worker).await {
+    } else if let Some(def) = ctx.sellers.default_pool(&worker).await {
         if session.default_target().await != def {
             match session.set_default(def.clone()).await {
                 Ok(()) => info!(%worker, upstream = %def.url, "applied seller default pool"),

@@ -137,6 +137,7 @@ async fn list_sellers(State(s): State<AppState>) -> Json<Value> {
 
 #[derive(Deserialize)]
 struct SellerReq {
+    /// Idle/default pool.
     url: String,
     user: String,
     #[serde(default)]
@@ -144,10 +145,23 @@ struct SellerReq {
     /// SV2 only: pool Noise authority public key (base58).
     #[serde(default)]
     authority: Option<String>,
+    /// Marketplace listing: advertised hashrate + pricing.
+    #[serde(default)]
+    advertised_ths: f64,
+    #[serde(default)]
+    price_per_th_day: f64,
+    #[serde(default)]
+    price_min_per_th_day: f64,
+    #[serde(default)]
+    price_max_per_th_day: f64,
+    /// Seller payout address (e.g. BTC) for rental earnings.
+    #[serde(default)]
+    payout_address: Option<String>,
 }
 
-/// Set a seller's default pool. Applies to the next connect; if the worker is
-/// connected and idle, the change is pushed live.
+/// Register/update a seller's rig: idle/default pool plus the marketplace
+/// listing (advertised hashrate + price). Applies the default pool live if the
+/// worker is connected and idle.
 async fn set_seller(
     State(s): State<AppState>,
     Path(worker): Path<String>,
@@ -159,11 +173,19 @@ async fn set_seller(
         password: req.pass,
         authority_pubkey: req.authority,
     };
+    let rig = crate::store::Rig {
+        default_pool: target.clone(),
+        advertised_ths: req.advertised_ths,
+        price_per_th_day: req.price_per_th_day,
+        price_min_per_th_day: req.price_min_per_th_day,
+        price_max_per_th_day: req.price_max_per_th_day,
+        payout_address: req.payout_address,
+    };
     s.sellers
-        .set(worker.clone(), target.clone())
+        .set(worker.clone(), rig)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // If connected + idle, apply now.
+    // If connected + idle, apply the default pool now.
     if let Some(sess) = s.registry.get(&worker).await {
         let routing = sess.status().await.routing;
         if routing == "idle" {
@@ -323,7 +345,9 @@ mod tests {
         let app = app().await;
         let put = Request::put("/api/sellers/bc1qSELLER.rig1")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"url":"poolA:3333","user":"acct","pass":"x"}"#))
+            .body(Body::from(
+                r#"{"url":"poolA:3333","user":"acct","pass":"x","advertised_ths":220,"price_per_th_day":0.05}"#,
+            ))
             .unwrap();
         let resp = app.clone().oneshot(put).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -333,7 +357,8 @@ mod tests {
             .await
             .unwrap();
         let v = body_json(resp).await;
-        assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["url"], "poolA:3333");
+        assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["default_pool"]["url"], "poolA:3333");
+        assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["advertised_ths"], 220.0);
     }
 
     #[tokio::test]
