@@ -11,6 +11,7 @@
 
 mod api;
 mod config;
+mod control;
 mod orders;
 mod proto;
 mod registry;
@@ -92,11 +93,11 @@ async fn main() -> anyhow::Result<()> {
     match cfg.protocol {
         Protocol::Sv1 => accept_loop(listener, proto::relay::Sv1Adapter, ctx).await,
         Protocol::Sv2 => {
-            warn!(
-                "RENTAL_PROXY_PROTOCOL=sv2: the SV2 downstream relay is not implemented \
-                 yet — connections will be refused. Use sv1 until the SV2 milestone lands."
-            );
-            accept_loop(listener, proto::sv2::Sv2Adapter, ctx).await
+            // `default()` generates/loads the Noise key in the real adapter; in
+            // a non-`sv2` build the adapter is a unit stub (hence the allow).
+            #[allow(clippy::default_constructed_unit_structs)]
+            let adapter = proto::sv2::Sv2Adapter::default();
+            accept_loop(listener, adapter, ctx).await
         }
     }
 }

@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use super::adapter::{DownstreamAdapter, ProxyContext};
 use super::sv1::RpcMessage;
+use crate::control::{AnySession, SessionStatus};
 use crate::registry::Registry;
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 
@@ -195,7 +196,7 @@ impl Session {
                     .and_then(|v| v.as_str())
                 {
                     i.label = w.to_string();
-                    registry.insert(w.to_string(), self.clone()).await;
+                    registry.insert(w.to_string(), AnySession::Sv1(self.clone())).await;
                 }
                 msg.params = Some(json!([i.active.target.user, i.active.target.password]));
             }
@@ -237,18 +238,9 @@ impl Session {
             order_id,
             upstream_url: i.active.target.url.clone(),
             hashrate_hs: i.hashrate.hashes_per_second(),
+            protocol: "sv1",
         }
     }
-}
-
-/// API-facing snapshot of a live session.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SessionStatus {
-    pub worker: String,
-    pub routing: String,
-    pub order_id: Option<String>,
-    pub upstream_url: String,
-    pub hashrate_hs: f64,
 }
 
 fn id_key(id: &Option<Value>) -> String {
@@ -538,7 +530,7 @@ pub async fn handle_seller_miner(
 
     // Teardown: deregister + abort upstream + writer.
     let worker = session.worker_label().await;
-    registry.remove_if(&worker, &session).await;
+    registry.remove_if(&worker, &AnySession::Sv1(session.clone())).await;
     {
         let i = session.inner.lock().await;
         i.active.reader.abort();
