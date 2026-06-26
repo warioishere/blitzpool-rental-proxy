@@ -7,14 +7,15 @@
 //! proxy with a swappable upstream — handshake on both sides, channel open
 //! (Standard or Extended, mirrored upstream), bidirectional forwarding with
 //! `channel_id` remapping, and a live rental switch via `SetExtranoncePrefix` +
-//! `SetTarget` (the miner never reconnects). Proven end-to-end over loopback
-//! Noise sockets against mock pools (see `relay::tests`), plus the
-//! lower-level [`foundation`] (handshake + frame round-trips) and [`wire`]
-//! plumbing. Without the feature the adapter is a stub that refuses loudly
-//! (never silently accepts then drops a miner).
-//!
-//! Scope: one mining channel per connection (single-rig); a second
-//! `OpenMiningChannel` on the same connection is logged and ignored.
+//! `SetTarget` (the miner never reconnects). Supports **multiple mining
+//! channels per connection** (each mapped independently; the switch re-opens
+//! and re-points them all). Upstream pools can be **authenticated** via their
+//! Noise authority public key (`UpstreamTarget::authority_pubkey`); when unset
+//! the link is encrypted but unauthenticated. Proven end-to-end over loopback
+//! Noise sockets against mock pools (see `relay::tests`), plus the lower-level
+//! [`foundation`] (handshake + frame round-trips) and [`wire`] plumbing.
+//! Without the feature the adapter is a stub that refuses loudly (never
+//! silently accepts then drops a miner).
 //!
 //! # Dependencies
 //!

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 const DIFF1_HASHES: f64 = 4_294_967_296.0;
 
 /// An upstream the proxy connects to as a client (a pool).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpstreamTarget {
     /// `host:port`.
     pub url: String,
@@ -16,6 +16,11 @@ pub struct UpstreamTarget {
     pub user: String,
     #[serde(default)]
     pub password: String,
+    /// SV2 only: the pool's Noise authority public key (base58). When set, the
+    /// proxy verifies it during the upstream handshake; when `None`, the link is
+    /// encrypted but unauthenticated. Ignored by the SV1 adapter.
+    #[serde(default)]
+    pub authority_pubkey: Option<String>,
 }
 
 /// Where a seller miner's hashrate currently goes.
@@ -126,6 +131,7 @@ mod tests {
             url: "pool.a:3333".into(),
             user: "seller".into(),
             password: "x".into(),
+            authority_pubkey: None,
         };
         let mut s = Session::new("seller1", def.clone());
         assert_eq!(s.current_upstream(), &def);
@@ -134,6 +140,7 @@ mod tests {
             url: "buyer-pool:3333".into(),
             user: "buyer".into(),
             password: "x".into(),
+            authority_pubkey: None,
         };
         s.routing = Routing::Rented {
             order_id: "o1".into(),

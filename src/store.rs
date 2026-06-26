@@ -75,6 +75,7 @@ mod tests {
             url: url.into(),
             user: "acct".into(),
             password: "x".into(),
+            authority_pubkey: None,
         }
     }
 

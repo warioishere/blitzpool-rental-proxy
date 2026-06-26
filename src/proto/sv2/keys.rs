@@ -67,6 +67,20 @@ impl NoiseKeys {
     }
 }
 
+/// Parse a pool's Noise authority public key (base58) for upstream
+/// authentication. `None`/empty → unauthenticated (encrypted only).
+pub fn parse_authority(pubkey: &Option<String>) -> anyhow::Result<Option<Secp256k1PublicKey>> {
+    match pubkey.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            let key: Secp256k1PublicKey = s
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid pool authority public key (base58)"))?;
+            Ok(Some(key))
+        }
+        None => Ok(None),
+    }
+}
+
 trait IntoInnerSecret {
     fn into_inner(self) -> SecretKey;
 }

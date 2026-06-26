@@ -66,6 +66,7 @@ impl Config {
                 url,
                 user: std::env::var("RENTAL_PROXY_POOL_USER").unwrap_or_default(),
                 password: std::env::var("RENTAL_PROXY_POOL_PASS").unwrap_or_else(|_| "x".into()),
+                authority_pubkey: std::env::var("RENTAL_PROXY_POOL_AUTHORITY").ok(),
             });
         }
         c

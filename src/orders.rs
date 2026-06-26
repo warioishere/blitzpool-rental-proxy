@@ -176,6 +176,7 @@ mod tests {
             url: "buyer:3333".into(),
             user: "b".into(),
             password: "x".into(),
+            authority_pubkey: None,
         }
     }
 

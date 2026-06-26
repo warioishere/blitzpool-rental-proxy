@@ -84,6 +84,9 @@ struct RentReq {
     user: String,
     #[serde(default)]
     pass: String,
+    /// SV2 only: pool Noise authority public key (base58).
+    #[serde(default)]
+    authority: Option<String>,
     #[serde(default)]
     order_id: Option<String>,
     #[serde(default)]
@@ -105,6 +108,7 @@ async fn rent(
         url: req.url,
         user: req.user,
         password: req.pass,
+        authority_pubkey: req.authority,
     };
     sess.switch_to(req.order_id.unwrap_or_default(), target)
         .await
@@ -137,6 +141,9 @@ struct SellerReq {
     user: String,
     #[serde(default)]
     pass: String,
+    /// SV2 only: pool Noise authority public key (base58).
+    #[serde(default)]
+    authority: Option<String>,
 }
 
 /// Set a seller's default pool. Applies to the next connect; if the worker is
@@ -150,6 +157,7 @@ async fn set_seller(
         url: req.url,
         user: req.user,
         password: req.pass,
+        authority_pubkey: req.authority,
     };
     s.sellers
         .set(worker.clone(), target.clone())
@@ -195,6 +203,9 @@ struct OrderReq {
     user: String,
     #[serde(default)]
     pass: String,
+    /// SV2 only: pool Noise authority public key (base58).
+    #[serde(default)]
+    authority: Option<String>,
     /// Auto-revert deadline in epoch ms; `0`/absent = open-ended.
     #[serde(default)]
     until_ms: i64,
@@ -211,6 +222,7 @@ async fn create_order(
         url: req.url,
         user: req.user,
         password: req.pass,
+        authority_pubkey: req.authority,
     };
     let order = s.orders.create(req.worker.clone(), target.clone(), req.until_ms).await;
     let mut applied = false;
