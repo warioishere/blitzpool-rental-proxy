@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -24,10 +24,12 @@ use tracing::info;
 
 use crate::registry::Registry;
 use crate::session::UpstreamTarget;
+use crate::store::SellerStore;
 
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<Registry>,
+    pub sellers: Arc<SellerStore>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -37,6 +39,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{worker}", get(get_session))
         .route("/api/sessions/{worker}/rent", post(rent))
         .route("/api/sessions/{worker}/release", post(release))
+        .route("/api/sellers", get(list_sellers))
+        .route(
+            "/api/sellers/{worker}",
+            put(set_seller).delete(delete_seller),
+        )
         .with_state(state)
 }
 
@@ -116,6 +123,56 @@ async fn release(
     Ok(Json(json!({"ok": true})))
 }
 
+async fn list_sellers(State(s): State<AppState>) -> Json<Value> {
+    Json(json!({ "sellers": s.sellers.list().await }))
+}
+
+#[derive(Deserialize)]
+struct SellerReq {
+    url: String,
+    user: String,
+    #[serde(default)]
+    pass: String,
+}
+
+/// Set a seller's default pool. Applies to the next connect; if the worker is
+/// connected and idle, the change is pushed live.
+async fn set_seller(
+    State(s): State<AppState>,
+    Path(worker): Path<String>,
+    Json(req): Json<SellerReq>,
+) -> Result<Json<Value>, ApiError> {
+    let target = UpstreamTarget {
+        url: req.url,
+        user: req.user,
+        password: req.pass,
+    };
+    s.sellers
+        .set(worker.clone(), target.clone())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // If connected + idle, apply now.
+    if let Some(sess) = s.registry.get(&worker).await {
+        let routing = sess.status().await.routing;
+        if routing == "idle" {
+            let _ = sess.set_default(target).await;
+        }
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_seller(
+    State(s): State<AppState>,
+    Path(worker): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let removed = s
+        .sellers
+        .remove(&worker)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({"ok": true, "removed": removed})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,15 +181,24 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn app() -> Router {
+    async fn app() -> Router {
+        let p = std::env::temp_dir().join(format!("srp_api_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
         router(AppState {
             registry: Registry::new(),
+            sellers: SellerStore::load(p).await,
         })
+    }
+
+    async fn body_json(resp: axum::response::Response) -> Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]
     async fn health_ok() {
         let resp = app()
+            .await
             .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -142,12 +208,12 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_empty() {
         let resp = app()
+            .await
             .oneshot(Request::get("/api/sessions").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let v: Value = serde_json::from_slice(&body).unwrap();
+        let v = body_json(resp).await;
         assert_eq!(v["sessions"].as_array().unwrap().len(), 0);
     }
 
@@ -157,13 +223,14 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(r#"{"url":"x:1","user":"u"}"#))
             .unwrap();
-        let resp = app().oneshot(req).await.unwrap();
+        let resp = app().await.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn release_unknown_worker_is_404() {
         let resp = app()
+            .await
             .oneshot(
                 Request::post("/api/sessions/ghost/release")
                     .body(Body::empty())
@@ -172,5 +239,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sellers_set_then_list() {
+        let app = app().await;
+        let put = Request::put("/api/sellers/bc1qSELLER.rig1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"url":"poolA:3333","user":"acct","pass":"x"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(put).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(Request::get("/api/sellers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["url"], "poolA:3333");
     }
 }

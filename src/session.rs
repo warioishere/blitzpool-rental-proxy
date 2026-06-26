@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 const DIFF1_HASHES: f64 = 4_294_967_296.0;
 
 /// An upstream the proxy connects to as a client (a pool).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpstreamTarget {
     /// `host:port`.
     pub url: String,
     /// Worker / account name presented to the upstream.
     pub user: String,
+    #[serde(default)]
     pub password: String,
 }
 

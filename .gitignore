@@ -1,1 +1,3 @@
 /target
+/sellers.json
+*.json.tmp

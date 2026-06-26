@@ -14,6 +14,7 @@ mod config;
 mod proto;
 mod registry;
 mod session;
+mod store;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -41,11 +42,17 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = registry::Registry::new();
 
+    let sellers_path = std::env::var("RENTAL_PROXY_SELLERS")
+        .unwrap_or_else(|_| "sellers.json".into())
+        .into();
+    let sellers = store::SellerStore::load(sellers_path).await;
+
     // HTTP control API — the proxy is fully steerable here; the web UI calls it.
     let api_addr = std::env::var("RENTAL_PROXY_API").unwrap_or_else(|_| "127.0.0.1:8080".into());
     {
         let state = api::AppState {
             registry: registry.clone(),
+            sellers: sellers.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = api::serve(api_addr, state).await {
@@ -69,10 +76,12 @@ async fn main() -> anyhow::Result<()> {
         };
         let upstream = upstream.clone();
         let registry = registry.clone();
+        let sellers = sellers.clone();
         tokio::spawn(async move {
             let peer = peer.to_string();
             if let Err(e) =
-                proto::relay::handle_seller_miner(sock, peer.clone(), upstream, registry).await
+                proto::relay::handle_seller_miner(sock, peer.clone(), upstream, registry, sellers)
+                    .await
             {
                 warn!(%peer, error = %e, "relay ended with error");
             }

@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 use super::sv1::RpcMessage;
 use crate::registry::Registry;
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
+use crate::store::SellerStore;
 
 /// Standard BIP320 version-rolling mask we advertise to the miner.
 const VERSION_ROLLING_MASK: &str = "1fffe000";
@@ -82,6 +83,20 @@ impl Session {
     pub async fn revert(self: &Arc<Self>) -> anyhow::Result<()> {
         let default = self.inner.lock().await.default_target.clone();
         self.swap_upstream(default, Routing::Idle).await
+    }
+
+    /// Set the seller's configured default upstream and use it now (the miner
+    /// is idle). Applied when a miner authorizes and the seller store has a
+    /// per-worker default that differs from the process-wide default.
+    pub async fn set_default(self: &Arc<Self>, target: UpstreamTarget) -> anyhow::Result<()> {
+        {
+            self.inner.lock().await.default_target = target.clone();
+        }
+        self.swap_upstream(target, Routing::Idle).await
+    }
+
+    pub async fn default_target(&self) -> UpstreamTarget {
+        self.inner.lock().await.default_target.clone()
     }
 
     async fn swap_upstream(self: &Arc<Self>, target: UpstreamTarget, routing: Routing) -> anyhow::Result<()> {
@@ -356,6 +371,7 @@ pub async fn handle_seller_miner(
     peer: String,
     default_target: UpstreamTarget,
     registry: Arc<Registry>,
+    sellers: Arc<SellerStore>,
 ) -> anyhow::Result<()> {
     let _ = miner.set_nodelay(true);
     let (miner_r, miner_w) = miner.into_split();
@@ -462,7 +478,29 @@ pub async fn handle_seller_miner(
                 }
                 _ => {
                     // authorize / submit / suggest_difficulty / etc.
+                    let auth_worker = if msg.method.as_deref() == Some("mining.authorize") {
+                        msg.params
+                            .as_ref()
+                            .and_then(|p| p.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    };
                     session.on_miner_msg(msg, &registry).await;
+                    // On authorize, apply this seller's configured default pool
+                    // (if any) when it differs from the process-wide default.
+                    if let Some(w) = auth_worker {
+                        if let Some(def) = sellers.get(&w).await {
+                            if session.default_target().await != def {
+                                match session.set_default(def.clone()).await {
+                                    Ok(()) => info!(worker = %w, upstream = %def.url, "applied seller default pool"),
+                                    Err(e) => warn!(worker = %w, error = %e, "apply seller default failed"),
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
