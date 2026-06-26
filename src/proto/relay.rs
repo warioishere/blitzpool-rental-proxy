@@ -208,6 +208,32 @@ impl Session {
     pub async fn worker_label(&self) -> String {
         self.inner.lock().await.label.clone()
     }
+
+    /// Snapshot for the control API.
+    pub async fn status(&self) -> SessionStatus {
+        let i = self.inner.lock().await;
+        let (routing, order_id) = match &i.routing {
+            Routing::Idle => ("idle".to_string(), None),
+            Routing::Rented { order_id, .. } => ("rented".to_string(), Some(order_id.clone())),
+        };
+        SessionStatus {
+            worker: i.label.clone(),
+            routing,
+            order_id,
+            upstream_url: i.active.target.url.clone(),
+            hashrate_hs: i.hashrate.hashes_per_second(),
+        }
+    }
+}
+
+/// API-facing snapshot of a live session.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionStatus {
+    pub worker: String,
+    pub routing: String,
+    pub order_id: Option<String>,
+    pub upstream_url: String,
+    pub hashrate_hs: f64,
 }
 
 fn id_key(id: &Option<Value>) -> String {

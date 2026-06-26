@@ -9,8 +9,8 @@
 // until the relay + control layers consume them.
 #![allow(dead_code)]
 
+mod api;
 mod config;
-mod control;
 mod proto;
 mod registry;
 mod session;
@@ -41,15 +41,15 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = registry::Registry::new();
 
-    // Control API (runtime pool switch). M3 replaces this with an
-    // authenticated HTTP/web API.
-    let control_addr =
-        std::env::var("RENTAL_PROXY_CONTROL").unwrap_or_else(|_| "127.0.0.1:3336".into());
+    // HTTP control API — the proxy is fully steerable here; the web UI calls it.
+    let api_addr = std::env::var("RENTAL_PROXY_API").unwrap_or_else(|_| "127.0.0.1:8080".into());
     {
-        let registry = registry.clone();
+        let state = api::AppState {
+            registry: registry.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = control::run(control_addr, registry).await {
-                warn!(error = %e, "control API stopped");
+            if let Err(e) = api::serve(api_addr, state).await {
+                warn!(error = %e, "HTTP API stopped");
             }
         });
     }

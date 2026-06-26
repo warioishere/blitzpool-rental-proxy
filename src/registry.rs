@@ -41,4 +41,14 @@ impl Registry {
     pub async fn list(&self) -> Vec<String> {
         self.inner.lock().await.keys().cloned().collect()
     }
+
+    /// Status snapshot of every connected session.
+    pub async fn snapshot(&self) -> Vec<crate::proto::relay::SessionStatus> {
+        let sessions: Vec<Arc<Session>> = self.inner.lock().await.values().cloned().collect();
+        let mut out = Vec::with_capacity(sessions.len());
+        for s in sessions {
+            out.push(s.status().await);
+        }
+        out
+    }
 }
