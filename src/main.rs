@@ -10,7 +10,9 @@
 #![allow(dead_code)]
 
 mod config;
+mod control;
 mod proto;
+mod registry;
 mod session;
 
 use anyhow::Context;
@@ -37,6 +39,21 @@ async fn main() -> anyhow::Result<()> {
     )?;
     info!(upstream = %upstream.url, "default upstream");
 
+    let registry = registry::Registry::new();
+
+    // Control API (runtime pool switch). M3 replaces this with an
+    // authenticated HTTP/web API.
+    let control_addr =
+        std::env::var("RENTAL_PROXY_CONTROL").unwrap_or_else(|_| "127.0.0.1:3336".into());
+    {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = control::run(control_addr, registry).await {
+                warn!(error = %e, "control API stopped");
+            }
+        });
+    }
+
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
@@ -51,9 +68,12 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         let upstream = upstream.clone();
+        let registry = registry.clone();
         tokio::spawn(async move {
             let peer = peer.to_string();
-            if let Err(e) = proto::relay::handle_seller_miner(sock, peer.clone(), upstream).await {
+            if let Err(e) =
+                proto::relay::handle_seller_miner(sock, peer.clone(), upstream, registry).await
+            {
                 warn!(%peer, error = %e, "relay ended with error");
             }
         });
