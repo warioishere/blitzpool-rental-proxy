@@ -43,6 +43,7 @@ use super::keys::NoiseKeys;
 use super::wire::{self, EitherFrame, Msg, Sv2Frame};
 use crate::proto::adapter::{DownstreamAdapter, ProxyContext};
 use crate::control::{AnySession, SessionStatus};
+use crate::orders::OrderStore;
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 
 /// How long the proxy's Noise certificate (responder side) is valid, seconds.
@@ -274,12 +275,36 @@ fn parse_setup_success_flags(frame: &mut Sv2Frame) -> Option<u32> {
     }
 }
 
-fn parse_shares_sum(frame: &mut Sv2Frame) -> Option<u64> {
+fn parse_accepted_count(frame: &mut Sv2Frame) -> Option<u32> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
-        Mining::SubmitSharesSuccess(s) => Some(s.new_shares_sum),
+        Mining::SubmitSharesSuccess(s) => Some(s.new_submits_accepted_count),
         _ => None,
+    }
+}
+
+fn parse_set_target(frame: &mut Sv2Frame) -> Option<Vec<u8>> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::SetTarget(m) => Some(m.maximum_target.inner_as_ref().to_vec()),
+        _ => None,
+    }
+}
+
+/// Difficulty (in diff-1 share units) implied by a channel `target`. Reuses the
+/// upstream stack's authoritative target math so the byte order + diff-1
+/// convention match the pools. Returns 0.0 on a zero/invalid target.
+fn difficulty_from_target(target: &[u8]) -> f64 {
+    let Ok(u) = U256::try_from(target.to_vec()) else {
+        return 0.0;
+    };
+    // hash_rate_from_target(t, 1 share/min) = hashes_per_share / 60;
+    // difficulty = hashes_per_share / 2^32.
+    match stratum_core::channels_sv2::target::hash_rate_from_target(u, 1.0) {
+        Ok(h1) => h1 * 60.0 / 4_294_967_296.0,
+        Err(_) => 0.0,
     }
 }
 
@@ -383,6 +408,9 @@ struct Channel {
     down_channel_id: u32,
     up_channel_id: u32,
     spec: OpenSpec,
+    /// Current share difficulty (diff-1 units) from the channel's target;
+    /// updated by `SetTarget`. Used to weight accepted shares for accounting.
+    difficulty: f64,
 }
 
 struct Inner {
@@ -399,6 +427,9 @@ struct Inner {
     routing: Routing,
     default_target: UpstreamTarget,
     hashrate: HashrateWindow,
+    /// Lifetime delivered work (diff-1 share units) + accepted shares.
+    delivered_work: f64,
+    accepted_shares: u64,
     label: String,
 }
 
@@ -410,12 +441,13 @@ impl Inner {
             .map(|c| c.up_channel_id)
     }
 
-    fn register_channel(&mut self, down_cid: u32, up_cid: u32, spec: OpenSpec) {
+    fn register_channel(&mut self, down_cid: u32, up_cid: u32, spec: OpenSpec, difficulty: f64) {
         self.up_to_down.insert(up_cid, down_cid);
         self.channels.push(Channel {
             down_channel_id: down_cid,
             up_channel_id: up_cid,
             spec,
+            difficulty,
         });
     }
 }
@@ -424,6 +456,8 @@ impl Inner {
 pub struct Sv2Session {
     to_miner: mpsc::UnboundedSender<EitherFrame>,
     inner: Mutex<Inner>,
+    /// For crediting measured delivered work to the active rental order.
+    orders: Arc<OrderStore>,
 }
 
 impl Sv2Session {
@@ -496,6 +530,7 @@ impl Sv2Session {
                 down_channel_id: *down_cid,
                 up_channel_id: info.up_channel_id,
                 spec: spec.clone(),
+                difficulty: difficulty_from_target(&info.target),
             });
             repoint.push((*down_cid, info.extranonce_prefix, info.target));
         }
@@ -563,7 +598,8 @@ impl Sv2Session {
                 if let Some(spec) = i.pending.remove(&info.request_id) {
                     let down_cid = i.next_down_cid;
                     i.next_down_cid += 1;
-                    i.register_channel(down_cid, info.up_channel_id, spec.clone());
+                    let diff = difficulty_from_target(&info.target);
+                    i.register_channel(down_cid, info.up_channel_id, spec.clone(), diff);
                     if let Ok(reply) = open_success_downstream(&spec, down_cid, &info) {
                         let _ = self.to_miner.send(reply);
                     }
@@ -578,22 +614,57 @@ impl Sv2Session {
             return;
         }
 
+        if !wire::is_channel_scoped(mt) {
+            debug!(mt, "dropping non-channel-scoped upstream message");
+            return;
+        }
+
+        let up_cid = wire::read_channel_id(&mut frame);
+
+        // Vardiff: a new target changes this channel's share difficulty.
+        if mt == mining::MESSAGE_TYPE_SET_TARGET {
+            if let Some(target) = parse_set_target(&mut frame) {
+                let diff = difficulty_from_target(&target);
+                if let Some(c) = i.channels.iter_mut().find(|c| c.up_channel_id == up_cid) {
+                    c.difficulty = diff;
+                }
+            }
+        }
+
+        // Accounting: weight accepted shares by the channel's current
+        // difficulty (proxy-authoritative) and credit the active rental.
+        let mut order_credit: Option<(String, f64, u64)> = None;
         if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {
-            if let Some(sum) = parse_shares_sum(&mut frame) {
-                i.hashrate.record(sum as f64);
+            let count = parse_accepted_count(&mut frame).unwrap_or(0);
+            let diff = i
+                .channels
+                .iter()
+                .find(|c| c.up_channel_id == up_cid)
+                .map(|c| c.difficulty)
+                .unwrap_or(0.0);
+            let work = diff * count as f64;
+            if work > 0.0 {
+                i.hashrate.record(work);
+                i.delivered_work += work;
+                i.accepted_shares += count as u64;
+                if let Routing::Rented { order_id, .. } = &i.routing {
+                    order_credit = Some((order_id.clone(), work, count as u64));
+                }
                 debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted shares");
             }
         }
-        if wire::is_channel_scoped(mt) {
-            let up_cid = wire::read_channel_id(&mut frame);
-            if let Some(&down_cid) = i.up_to_down.get(&up_cid) {
-                wire::rewrite_channel_id(&mut frame, down_cid);
-                let _ = self.to_miner.send(frame.into());
-            } else {
-                debug!(up_cid, "no channel mapping for upstream frame; dropping");
-            }
+
+        // Forward to the miner with the channel id remapped.
+        if let Some(&down_cid) = i.up_to_down.get(&up_cid) {
+            wire::rewrite_channel_id(&mut frame, down_cid);
+            let _ = self.to_miner.send(frame.into());
         } else {
-            debug!(mt, "dropping non-channel-scoped upstream message");
+            debug!(up_cid, "no channel mapping for upstream frame; dropping");
+        }
+        drop(i);
+
+        if let Some((order_id, work, shares)) = order_credit {
+            self.orders.add_work(&order_id, work, shares).await;
         }
     }
 
@@ -609,6 +680,8 @@ impl Sv2Session {
             order_id,
             upstream_url: i.active.target.url.clone(),
             hashrate_hs: i.hashrate.hashes_per_second(),
+            delivered_work: i.delivered_work,
+            accepted_shares: i.accepted_shares,
             protocol: "sv2",
         }
     }
@@ -668,6 +741,7 @@ pub async fn handle_seller_miner_sv2(
     up_to_down.insert(info.up_channel_id, down_channel_id);
     let session = Arc::new(Sv2Session {
         to_miner: to_miner.clone(),
+        orders: ctx.orders.clone(),
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
                 generation: 0,
@@ -681,6 +755,7 @@ pub async fn handle_seller_miner_sv2(
                 down_channel_id,
                 up_channel_id: info.up_channel_id,
                 spec: spec.clone(),
+                difficulty: difficulty_from_target(&info.target),
             }],
             up_to_down,
             pending: std::collections::HashMap::new(),
@@ -688,6 +763,8 @@ pub async fn handle_seller_miner_sv2(
             routing: Routing::Idle,
             default_target: default_target.clone(),
             hashrate: HashrateWindow::new(Duration::from_secs(600)),
+            delivered_work: 0.0,
+            accepted_shares: 0,
             label: worker.clone(),
         }),
     });
@@ -839,6 +916,15 @@ mod tests {
         std::env::temp_dir().join(format!("srp_sv2_{}_{}.json", std::process::id(), tag))
     }
 
+    /// A channel target (little-endian) of 2^224 ⇒ difficulty ≈ 1, so accepted
+    /// shares carry real (non-zero) work. (`[0xff; 32]` is the max target =
+    /// difficulty 0, which the accounting correctly ignores.)
+    fn diff1_target() -> Vec<u8> {
+        let mut t = vec![0u8; 32];
+        t[28] = 1;
+        t
+    }
+
     /// A mock SV2 pool: one connection, tagging its `extranonce_prefix`. Assigns
     /// each opened channel a distinct id starting at `base_cid`. Reports the
     /// `channel_id` of each received submit on `submits` and replies
@@ -883,7 +969,7 @@ mod tests {
                         request_id: open.spec.request_id(),
                         up_channel_id: cid,
                         extranonce_prefix: prefix.clone(),
-                        target: vec![0xffu8; 32],
+                        target: diff1_target(),
                         extranonce_size: 8,
                         group_channel_id: 0,
                     };
@@ -1325,6 +1411,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(err_request_id, 2, "pending open #2 abandoned with an error");
+    }
+
+    #[tokio::test]
+    async fn delivered_work_is_credited_to_the_rental_order() {
+        // Default pool A (idle) + buyer pool B (rented).
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = pool_b.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        let (b_tx, mut b_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let orders = crate::orders::OrderStore::load(tmp("acct_o")).await;
+        let ctx = ProxyContext {
+            default_target: ext_target(&a_addr.to_string(), "acctA"),
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::load(tmp("acct_s")).await,
+            orders: orders.clone(),
+        };
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, _) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+
+        // Rent: create an order and switch the session onto buyer pool B.
+        let order = orders
+            .create(
+                "bc1qSELLER.rig1".into(),
+                ext_target(&b_addr.to_string(), "acctB"),
+                0,
+            )
+            .await;
+        let sess = loop {
+            if let Some(s) = registry.get("bc1qSELLER.rig1").await {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        sess.switch_to(order.id.clone(), ext_target(&b_addr.to_string(), "acctB"))
+            .await
+            .unwrap();
+        let _ = miner.read_until_set_extranonce().await.unwrap();
+
+        // Submit K accepted shares.
+        let k = 3u64;
+        for seq in 0..k {
+            miner.submit(down_cid, seq as u32).await.unwrap();
+            b_rx.recv().await.unwrap(); // pool B received the submit
+        }
+
+        // Work is credited just after the success is forwarded; poll the order
+        // (bounded, so a regression fails the test instead of hanging).
+        let mut credited = orders.get(&order.id).await.unwrap();
+        for _ in 0..100_000 {
+            if credited.accepted_shares >= k {
+                break;
+            }
+            tokio::task::yield_now().await;
+            credited = orders.get(&order.id).await.unwrap();
+        }
+        assert_eq!(credited.accepted_shares, k, "accepted shares credited to order");
+        let expected = difficulty_from_target(&diff1_target()) * k as f64;
+        assert!(credited.delivered_work > 0.0, "delivered work measured");
+        assert!(
+            (credited.delivered_work - expected).abs() <= expected * 1e-6 + f64::MIN_POSITIVE,
+            "delivered_work {} ~= {} (diff-weighted)",
+            credited.delivered_work,
+            expected
+        );
     }
 
     #[tokio::test]

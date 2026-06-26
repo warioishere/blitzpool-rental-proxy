@@ -18,7 +18,13 @@ pub struct SessionStatus {
     pub routing: String,
     pub order_id: Option<String>,
     pub upstream_url: String,
+    /// Live (windowed) delivered hashrate estimate, hashes/second.
     pub hashrate_hs: f64,
+    /// Lifetime delivered work this session, in diff-1 share units (Σ accepted
+    /// share difficulty). Per-rental delivered work is tracked on the order.
+    pub delivered_work: f64,
+    /// Lifetime accepted shares this session.
+    pub accepted_shares: u64,
     /// `"sv1"` or `"sv2"`.
     pub protocol: &'static str,
 }

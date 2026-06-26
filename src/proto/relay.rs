@@ -55,6 +55,9 @@ struct Inner {
     /// submit id (serialized) → (generation, difficulty) for hashrate credit.
     pending: HashMap<String, (u64, f64)>,
     hashrate: HashrateWindow,
+    /// Lifetime delivered work (diff-1 share units) + accepted shares.
+    delivered_work: f64,
+    accepted_shares: u64,
     routing: Routing,
     default_target: UpstreamTarget,
     /// Miner's `mining.configure` (remembered to replay to each upstream).
@@ -67,6 +70,8 @@ struct Inner {
 pub struct Session {
     to_miner: Tx,
     inner: Mutex<Inner>,
+    /// For crediting measured delivered work to the active rental order.
+    orders: Arc<crate::orders::OrderStore>,
 }
 
 impl Session {
@@ -150,33 +155,44 @@ impl Session {
     /// Process a line from the upstream tagged `generation`; returns the line
     /// to forward to the miner (or `None` to drop a stale-upstream line).
     async fn on_upstream_msg(&self, generation: u64, msg: RpcMessage) -> Option<String> {
-        let mut i = self.inner.lock().await;
-        if generation != i.active.generation {
-            return None; // stale upstream (already swapped away)
-        }
-        match msg.method.as_deref() {
-            Some("mining.set_difficulty") => {
-                if let Some(d) = msg
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|v| v.as_f64())
-                {
-                    i.current_difficulty = d;
-                }
+        let mut order_credit: Option<(String, f64)> = None;
+        {
+            let mut i = self.inner.lock().await;
+            if generation != i.active.generation {
+                return None; // stale upstream (already swapped away)
             }
-            None => {
-                // A response — credit accepted submits to the hashrate window.
-                let idk = id_key(&msg.id);
-                if let Some((g, diff)) = i.pending.remove(&idk) {
-                    if g == generation && matches!(&msg.result, Some(Value::Bool(true))) {
-                        i.hashrate.record(diff);
-                        debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted share");
+            match msg.method.as_deref() {
+                Some("mining.set_difficulty") => {
+                    if let Some(d) = msg
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_f64())
+                    {
+                        i.current_difficulty = d;
                     }
                 }
+                None => {
+                    // A response — credit accepted submits (diff-weighted).
+                    let idk = id_key(&msg.id);
+                    if let Some((g, diff)) = i.pending.remove(&idk) {
+                        if g == generation && matches!(&msg.result, Some(Value::Bool(true))) {
+                            i.hashrate.record(diff);
+                            i.delivered_work += diff;
+                            i.accepted_shares += 1;
+                            if let Routing::Rented { order_id, .. } = &i.routing {
+                                order_credit = Some((order_id.clone(), diff));
+                            }
+                            debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted share");
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+        }
+        if let Some((order_id, diff)) = order_credit {
+            self.orders.add_work(&order_id, diff, 1).await;
         }
         Some(msg.to_line())
     }
@@ -238,6 +254,8 @@ impl Session {
             order_id,
             upstream_url: i.active.target.url.clone(),
             hashrate_hs: i.hashrate.hashes_per_second(),
+            delivered_work: i.delivered_work,
+            accepted_shares: i.accepted_shares,
             protocol: "sv1",
         }
     }
@@ -402,6 +420,7 @@ pub async fn handle_seller_miner(
 
     let session = Arc::new(Session {
         to_miner: to_miner.clone(),
+        orders: orders.clone(),
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
                 generation: 0,
@@ -414,6 +433,8 @@ pub async fn handle_seller_miner(
             current_difficulty: 1.0,
             pending: HashMap::new(),
             hashrate: HashrateWindow::new(Duration::from_secs(600)),
+            delivered_work: 0.0,
+            accepted_shares: 0,
             routing: Routing::Idle,
             default_target: default_target.clone(),
             configure: None,

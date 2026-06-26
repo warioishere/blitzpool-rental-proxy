@@ -46,6 +46,15 @@ pub struct Order {
     /// Auto-revert deadline (epoch ms). `0` = open-ended (no auto-revert).
     pub until_ms: i64,
     pub status: OrderStatus,
+    /// Delivered work measured by the proxy over this rental, in diff-1 share
+    /// units (Σ of accepted-share difficulty). Hashes = `delivered_work * 2^32`;
+    /// average delivered hashrate = `delivered_work * 2^32 / elapsed_seconds`.
+    /// This is the billing basis (pro-rata on actual delivery).
+    #[serde(default)]
+    pub delivered_work: f64,
+    /// Count of accepted shares credited to this rental.
+    #[serde(default)]
+    pub accepted_shares: u64,
 }
 
 impl Order {
@@ -81,6 +90,8 @@ impl OrderStore {
             created_ms: now,
             until_ms,
             status: OrderStatus::Active,
+            delivered_work: 0.0,
+            accepted_shares: 0,
         };
         self.inner.lock().await.insert(id, order.clone());
         let _ = self.save().await;
@@ -103,6 +114,22 @@ impl OrderStore {
             .values()
             .find(|o| o.worker == worker && o.is_live(now))
             .cloned()
+    }
+
+    /// Credit measured delivered work to an order (in-memory; persisted by the
+    /// periodic [`flush`](Self::flush)). No-op if the order is unknown.
+    pub async fn add_work(&self, id: &str, work: f64, accepted_shares: u64) {
+        let mut map = self.inner.lock().await;
+        if let Some(o) = map.get_mut(id) {
+            o.delivered_work += work;
+            o.accepted_shares += accepted_shares;
+        }
+    }
+
+    /// Persist the store (called periodically so accumulated work survives a
+    /// restart; at most one tick's worth of work is lost on a crash).
+    pub async fn flush(&self) -> std::io::Result<()> {
+        self.save().await
     }
 
     /// Cancel an order; returns it so the caller can revert the session.
@@ -148,7 +175,8 @@ impl OrderStore {
     }
 }
 
-/// Background task: every 5s, revert sessions whose rental has expired.
+/// Background task: every 5s, revert expired rentals and persist accumulated
+/// delivered work (so billing survives a restart).
 pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -160,6 +188,7 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
                     info!(order = %o.id, worker = %o.worker, "rental expired → reverted to default");
                 }
             }
+            let _ = orders.flush().await;
         }
     })
 }
