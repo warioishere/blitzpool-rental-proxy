@@ -1490,6 +1490,8 @@ mod tests {
                 "bc1qSELLER.rig1".into(),
                 ext_target(&b_addr.to_string(), "acctB"),
                 0,
+                0.0,
+                0.0,
             )
             .await;
         let sess = loop {

@@ -207,13 +207,23 @@ async fn delete_seller(
     Ok(Json(json!({"ok": true, "removed": removed})))
 }
 
+/// Serialize an order plus its computed billing fields (measured cost so far +
+/// remaining prepaid budget).
+fn order_json(o: &crate::orders::Order) -> Value {
+    let mut v = serde_json::to_value(o).unwrap_or_else(|_| json!({}));
+    v["cost"] = json!(o.cost());
+    v["budget_remaining"] = json!(o.budget_remaining());
+    v
+}
+
 async fn list_orders(State(s): State<AppState>) -> Json<Value> {
-    Json(json!({ "orders": s.orders.list().await }))
+    let orders: Vec<Value> = s.orders.list().await.iter().map(order_json).collect();
+    Json(json!({ "orders": orders }))
 }
 
 async fn get_order(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     match s.orders.get(&id).await {
-        Some(o) => Ok(Json(json!(o))),
+        Some(o) => Ok(Json(order_json(&o))),
         None => Err((StatusCode::NOT_FOUND, "order not found".into())),
     }
 }
@@ -231,6 +241,13 @@ struct OrderReq {
     /// Auto-revert deadline in epoch ms; `0`/absent = open-ended.
     #[serde(default)]
     until_ms: i64,
+    /// Agreed price per TH/day (same unit as `budget`, e.g. sats).
+    #[serde(default)]
+    price_per_th_day: f64,
+    /// Prepaid credit allocated to this rental; `0` = no limit. The proxy stops
+    /// routing (pay-as-you-hash) once the measured cost reaches it. No refunds.
+    #[serde(default)]
+    budget: f64,
 }
 
 /// Create a rental order: records it and, if the worker is connected, switches
@@ -246,12 +263,21 @@ async fn create_order(
         password: req.pass,
         authority_pubkey: req.authority,
     };
-    let order = s.orders.create(req.worker.clone(), target.clone(), req.until_ms).await;
+    let order = s
+        .orders
+        .create(
+            req.worker.clone(),
+            target.clone(),
+            req.until_ms,
+            req.price_per_th_day,
+            req.budget,
+        )
+        .await;
     let mut applied = false;
     if let Some(sess) = s.registry.get(&req.worker).await {
         applied = sess.switch_to(order.id.clone(), target).await.is_ok();
     }
-    Json(json!({"ok": true, "order": order, "applied": applied}))
+    Json(json!({"ok": true, "order": order_json(&order), "applied": applied}))
 }
 
 /// Cancel an order; if the worker is connected, revert it to its default pool.

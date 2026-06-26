@@ -22,6 +22,12 @@ use crate::session::UpstreamTarget;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Hashes in one TH·day: 1e12 H/s × 86400 s. Used to turn measured work into
+/// the billable TH·day quantity.
+const HASHES_PER_TH_DAY: f64 = 1e12 * 86_400.0;
+/// Hashes per diff-1 share (2^32).
+const DIFF1_HASHES: f64 = 4_294_967_296.0;
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -59,11 +65,39 @@ pub struct Order {
     /// `accepted_shares` gives the accept-ratio (a fraud/health signal).
     #[serde(default)]
     pub submitted_shares: u64,
+    /// Agreed price per TH/day (same currency unit as `budget`, e.g. sats).
+    #[serde(default)]
+    pub price_per_th_day: f64,
+    /// Prepaid amount allocated to this rental (same unit as price). `0` = no
+    /// limit (open-ended). When the measured cost reaches it, the proxy stops
+    /// routing (pay-as-you-hash; no refunds — the credit is consumed).
+    #[serde(default)]
+    pub budget: f64,
 }
 
 impl Order {
     fn is_live(&self, now: i64) -> bool {
         self.status == OrderStatus::Active && (self.until_ms == 0 || self.until_ms > now)
+    }
+
+    /// Billable cost so far = delivered TH·days × price.
+    pub fn cost(&self) -> f64 {
+        let th_days = self.delivered_work * DIFF1_HASHES / HASHES_PER_TH_DAY;
+        th_days * self.price_per_th_day
+    }
+
+    /// Remaining prepaid budget (0 if no budget set or already spent).
+    pub fn budget_remaining(&self) -> f64 {
+        if self.budget <= 0.0 {
+            0.0
+        } else {
+            (self.budget - self.cost()).max(0.0)
+        }
+    }
+
+    /// True when a budgeted rental has consumed its prepaid credit.
+    pub fn funding_exhausted(&self) -> bool {
+        self.budget > 0.0 && self.cost() >= self.budget
     }
 }
 
@@ -84,7 +118,14 @@ impl OrderStore {
         })
     }
 
-    pub async fn create(&self, worker: String, target: UpstreamTarget, until_ms: i64) -> Order {
+    pub async fn create(
+        &self,
+        worker: String,
+        target: UpstreamTarget,
+        until_ms: i64,
+        price_per_th_day: f64,
+        budget: f64,
+    ) -> Order {
         let now = now_ms();
         let id = format!("o{}-{}", now, SEQ.fetch_add(1, Ordering::Relaxed));
         let order = Order {
@@ -97,6 +138,8 @@ impl OrderStore {
             delivered_work: 0.0,
             accepted_shares: 0,
             submitted_shares: 0,
+            price_per_th_day,
+            budget,
         };
         self.inner.lock().await.insert(id, order.clone());
         let _ = self.save().await;
@@ -157,14 +200,16 @@ impl OrderStore {
         Some(order)
     }
 
-    /// Mark every past-deadline active order as ended; returns them so the
-    /// caller can revert the corresponding sessions.
+    /// Mark every finished active order as ended (past its deadline OR with its
+    /// prepaid budget consumed) and return them so the caller can revert the
+    /// corresponding sessions.
     pub async fn take_expired(&self, now: i64) -> Vec<Order> {
         let expired: Vec<Order> = {
             let mut map = self.inner.lock().await;
             let mut out = Vec::new();
             for o in map.values_mut() {
-                if o.status == OrderStatus::Active && o.until_ms > 0 && o.until_ms <= now {
+                let deadline_passed = o.until_ms > 0 && o.until_ms <= now;
+                if o.status == OrderStatus::Active && (deadline_passed || o.funding_exhausted()) {
                     o.status = OrderStatus::Ended;
                     out.push(o.clone());
                 }
@@ -227,7 +272,7 @@ mod tests {
         let p = tmp_path("crud");
         let _ = std::fs::remove_file(&p);
         let store = OrderStore::load(p.clone()).await;
-        let o = store.create("w1".into(), target(), 0).await; // open-ended
+        let o = store.create("w1".into(), target(), 0, 0.0, 0.0).await; // open-ended
         assert!(store.active_for_worker("w1", now_ms()).await.is_some());
         let cancelled = store.cancel(&o.id).await.unwrap();
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
@@ -241,8 +286,8 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let store = OrderStore::load(p.clone()).await;
         // already past deadline
-        let _o = store.create("w2".into(), target(), now_ms() - 1000).await;
-        let live_now = store.create("w3".into(), target(), now_ms() + 60_000).await;
+        let _o = store.create("w2".into(), target(), now_ms() - 1000, 0.0, 0.0).await;
+        let live_now = store.create("w3".into(), target(), now_ms() + 60_000, 0.0, 0.0).await;
         let expired = store.take_expired(now_ms()).await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].worker, "w2");
@@ -254,12 +299,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn funding_exhausted_ends_the_order() {
+        let p = tmp_path("budget");
+        let _ = std::fs::remove_file(&p);
+        let store = OrderStore::load(p.clone()).await;
+        // price 1.0 per TH·day, prepaid budget 100, open-ended deadline.
+        let o = store.create("w5".into(), target(), 0, 1.0, 100.0).await;
+        assert!(store.take_expired(now_ms()).await.is_empty(), "fresh order is live");
+
+        // Credit work worth 100 TH·days ⇒ cost reaches the budget.
+        let work_for_100_th_days = 100.0 * HASHES_PER_TH_DAY / DIFF1_HASHES;
+        store.add_work(&o.id, work_for_100_th_days, 1).await;
+
+        let after = store.get(&o.id).await.unwrap();
+        assert!((after.cost() - 100.0).abs() < 1e-6, "cost ≈ budget");
+        assert_eq!(after.budget_remaining(), 0.0);
+
+        let ended = store.take_expired(now_ms()).await;
+        assert_eq!(ended.len(), 1, "exhausted budget ends the rental");
+        assert_eq!(ended[0].id, o.id);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
     async fn persists_across_reload() {
         let p = tmp_path("persist");
         let _ = std::fs::remove_file(&p);
         let id = {
             let store = OrderStore::load(p.clone()).await;
-            store.create("w4".into(), target(), 0).await.id
+            store.create("w4".into(), target(), 0, 0.0, 0.0).await.id
         };
         let reloaded = OrderStore::load(p.clone()).await;
         assert!(reloaded.get(&id).await.is_some());
