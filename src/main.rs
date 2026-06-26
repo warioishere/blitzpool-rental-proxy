@@ -17,10 +17,15 @@ mod registry;
 mod session;
 mod store;
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+use config::Protocol;
+use proto::adapter::{DownstreamAdapter, ProxyContext};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -74,8 +79,36 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
-    info!("listening for seller miners");
 
+    let ctx = ProxyContext {
+        default_target: upstream,
+        registry,
+        sellers,
+        orders,
+    };
+
+    // Select the wire protocol's adapter at boot; the accept loop is
+    // monomorphised over it (generics, no per-message dyn dispatch).
+    match cfg.protocol {
+        Protocol::Sv1 => accept_loop(listener, proto::relay::Sv1Adapter, ctx).await,
+        Protocol::Sv2 => {
+            warn!(
+                "RENTAL_PROXY_PROTOCOL=sv2: the SV2 downstream relay is not implemented \
+                 yet — connections will be refused. Use sv1 until the SV2 milestone lands."
+            );
+            accept_loop(listener, proto::sv2::Sv2Adapter, ctx).await
+        }
+    }
+}
+
+/// Accept seller miners and hand each to `adapter` with the shared context.
+async fn accept_loop<A: DownstreamAdapter>(
+    listener: TcpListener,
+    adapter: A,
+    ctx: ProxyContext,
+) -> anyhow::Result<()> {
+    info!(protocol = adapter.protocol(), "listening for seller miners");
+    let adapter = Arc::new(adapter);
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -84,18 +117,12 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
-        let upstream = upstream.clone();
-        let registry = registry.clone();
-        let sellers = sellers.clone();
-        let orders = orders.clone();
+        let adapter = adapter.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             let peer = peer.to_string();
-            if let Err(e) = proto::relay::handle_seller_miner(
-                sock, peer.clone(), upstream, registry, sellers, orders,
-            )
-            .await
-            {
-                warn!(%peer, error = %e, "relay ended with error");
+            if let Err(e) = adapter.serve(sock, peer.clone(), ctx).await {
+                warn!(%peer, error = %e, "session ended with error");
             }
         });
     }

@@ -28,11 +28,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use super::adapter::{DownstreamAdapter, ProxyContext};
 use super::sv1::RpcMessage;
-use crate::orders::OrderStore;
 use crate::registry::Registry;
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
-use crate::store::SellerStore;
 
 /// Standard BIP320 version-rolling mask we advertise to the miner.
 const VERSION_ROLLING_MASK: &str = "1fffe000";
@@ -364,17 +363,35 @@ fn spawn_upstream_reader(
     })
 }
 
+/// The Stratum V1 downstream adapter: a transparent full-proxy with a
+/// swappable upstream. Plugs into the [`DownstreamAdapter`] seam.
+#[derive(Clone, Copy, Default)]
+pub struct Sv1Adapter;
+
+impl DownstreamAdapter for Sv1Adapter {
+    fn protocol(&self) -> &'static str {
+        "sv1"
+    }
+
+    async fn serve(&self, miner: TcpStream, peer: String, ctx: ProxyContext) -> anyhow::Result<()> {
+        handle_seller_miner(miner, peer, ctx).await
+    }
+}
+
 /// Drive one seller miner end to end. Connects the default upstream, answers
 /// the miner handshake (synthesizing configure + subscribe), registers the
 /// session under the miner's worker, then relays until either side closes.
 pub async fn handle_seller_miner(
     miner: TcpStream,
     peer: String,
-    default_target: UpstreamTarget,
-    registry: Arc<Registry>,
-    sellers: Arc<SellerStore>,
-    orders: Arc<OrderStore>,
+    ctx: ProxyContext,
 ) -> anyhow::Result<()> {
+    let ProxyContext {
+        default_target,
+        registry,
+        sellers,
+        orders,
+    } = ctx;
     let _ = miner.set_nodelay(true);
     let (miner_r, miner_w) = miner.into_split();
 

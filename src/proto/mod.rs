@@ -1,12 +1,13 @@
 //! Protocol adapters. The proxy core (session, routing, control, accounting)
-//! is protocol-agnostic; each adapter here implements the downstream server +
-//! swappable upstream client for one Stratum protocol version.
+//! is protocol-agnostic; each adapter implements the downstream server +
+//! swappable upstream client for one Stratum protocol version, plugging into
+//! the [`adapter::DownstreamAdapter`] seam.
 //!
-//! - [`sv1`] — Stratum V1 (phase 1).
-//! - `sv2` — Stratum V2 (planned; same core underneath).
-//!
-//! A future `ProtocolAdapter` trait will unify them once SV2 lands; until then
-//! SV1 is wired directly.
+//! - [`sv1`] codec + [`relay`] — Stratum V1 (live).
+//! - [`sv2`] — Stratum V2 (seam + Noise/framing foundation; relay is the next
+//!   milestone).
 
+pub mod adapter;
 pub mod relay;
 pub mod sv1;
+pub mod sv2;
