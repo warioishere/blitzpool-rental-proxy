@@ -3289,4 +3289,351 @@ mod tests {
         assert!(st.accepted_shares >= 1, "accepted share counted");
         assert!(st.delivered_work > 0.0, "delivered work credited");
     }
+
+    #[tokio::test]
+    async fn rent_sv2_miner_switches_onto_sv1_pool() {
+        // Idle on an SV2 pool (passthrough), then rented onto an SV1 buyer pool —
+        // the switch must translate (swap_to_sv1_translate) and re-point the miner.
+        let sv2_idle = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let idle_addr = sv2_idle.local_addr().unwrap();
+        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(sv2_idle, vec![0xAA; 8], 7, NoiseKeys::generate(), idle_tx));
+        let sv1_buyer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let buyer_addr = sv1_buyer.local_addr().unwrap();
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<()>();
+        tokio::spawn(mock_sv1_pool_translate(sv1_buyer, sub_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let orders = crate::orders::OrderStore::new(db.clone());
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: orders.clone(),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&idle_addr.to_string(), "acctIdle")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, prefix) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+        assert_eq!(prefix, vec![0xAA; 8], "idle on the SV2 pool (passthrough)");
+
+        // Rent onto the SV1 buyer pool → translated switch.
+        let sess = loop {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        let buyer = ext_target(&buyer_addr.to_string(), "acctBuyer");
+        let order = orders
+            .create("bc1qSELLER.rig1".into(), buyer.clone(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
+        sess.switch_to(order.id.clone(), buyer).await.unwrap();
+
+        // Re-pointed to the SV1 extranonce, then a translated job + accepted share.
+        let (re_cid, re_prefix) = tokio::time::timeout(Duration::from_secs(15), miner.read_until_set_extranonce())
+            .await
+            .expect("set_extranonce after the translated switch")
+            .unwrap();
+        assert_eq!(re_cid, down_cid, "channel id stable across the switch");
+        assert_eq!(re_prefix, vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe], "now on the SV1 extranonce1");
+        let _ = tokio::time::timeout(Duration::from_secs(5), miner.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB))
+            .await
+            .expect("translated job after switch")
+            .unwrap();
+        miner.submit(down_cid, 0).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sub_rx.recv())
+            .await
+            .expect("share reached the SV1 buyer pool")
+            .unwrap();
+        assert_eq!(sess.status().await.routing, "rented");
+    }
+
+    // ── self-validating combo 4: a real mined share, validated by the pool ──
+
+    /// `a <= b` for two 32-byte little-endian numbers (Bitcoin hash vs target).
+    fn le_leq(a: &[u8], b: &[u8]) -> bool {
+        for i in (0..32).rev() {
+            if a[i] != b[i] {
+                return a[i] < b[i];
+            }
+        }
+        true
+    }
+
+    /// A legacy coinbase split reserving `en_len` bytes for the extranonce so
+    /// `coinb1 + extranonce + coinb2` deserializes as a valid transaction.
+    fn legacy_cb_reserving(en_len: usize) -> (Vec<u8>, Vec<u8>) {
+        let script_prefix = [0x03u8, 0x33, 0x33, 0x33];
+        let ssl = script_prefix.len() + en_len;
+        let mut c1 = Vec::new();
+        c1.extend_from_slice(&1u32.to_le_bytes());
+        c1.push(0x01);
+        c1.extend_from_slice(&[0u8; 32]);
+        c1.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        c1.push(ssl as u8);
+        c1.extend_from_slice(&script_prefix);
+        let mut c2 = Vec::new();
+        c2.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        c2.push(0x01);
+        c2.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+        c2.push(0x00);
+        c2.extend_from_slice(&0u32.to_le_bytes());
+        (c1, c2)
+    }
+
+    /// Read the SV2 job/prev-hash/target, mine a real nonce that meets the target,
+    /// and submit it — exercising the full coinbase (prefix+extranonce+suffix) and
+    /// header reconstruction the SV1 pool will independently re-check.
+    async fn mine_and_submit_one(
+        miner: &mut MockMiner,
+        channel_id: u32,
+        extranonce_prefix: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        use stratum_core::bitcoin::hashes::{sha256d, Hash};
+        use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
+
+        let mut job: Option<(u32, u32, Vec<u8>, Vec<u8>)> = None; // job_id, version, cb_prefix, cb_suffix
+        let mut prev: Option<([u8; 32], u32, u32)> = None; // prev_hash, min_ntime, nbits
+        let mut target: Option<Vec<u8>> = None;
+        for _ in 0..50 {
+            let mut f = read_one(&mut miner.read).await?;
+            match wire::msg_type(&f) {
+                Some(mt) if mt == mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
+                    if let Some(m) = parse_new_extended_job(&mut f) {
+                        job = Some((
+                            m.job_id,
+                            m.version,
+                            m.coinbase_tx_prefix.inner_as_ref().to_vec(),
+                            m.coinbase_tx_suffix.inner_as_ref().to_vec(),
+                        ));
+                    }
+                }
+                Some(mt) if mt == mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+                    if let Some(m) = parse_set_new_prev_hash(&mut f) {
+                        let ph: [u8; 32] = m.prev_hash.inner_as_ref().try_into().unwrap();
+                        prev = Some((ph, m.min_ntime, m.nbits));
+                    }
+                }
+                Some(mt) if mt == mining::MESSAGE_TYPE_SET_TARGET => {
+                    if let Some(t) = parse_set_target(&mut f) {
+                        target = Some(t);
+                    }
+                }
+                _ => {}
+            }
+            if job.is_some() && prev.is_some() && target.is_some() {
+                break;
+            }
+        }
+        let (job_id, version, cb_prefix, cb_suffix) = job.ok_or_else(|| anyhow!("no job"))?;
+        let (prev_hash, min_ntime, nbits) = prev.ok_or_else(|| anyhow!("no prev-hash"))?;
+        let target = target.ok_or_else(|| anyhow!("no target"))?;
+
+        // Full extranonce = the channel prefix + the miner's rolled part.
+        let miner_extranonce = vec![0u8, 0, 0, 1];
+        let mut full_en = extranonce_prefix;
+        full_en.extend_from_slice(&miner_extranonce);
+        let empty: Vec<Vec<u8>> = vec![];
+        let merkle_root = merkle_root_from_path(&cb_prefix, &cb_suffix, &full_en, &empty)
+            .ok_or_else(|| anyhow!("coinbase did not deserialize"))?;
+
+        let mut header = Vec::with_capacity(80);
+        header.extend_from_slice(&version.to_le_bytes());
+        header.extend_from_slice(&prev_hash);
+        header.extend_from_slice(&merkle_root);
+        header.extend_from_slice(&min_ntime.to_le_bytes());
+        header.extend_from_slice(&nbits.to_le_bytes());
+        let noff = header.len();
+        header.extend_from_slice(&0u32.to_le_bytes());
+        let mut nonce = None;
+        for n in 0u32..5_000_000 {
+            header[noff..noff + 4].copy_from_slice(&n.to_le_bytes());
+            if le_leq(&sha256d::Hash::hash(&header).to_byte_array(), &target) {
+                nonce = Some(n);
+                break;
+            }
+        }
+        let nonce = nonce.ok_or_else(|| anyhow!("no winning nonce"))?;
+
+        let m = SubmitSharesExtended {
+            channel_id,
+            sequence_number: 0,
+            job_id,
+            nonce,
+            ntime: min_ntime,
+            version,
+            extranonce: B032::try_from(miner_extranonce).unwrap(),
+        };
+        miner
+            .write
+            .write_frame(wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesExtended(m))))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    /// A mock SV1 pool that *validates* each submitted share: it reconstructs the
+    /// coinbase (`coinb1 + extranonce1 + extranonce2 + coinb2`), the merkle root,
+    /// and the 80-byte header, and accepts only if SHA256d ≤ the share target.
+    async fn validating_sv1_pool(listener: TcpListener, accepted: mpsc::UnboundedSender<bool>) {
+        use stratum_core::bitcoin::hashes::{sha256d, Hash};
+        use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
+        use stratum_core::sv1_api::utils::PrevHash as Sv1PrevHash;
+
+        const MASK: u32 = 0x1fff_e000;
+        const VERSION: u32 = 0x2000_0000;
+        const NBITS: u32 = 0x207f_ffff;
+        const NTIME: u32 = 0x6500_0000;
+        const DIFFICULTY: f64 = 1e-9;
+        let en1: Vec<u8> = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let (coinb1, coinb2) = legacy_cb_reserving(en1.len() + 4);
+        let pv = [0x11u8; 32]; // internal byte order
+        let pv_str = String::from(Sv1PrevHash(U256::from(pv)));
+        let share_target = translate::target_from_difficulty(DIFFICULTY).to_vec();
+
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let accepted = accepted.clone();
+            let (en1, coinb1, coinb2, pv_str, share_target) =
+                (en1.clone(), coinb1.clone(), coinb2.clone(), pv_str.clone(), share_target.clone());
+            tokio::spawn(async move {
+                let (r, mut w) = sock.into_split();
+                let mut lines = BufReader::new(r).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let id = v.get("id").cloned().unwrap_or(Value::Null);
+                    let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    match method {
+                        "mining.configure" => {
+                            let reply = json!({"id": id, "result": {"version-rolling": true, "version-rolling.mask": "1fffe000"}, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        "mining.subscribe" => {
+                            let reply = json!({"id": id, "result": [[["mining.notify", "1"]], hex_string(&en1), 4], "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                            let sd = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [DIFFICULTY]});
+                            let _ = w.write_all(format!("{sd}\n").as_bytes()).await;
+                            let notify = json!({"id": Value::Null, "method": "mining.notify", "params": [
+                                "j1", pv_str, hex_string(&coinb1), hex_string(&coinb2), [],
+                                format!("{VERSION:08x}"), format!("{NBITS:08x}"), format!("{NTIME:08x}"), true
+                            ]});
+                            let _ = w.write_all(format!("{notify}\n").as_bytes()).await;
+                        }
+                        "mining.authorize" => {
+                            let reply = json!({"id": id, "result": true, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        "mining.submit" => {
+                            let p = v.get("params").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+                            let en2 = p.get(2).and_then(|x| x.as_str()).map(hex_bytes).unwrap_or_default();
+                            let ntime = p.get(3).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+                            let nonce = p.get(4).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+                            let vbits = p.get(5).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+
+                            let mut full_en = en1.clone();
+                            full_en.extend_from_slice(&en2);
+                            let empty: Vec<Vec<u8>> = vec![];
+                            let valid = match merkle_root_from_path(&coinb1, &coinb2, &full_en, &empty) {
+                                Some(root) => {
+                                    let version = (VERSION & !MASK) | (vbits & MASK);
+                                    let mut header = Vec::with_capacity(80);
+                                    header.extend_from_slice(&version.to_le_bytes());
+                                    header.extend_from_slice(&pv);
+                                    header.extend_from_slice(&root);
+                                    header.extend_from_slice(&ntime.to_le_bytes());
+                                    header.extend_from_slice(&NBITS.to_le_bytes());
+                                    header.extend_from_slice(&nonce.to_le_bytes());
+                                    le_leq(&sha256d::Hash::hash(&header).to_byte_array(), &share_target)
+                                }
+                                None => false,
+                            };
+                            let _ = accepted.send(valid);
+                            let reply = json!({"id": id, "result": valid, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+
+    fn hex_string(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).filter_map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn sv2_to_sv1_translated_share_is_cryptographically_valid() {
+        // The end-to-end proof: an SV2 miner mines a real share against the
+        // translated job; the SV1 pool independently rebuilds the coinbase +
+        // header and confirms SHA256d ≤ target. A wrong extranonce split or
+        // endianness anywhere makes the two headers diverge and the pool reject.
+        let sv1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sv1_addr = sv1.local_addr().unwrap();
+        let (acc_tx, mut acc_rx) = mpsc::unbounded_channel::<bool>();
+        tokio::spawn(validating_sv1_pool(sv1, acc_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&sv1_addr.to_string(), "acctSV1")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, prefix) = tokio::time::timeout(Duration::from_secs(15), miner.open("bc1qSELLER.rig1", 1))
+            .await
+            .expect("open did not complete")
+            .unwrap();
+        assert_eq!(prefix, vec![0xaa, 0xbb, 0xcc, 0xdd], "channel prefix = SV1 extranonce1");
+
+        // Mine a real share against the translated job and submit it.
+        tokio::time::timeout(Duration::from_secs(20), mine_and_submit_one(&mut miner, down_cid, prefix))
+            .await
+            .expect("mining timed out")
+            .unwrap();
+
+        // The pool validated the reconstructed header and accepted it.
+        let valid = tokio::time::timeout(Duration::from_secs(5), acc_rx.recv())
+            .await
+            .expect("pool never saw the share")
+            .unwrap();
+        assert!(valid, "the translated share must be cryptographically valid at the SV1 pool");
+
+        // The acceptance is translated back to the miner.
+        let ok_cid = tokio::time::timeout(Duration::from_secs(5), miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS))
+            .await
+            .expect("share result timed out")
+            .unwrap();
+        assert_eq!(ok_cid, down_cid);
+    }
 }
