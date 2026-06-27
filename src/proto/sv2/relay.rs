@@ -113,7 +113,10 @@ fn setup_connection() -> EitherFrame {
         flags: 0,
         endpoint_host: empty_str(),
         endpoint_port: 0,
-        vendor: empty_str(),
+        // Identify the rental proxy to the upstream pool (the pool surfaces this
+        // as the userAgent, e.g. `bp-proxy/sv2`, instead of the `jd-client/sv2`
+        // placeholder it uses when the vendor is empty).
+        vendor: Str0255::try_from("bp-proxy".to_string()).unwrap_or_else(|_| empty_str()),
         hardware_version: empty_str(),
         firmware: empty_str(),
         device_id: empty_str(),
@@ -502,8 +505,8 @@ impl Sv2Session {
         target: UpstreamTarget,
         routing: Routing,
     ) -> anyhow::Result<()> {
-        // Snapshot the channels to re-open (down_channel_id + spec).
-        let (specs, generation) = {
+        // Snapshot the channels to re-open (down_channel_id + spec) + worker.
+        let (specs, generation, label) = {
             let mut i = self.inner.lock().await;
             i.generation_counter += 1;
             let specs: Vec<(u32, OpenSpec)> = i
@@ -511,8 +514,10 @@ impl Sv2Session {
                 .iter()
                 .map(|c| (c.down_channel_id, c.spec.clone()))
                 .collect();
-            (specs, i.generation_counter)
+            (specs, i.generation_counter, i.label.clone())
         };
+        // user_identity on the new pool: its account + the miner's worker, tagged.
+        let up_ident = crate::proto::relay::upstream_worker(&target.user, &label);
         if specs.is_empty() {
             bail!("no channels to switch");
         }
@@ -526,7 +531,7 @@ impl Sv2Session {
         let mut up_to_down = std::collections::HashMap::new();
         let mut repoint = Vec::with_capacity(specs.len());
         for (down_cid, spec) in &specs {
-            let info = open_on(&mut read, &mut write, spec, &target.user)
+            let info = open_on(&mut read, &mut write, spec, &up_ident)
                 .await
                 .map_err(|e| anyhow!("switch reopen channel {down_cid}: {e}"))?;
             up_to_down.insert(info.up_channel_id, *down_cid);
@@ -759,8 +764,11 @@ pub async fn handle_seller_miner_sv2(
     };
 
     // 5. Connect upstream = the rig's idle pool + open the same channel type.
+    //    user_identity = pool account + the miner's worker, tagged -bp-proxy, so
+    //    the pool shows the rig (not "default") and marks it as proxied.
+    let up_ident = crate::proto::relay::upstream_worker(&idle_target.user, &worker);
     let (mut up_read, mut up_write, _up_flags) = connect_setup(&idle_target).await?;
-    let info = open_on(&mut up_read, &mut up_write, &spec, &idle_target.user).await?;
+    let info = open_on(&mut up_read, &mut up_write, &spec, &up_ident).await?;
     // Stable, proxy-assigned downstream channel id for the first channel.
     let down_channel_id = 1u32;
 
@@ -848,7 +856,8 @@ pub async fn handle_seller_miner_sv2(
                 // rewritten); the upstream reader finalizes it on success.
                 if let Some(open) = parse_miner_open(&mut frame) {
                     let mut i = session.inner.lock().await;
-                    let account = i.active.target.user.clone();
+                    let account =
+                        crate::proto::relay::upstream_worker(&i.active.target.user, &i.label);
                     match open_channel_upstream(&open.spec, &account) {
                         Ok(f) => {
                             i.pending.insert(open.spec.request_id(), open.spec.clone());

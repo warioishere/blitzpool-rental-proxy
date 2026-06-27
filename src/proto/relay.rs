@@ -73,7 +73,7 @@ fn peer_ip(peer: &str) -> String {
 /// the miner's own worker name, tagged `-bp-proxy` so the pool clearly shows the
 /// hashrate is coming through the rental proxy. The account part (before the
 /// first `.`) stays a valid payout address; the tag rides on the worker suffix.
-fn upstream_worker(account: &str, miner_label: &str) -> String {
+pub(crate) fn upstream_worker(account: &str, miner_label: &str) -> String {
     match miner_label.split_once('.').map(|(_, s)| s).filter(|s| !s.is_empty()) {
         Some(suffix) => format!("{account}.{suffix}-bp-proxy"),
         None => format!("{account}.bp-proxy"),
