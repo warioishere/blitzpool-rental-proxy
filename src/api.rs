@@ -460,6 +460,10 @@ async fn create_order(
         }
     };
     let sessions = s.registry.get_all(&req.worker).await;
+    // Switch every connected miner of the rig. Partial success is fine: billing is
+    // pay-as-you-hash (the buyer is charged for measured delivered work and the
+    // unspent prepaid budget is refunded when the order ends), so a miner that
+    // didn't switch simply delivers less. The response reports switched/of.
     let switched = switch_all(&sessions, &order.id, &target).await;
     let applied = switched > 0;
     Ok(Json(json!({
