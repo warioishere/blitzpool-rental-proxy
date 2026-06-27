@@ -370,7 +370,14 @@ async fn open_on(
             Some(mining::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR) => {
                 bail!("upstream rejected OpenMiningChannel")
             }
-            _ => continue,
+            other => {
+                // Frames the pool emits *before* OpenSuccess (e.g. a future
+                // NewExtendedMiningJob + SetNewPrevHash that bootstrap the new
+                // channel). Currently discarded — log so we can confirm the
+                // miner is starved of its initial job.
+                tracing::warn!(mt = ?other, "sv2 open_on discarding pre-OpenSuccess frame");
+                continue;
+            }
         }
     }
 }
