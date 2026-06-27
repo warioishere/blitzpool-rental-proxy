@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     routing::{get, post, put},
@@ -52,6 +52,7 @@ pub fn router(state: AppState) -> Router {
             "/api/sellers/{worker}",
             put(set_seller).delete(delete_seller),
         )
+        .route("/api/sellers/{worker}/rentable", post(set_rentable))
         .route("/api/orders", get(list_orders).post(create_order))
         .route("/api/orders/{id}", get(get_order).delete(cancel_order))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer));
@@ -186,8 +187,25 @@ async fn release(
     Ok(Json(json!({"ok": true})))
 }
 
-async fn list_sellers(State(s): State<AppState>) -> Json<Value> {
-    Json(json!({ "sellers": s.sellers.list().await }))
+#[derive(Deserialize)]
+struct SellerQuery {
+    /// Filter to one seller's rigs (`<address>` + its `<address>.<label>` rigs).
+    #[serde(default)]
+    seller: Option<String>,
+}
+
+/// List rigs. `?seller=<address>` filters to that seller's rigs (dashboard);
+/// no filter returns all (operator view).
+async fn list_sellers(State(s): State<AppState>, Query(q): Query<SellerQuery>) -> Json<Value> {
+    let sellers = match q.seller.as_deref() {
+        Some(addr) if !addr.is_empty() => s.sellers.list_for_seller(addr).await,
+        _ => s.sellers.list().await,
+    };
+    Json(json!({ "sellers": sellers }))
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -212,6 +230,10 @@ struct SellerReq {
     /// Seller payout address (e.g. BTC) for rental earnings.
     #[serde(default)]
     payout_address: Option<String>,
+    /// Whether the rig is listed for rent (default true). The rig still
+    /// idle-mines when false; it just can't be rented.
+    #[serde(default = "default_true")]
+    rentable: bool,
 }
 
 /// Register/update a seller's rig: idle/default pool plus the marketplace
@@ -235,6 +257,7 @@ async fn set_seller(
         price_min_per_th_day: req.price_min_per_th_day,
         price_max_per_th_day: req.price_max_per_th_day,
         payout_address: req.payout_address,
+        rentable: req.rentable,
     };
     s.sellers
         .set(worker.clone(), rig)
@@ -248,6 +271,29 @@ async fn set_seller(
         }
     }
     Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct RentableReq {
+    rentable: bool,
+}
+
+/// Toggle whether a rig is listed for rent (marketplace on/off). The rig keeps
+/// idle-mining either way; `false` just blocks new rentals.
+async fn set_rentable(
+    State(s): State<AppState>,
+    Path(worker): Path<String>,
+    Json(req): Json<RentableReq>,
+) -> Result<Json<Value>, ApiError> {
+    let updated = s
+        .sellers
+        .set_rentable(&worker, req.rentable)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "rig not found".into()));
+    }
+    Ok(Json(json!({"ok": true, "rentable": req.rentable})))
 }
 
 async fn delete_seller(
@@ -311,7 +357,13 @@ struct OrderReq {
 async fn create_order(
     State(s): State<AppState>,
     Json(req): Json<OrderReq>,
-) -> Json<Value> {
+) -> Result<Json<Value>, ApiError> {
+    // A registered rig that's toggled off can't be rented.
+    if let Some(rig) = s.sellers.get(&req.worker).await {
+        if !rig.rentable {
+            return Err((StatusCode::CONFLICT, "rig is not listed for rent".into()));
+        }
+    }
     let target = UpstreamTarget {
         url: req.url,
         user: req.user,
@@ -332,7 +384,7 @@ async fn create_order(
     if let Some(sess) = s.registry.get(&req.worker).await {
         applied = sess.switch_to(order.id.clone(), target).await.is_ok();
     }
-    Json(json!({"ok": true, "order": order_json(&order), "applied": applied}))
+    Ok(Json(json!({"ok": true, "order": order_json(&order), "applied": applied})))
 }
 
 /// Cancel an order; if the worker is connected, revert it to its default pool.
@@ -530,5 +582,96 @@ mod tests {
             .unwrap();
         let v = body_json(resp).await;
         assert_eq!(v["orders"].as_array().unwrap().len(), 1);
+    }
+
+    async fn put_rig(app: &Router, worker: &str) {
+        let put = Request::put(format!("/api/sellers/{worker}"))
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(r#"{"url":"poolA:3333","user":"acct"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(put).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_sellers_filtered_by_seller() {
+        let app = app().await;
+        put_rig(&app, "bc1qA").await;
+        put_rig(&app, "bc1qA.rig1").await;
+        put_rig(&app, "bc1qB.rig1").await;
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/sellers?seller=bc1qA")
+                    .header("authorization", BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        let sellers = v["sellers"].as_object().unwrap();
+        assert_eq!(sellers.len(), 2, "bc1qA + bc1qA.rig1");
+        assert!(sellers.contains_key("bc1qA"));
+        assert!(sellers.contains_key("bc1qA.rig1"));
+        assert!(!sellers.contains_key("bc1qB.rig1"));
+    }
+
+    #[tokio::test]
+    async fn rentable_toggle_blocks_new_rentals() {
+        let app = app().await;
+        put_rig(&app, "bc1qA.rig1").await;
+
+        // Toggle off.
+        let off = Request::post("/api/sellers/bc1qA.rig1/rentable")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(r#"{"rentable":false}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(off).await.unwrap().status(), StatusCode::OK);
+
+        // Creating a rental for a non-rentable rig is rejected.
+        let order = Request::post("/api/orders")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(
+                r#"{"worker":"bc1qA.rig1","url":"buyer:3333","user":"b","until_ms":0}"#,
+            ))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(order).await.unwrap().status(), StatusCode::CONFLICT);
+
+        // Toggle back on → rental allowed.
+        let on = Request::post("/api/sellers/bc1qA.rig1/rentable")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(r#"{"rentable":true}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(on).await.unwrap().status(), StatusCode::OK);
+
+        let order2 = Request::post("/api/orders")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(
+                r#"{"worker":"bc1qA.rig1","url":"buyer:3333","user":"b","until_ms":0}"#,
+            ))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(order2).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rentable_toggle_unknown_rig_is_404() {
+        let resp = app()
+            .await
+            .oneshot(
+                Request::post("/api/sellers/ghost/rentable")
+                    .header("content-type", "application/json")
+                    .header("authorization", BEARER)
+                    .body(Body::from(r#"{"rentable":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

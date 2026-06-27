@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE rigs SET rentable = ? WHERE worker = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "d32b0e99a935dbcdac36295d035522571368c395e24e719e81632190bcdfd3c9"
+}

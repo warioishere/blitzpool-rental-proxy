@@ -1,0 +1,80 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable FROM rigs WHERE worker = ? OR worker LIKE ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "worker",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "pool_url",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "pool_user",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "pool_password",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "pool_authority",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "advertised_ths",
+        "ordinal": 5,
+        "type_info": "Float"
+      },
+      {
+        "name": "price_per_th_day",
+        "ordinal": 6,
+        "type_info": "Float"
+      },
+      {
+        "name": "price_min_per_th_day",
+        "ordinal": 7,
+        "type_info": "Float"
+      },
+      {
+        "name": "price_max_per_th_day",
+        "ordinal": 8,
+        "type_info": "Float"
+      },
+      {
+        "name": "payout_address",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "rentable",
+        "ordinal": 10,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "588f46808f707c6d0005f454d8cc38334ae3a5b735142270af8bcde609e6f8b9"
+}

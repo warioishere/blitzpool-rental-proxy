@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address FROM rigs",
+  "query": "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable FROM rigs",
   "describe": {
     "columns": [
       {
@@ -52,6 +52,11 @@
         "name": "payout_address",
         "ordinal": 9,
         "type_info": "Text"
+      },
+      {
+        "name": "rentable",
+        "ordinal": 10,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
@@ -67,8 +72,9 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "d6265193a92956ff409b1c72729f389fb0d318a10a2ca29588fac821d1ffcd19"
+  "hash": "5862e1c71b2b969425bbf0226f83184f7e42b6976da6520adcd890735bbb795a"
 }
