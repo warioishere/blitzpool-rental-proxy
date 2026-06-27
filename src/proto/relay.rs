@@ -46,9 +46,11 @@ const RECONNECT_HINT_TTL: Duration = Duration::from_secs(120);
 /// before deciding live-switch vs reconnect. Miners (e.g. BitAxe) send it only
 /// after they receive the authorize result, so the proxy must give it a moment.
 /// The wait ends as soon as the subscribe arrives — this is only the ceiling for
-/// miners that never send it (they then take the reconnect path). 50ms is enough
-/// in practice (confirmed from earlier TS-pool testing with a BitAxe).
-const EXTRANONCE_GRACE: Duration = Duration::from_millis(50);
+/// miners that never send it (they then take the reconnect path). The miner can
+/// only send it after the authorize result has made the round trip, so this must
+/// exceed the link RTT: ~48ms was observed over the public IP/pfSense, so 250ms
+/// gives ample margin (50ms is enough only for LAN-local miners).
+const EXTRANONCE_GRACE: Duration = Duration::from_millis(250);
 
 /// Per-source-IP reconnect hints. When a miner that can't take a live
 /// extranonce change authorizes onto a pool different from its handshake pool,
