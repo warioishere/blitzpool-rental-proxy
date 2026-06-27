@@ -1,9 +1,10 @@
 //! stratum-rental-proxy — entry point.
 //!
-//! Milestone 1 scaffold: binds the downstream Stratum server and accepts
-//! seller miners. The per-connection handler (SV1 handshake → connect default
-//! upstream → relay + hashrate) and the runtime pool-switch are the next
-//! increments; the foundations (`proto::sv1` codec, `session`) are in place.
+//! Binds the downstream Stratum server (SV1, SV2, or auto-detect on one port),
+//! accepts seller miners, and drives each through its protocol relay with a
+//! swappable upstream: idle → the rig's default pool, rented → the buyer's pool.
+//! Persistent rig/order state lives in SQLite; the HTTP control API steers
+//! rentals and the expiry task auto-reverts finished ones.
 
 // Foundations are scaffolded ahead of being wired; silence dead-code noise
 // until the relay + control layers consume them.

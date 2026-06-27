@@ -388,6 +388,12 @@ async fn create_order(
     State(s): State<AppState>,
     Json(req): Json<OrderReq>,
 ) -> Result<Json<Value>, ApiError> {
+    // A bounded rental's end time must be in the future (0 = open-ended). Without
+    // this a past `until_ms` would slip through the max-duration check (negative
+    // duration is not "too long") and create an already-expired order.
+    if req.until_ms != 0 && req.until_ms <= now_ms() {
+        return Err((StatusCode::CONFLICT, "end time must be in the future".into()));
+    }
     // A registered rig that's toggled off can't be rented; and a rig with a
     // max-duration cap rejects open-ended or too-long rentals.
     if let Some(rig) = s.sellers.get(&req.worker).await {
@@ -703,6 +709,24 @@ mod tests {
         let resp2 = app.oneshot(post2).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::CONFLICT);
         assert!(body_text(resp2).await.contains("set an end time"));
+    }
+
+    #[tokio::test]
+    async fn create_order_with_past_end_time_is_rejected() {
+        // A bounded rental whose end time is already in the past is rejected
+        // before any rig/offline checks (it would otherwise create a dead order).
+        let app = app().await;
+        let until = now_ms() - 1000; // in the past
+        let post = Request::post("/api/orders")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(format!(
+                r#"{{"worker":"bc1qSELLER.rig1","url":"buyer:3333","user":"b","until_ms":{until}}}"#
+            )))
+            .unwrap();
+        let resp = app.oneshot(post).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("future"));
     }
 
     #[tokio::test]

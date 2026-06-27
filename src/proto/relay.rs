@@ -31,7 +31,6 @@ use tracing::{debug, info, warn};
 use super::adapter::{DownstreamAdapter, ProxyContext};
 use super::sv1::RpcMessage;
 use crate::control::{AnySession, SessionStatus};
-use crate::registry::Registry;
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 
 /// Standard BIP320 version-rolling mask we advertise to the miner.
@@ -293,27 +292,20 @@ impl Session {
         Some(msg.to_line())
     }
 
-    /// Process a line from the miner; sends the (possibly rewritten) line to
-    /// the active upstream. `registry`/`self_arc` let an `authorize` register
-    /// the session under the miner's worker name.
-    async fn on_miner_msg(self: &Arc<Self>, mut msg: RpcMessage, registry: &Arc<Registry>) {
+    /// Process a line from the miner; sends the (possibly rewritten) line to the
+    /// active upstream. Authorize is owned by the main handshake loop (which
+    /// registers the session and answers it locally) and is never handled here.
+    async fn on_miner_msg(self: &Arc<Self>, mut msg: RpcMessage) {
         let mut submit_order: Option<String> = None;
         {
             let mut i = self.inner.lock().await;
             match msg.method.as_deref() {
                 Some("mining.authorize") => {
-                    if let Some(w) = msg
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|v| v.as_str())
-                    {
-                        i.label = w.to_string();
-                        registry.insert(w.to_string(), AnySession::Sv1(self.clone())).await;
-                    }
-                    let up_worker = upstream_worker(&i.active.target.user, &i.label);
-                    msg.params = Some(json!([up_worker, i.active.target.password]));
+                    // The proxy authorizes upstream itself (with the pool/buyer
+                    // account) during the handshake/switch, and the main loop owns
+                    // registration — the miner's authorize is never forwarded. Drop
+                    // a stray one (e.g. a retransmit during the extranonce grace).
+                    return;
                 }
                 Some("mining.submit") => {
                     let diff = i.current_difficulty;
@@ -776,7 +768,7 @@ pub async fn handle_seller_miner(
                                                     };
                                                     let _ = to_miner.send(reply.to_line());
                                                 } else {
-                                                    session.on_miner_msg(gm, &registry).await;
+                                                    session.on_miner_msg(gm).await;
                                                 }
                                             }
                                             _ => break, // timeout, EOF, or read error
@@ -808,7 +800,7 @@ pub async fn handle_seller_miner(
                             }
                         }
                     } else {
-                        session.on_miner_msg(msg, &registry).await;
+                        session.on_miner_msg(msg).await;
                     }
                 }
             }
