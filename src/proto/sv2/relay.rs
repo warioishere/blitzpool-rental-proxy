@@ -634,6 +634,14 @@ impl Sv2Session {
         if mt == mining::MESSAGE_TYPE_SET_TARGET {
             if let Some(target) = parse_set_target(&mut frame) {
                 let diff = difficulty_from_target(&target);
+                let mapped = i.up_to_down.get(&up_cid).copied();
+                info!(
+                    worker = %i.label,
+                    up_cid,
+                    down_cid = ?mapped,
+                    diff,
+                    "sv2 SetTarget from upstream (forwarding to miner)"
+                );
                 if let Some(c) = i.channels.iter_mut().find(|c| c.up_channel_id == up_cid) {
                     c.difficulty = diff;
                 }
@@ -824,7 +832,11 @@ pub async fn handle_seller_miner_sv2(
     ctx.registry
         .insert(worker.clone(), AnySession::Sv2(session.clone()))
         .await;
-    info!(%peer, %worker, upstream = %idle_target.url, "sv2 relay established (idle)");
+    info!(
+        %peer, %worker, upstream = %idle_target.url,
+        initial_diff = difficulty_from_target(&info.target),
+        "sv2 relay established (idle)"
+    );
 
     // 8. We already opened on the rig's idle pool; if a rental is active, switch
     //    the session onto the buyer's target now.
