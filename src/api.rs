@@ -134,17 +134,13 @@ async fn get_session(
     }
 }
 
-/// Switch all of a rig's sessions to `target`; returns how many succeeded.
-/// Tolerates partial failure (a dead session's reconnect resumes the order),
-/// but logs it.
-async fn switch_all(
-    sessions: &[crate::control::AnySession],
-    order_id: &str,
-    target: &UpstreamTarget,
-) -> usize {
+/// Switch all of a rig's sessions onto the order's pool (primary→fallback);
+/// returns how many succeeded. Tolerates partial failure (a dead session's
+/// reconnect resumes the order), but logs it.
+async fn switch_all(sessions: &[crate::control::AnySession], order_id: &str) -> usize {
     let mut ok = 0;
     for sess in sessions {
-        match sess.switch_to(order_id.to_string(), target.clone()).await {
+        match sess.switch_to_order(order_id.to_string()).await {
             Ok(()) => ok += 1,
             Err(e) => tracing::warn!(error = %e, "rig session switch failed"),
         }
@@ -486,7 +482,7 @@ async fn create_order(
     // pay-as-you-hash (the buyer is charged for measured delivered work and the
     // unspent prepaid budget is refunded when the order ends), so a miner that
     // didn't switch simply delivers less. The response reports switched/of.
-    let switched = switch_all(&sessions, &order.id, &target).await;
+    let switched = switch_all(&sessions, &order.id).await;
     let applied = switched > 0;
     Ok(Json(json!({
         "ok": true,

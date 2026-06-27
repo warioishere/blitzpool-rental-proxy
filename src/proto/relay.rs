@@ -132,6 +132,27 @@ impl Session {
         self.swap_upstream(target, Routing::Rented { order_id }).await
     }
 
+    /// Switch onto a rental order's pool with failover: try the order's primary
+    /// target, then its fallback if the primary is unreachable. Errors only if
+    /// both fail (same protocol as the rig — the proxy doesn't translate).
+    pub async fn switch_to_order(self: &Arc<Self>, order_id: String) -> anyhow::Result<()> {
+        let order = self
+            .orders
+            .get(&order_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("order {order_id} not found"))?;
+        match self.switch_to(order_id.clone(), order.target).await {
+            Ok(()) => Ok(()),
+            Err(primary_err) => match order.fallback {
+                Some(fb) => {
+                    warn!(order = %order_id, error = %primary_err, "primary buyer pool unreachable — using fallback");
+                    self.switch_to(order_id, fb).await
+                }
+                None => Err(primary_err),
+            },
+        }
+    }
+
     /// Switch back to the seller's default upstream (a rental ends).
     pub async fn revert(self: &Arc<Self>) -> anyhow::Result<()> {
         let default = self.inner.lock().await.default_target.clone();

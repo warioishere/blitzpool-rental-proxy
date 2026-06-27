@@ -536,6 +536,28 @@ impl Sv2Session {
         self.swap_upstream(target, Routing::Rented { order_id }).await
     }
 
+    /// Switch onto a rental order's pool with failover: try the order's primary
+    /// target, then its fallback if the primary is unreachable. Errors only if
+    /// both fail. Resolves the pools from the order store (same protocol as the
+    /// rig — the proxy doesn't translate).
+    pub async fn switch_to_order(self: &Arc<Self>, order_id: String) -> anyhow::Result<()> {
+        let order = self
+            .orders
+            .get(&order_id)
+            .await
+            .ok_or_else(|| anyhow!("order {order_id} not found"))?;
+        match self.switch_to(order_id.clone(), order.target).await {
+            Ok(()) => Ok(()),
+            Err(primary_err) => match order.fallback {
+                Some(fb) => {
+                    warn!(order = %order_id, error = %primary_err, "primary buyer pool unreachable — using fallback");
+                    self.switch_to(order_id, fb).await
+                }
+                None => Err(primary_err),
+            },
+        }
+    }
+
     pub async fn revert(self: &Arc<Self>) -> anyhow::Result<()> {
         let default = self.inner.lock().await.default_target.clone();
         self.swap_upstream(default, Routing::Idle).await
@@ -886,7 +908,7 @@ pub async fn handle_seller_miner_sv2(
         .orders
         .active_for_worker(&worker, crate::orders::now_ms())
         .await;
-    let (open_target, routing) = match &active_order {
+    let (mut open_target, routing) = match &active_order {
         Some(o) => (
             o.target.clone(),
             Routing::Rented {
@@ -900,10 +922,23 @@ pub async fn handle_seller_miner_sv2(
     //    finalized by the steady reader below — the miner's OpenMiningChannel is
     //    forwarded as a `pending` open, exactly like an additional channel or a
     //    switch re-open, so there is a single open-finalize path.
-    //    user_identity = pool account + the miner's worker, tagged -bp-proxy, so
-    //    the pool shows the rig (not "default") and marks it as proxied.
+    //    If the rental's primary pool is unreachable, fall back to the order's
+    //    fallback pool (same protocol). `up_ident` is computed after, so it
+    //    reflects whichever pool we landed on.
+    let (up_read, up_write, _up_flags) = match connect_setup(&open_target).await {
+        Ok(c) => c,
+        Err(e) => match active_order.as_ref().and_then(|o| o.fallback.clone()) {
+            Some(fb) => {
+                warn!(%worker, error = %e, "primary buyer pool unreachable — using fallback");
+                open_target = fb;
+                connect_setup(&open_target).await?
+            }
+            None => return Err(e),
+        },
+    };
+    // user_identity = pool account + the miner's worker, tagged -bp-proxy, so
+    // the pool shows the rig (not "default") and marks it as proxied.
     let up_ident = crate::proto::relay::upstream_worker(&open_target.user, &worker);
-    let (up_read, up_write, _up_flags) = connect_setup(&open_target).await?;
     let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
     let up_writer = spawn_writer(up_write, up_rx);
     let mut pending = std::collections::HashMap::new();
@@ -2072,6 +2107,71 @@ mod tests {
             job_cid, down_cid,
             "post-switch job remapped to the stable downstream channel id"
         );
+    }
+
+    #[tokio::test]
+    async fn switch_falls_back_when_primary_pool_is_down() {
+        // Rental primary points at a dead port; fallback = a live pool. switch_to_order
+        // must try the primary, fail fast, and land on the fallback.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead); // free the port → connect refused
+        let pool_fb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fb_addr = pool_fb.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        let (fb_tx, _fb_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool(pool_fb, vec![0xCC; 8], 55, NoiseKeys::generate(), fb_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let orders = crate::orders::OrderStore::new(db.clone());
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: orders.clone(),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, _) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+
+        let order = orders
+            .create(
+                "bc1qSELLER.rig1".into(),
+                ext_target(&dead_addr.to_string(), "acctDead"),
+                Some(ext_target(&fb_addr.to_string(), "acctFB")),
+                0,
+                0.0,
+                0.0,
+            )
+            .await
+            .unwrap();
+
+        let sess = loop {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        sess.switch_to_order(order.id.clone()).await.unwrap();
+
+        // Landed on the fallback: the miner is re-pointed to FB's extranonce prefix.
+        let (re_cid, prefix) = miner.read_until_set_extranonce().await.unwrap();
+        assert_eq!(prefix, vec![0xCC; 8], "primary down → switched to fallback pool");
+        assert_eq!(re_cid, down_cid);
+        assert_eq!(sess.status().await.routing, "rented");
     }
 
     #[tokio::test]

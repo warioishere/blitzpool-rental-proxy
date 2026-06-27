@@ -68,12 +68,25 @@ pub enum AnySession {
 }
 
 impl AnySession {
-    /// Route this session's hashrate to `target` (a rental starts).
+    /// Route this session's hashrate to a single `target` (no fallback). The
+    /// production path is [`AnySession::switch_to_order`]; this lower-level form
+    /// is used by the relay tests to drive a switch without a stored order.
+    #[cfg(test)]
     pub async fn switch_to(&self, order_id: String, target: UpstreamTarget) -> anyhow::Result<()> {
         match self {
             AnySession::Sv1(s) => s.switch_to(order_id, target).await,
             #[cfg(feature = "sv2")]
             AnySession::Sv2(s) => s.switch_to(order_id, target).await,
+        }
+    }
+
+    /// Route this session onto a rental order's pool, with primary→fallback
+    /// failover (the pools are resolved from the order).
+    pub async fn switch_to_order(&self, order_id: String) -> anyhow::Result<()> {
+        match self {
+            AnySession::Sv1(s) => s.switch_to_order(order_id).await,
+            #[cfg(feature = "sv2")]
+            AnySession::Sv2(s) => s.switch_to_order(order_id).await,
         }
     }
 
