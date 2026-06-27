@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders",
+  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE id = ?",
   "describe": {
     "columns": [
       {
@@ -34,48 +34,68 @@
         "type_info": "Text"
       },
       {
-        "name": "created_ms",
+        "name": "fallback_url",
         "ordinal": 6,
-        "type_info": "Integer"
+        "type_info": "Text"
       },
       {
-        "name": "until_ms",
+        "name": "fallback_user",
         "ordinal": 7,
-        "type_info": "Integer"
+        "type_info": "Text"
       },
       {
-        "name": "status",
+        "name": "fallback_password",
         "ordinal": 8,
         "type_info": "Text"
       },
       {
-        "name": "delivered_work",
+        "name": "fallback_authority",
         "ordinal": 9,
-        "type_info": "Float"
+        "type_info": "Text"
       },
       {
-        "name": "accepted_shares",
+        "name": "created_ms",
         "ordinal": 10,
         "type_info": "Integer"
       },
       {
-        "name": "submitted_shares",
+        "name": "until_ms",
         "ordinal": 11,
         "type_info": "Integer"
       },
       {
-        "name": "price_per_th_day",
+        "name": "status",
         "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "delivered_work",
+        "ordinal": 13,
+        "type_info": "Float"
+      },
+      {
+        "name": "accepted_shares",
+        "ordinal": 14,
+        "type_info": "Integer"
+      },
+      {
+        "name": "submitted_shares",
+        "ordinal": 15,
+        "type_info": "Integer"
+      },
+      {
+        "name": "price_per_th_day",
+        "ordinal": 16,
         "type_info": "Float"
       },
       {
         "name": "budget",
-        "ordinal": 13,
+        "ordinal": 17,
         "type_info": "Float"
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       false,
@@ -83,6 +103,10 @@
       false,
       false,
       false,
+      true,
+      true,
+      true,
+      true,
       true,
       false,
       false,
@@ -94,5 +118,5 @@
       false
     ]
   },
-  "hash": "3b361e77e85bc79a73de5adf27d1a016386d5c6f9a2fc545e2652704c4930c26"
+  "hash": "554dedef834502a5f70154f7e6cde3d3bd45eaa4ec6fef578ce0508a52cc1110"
 }

@@ -369,6 +369,16 @@ struct OrderReq {
     /// SV2 only: pool Noise authority public key (base58).
     #[serde(default)]
     authority: Option<String>,
+    /// Optional fallback pool (same protocol as the rig) used when the primary
+    /// `url` is unreachable. Empty/absent = no fallback.
+    #[serde(default)]
+    fallback_url: String,
+    #[serde(default)]
+    fallback_user: String,
+    #[serde(default)]
+    fallback_pass: String,
+    #[serde(default)]
+    fallback_authority: Option<String>,
     /// Auto-revert deadline in epoch ms; `0`/absent = open-ended.
     #[serde(default)]
     until_ms: i64,
@@ -438,11 +448,23 @@ async fn create_order(
         password: req.pass,
         authority_pubkey: req.authority,
     };
+    // Optional fallback pool (same protocol as the rig). Empty url = none.
+    let fallback = if req.fallback_url.trim().is_empty() {
+        None
+    } else {
+        Some(UpstreamTarget {
+            url: req.fallback_url,
+            user: req.fallback_user,
+            password: req.fallback_pass,
+            authority_pubkey: req.fallback_authority,
+        })
+    };
     let order = match s
         .orders
         .create(
             req.worker.clone(),
             target.clone(),
+            fallback,
             req.until_ms,
             req.price_per_th_day,
             req.budget,
@@ -738,7 +760,7 @@ mod tests {
         // A worker with a live rental can't be rented again, even while online.
         let (app, orders) = app_with_orders().await;
         orders
-            .create("bc1qA.rig1".to_string(), buyer_target(), 0, 0.0, 0.0)
+            .create("bc1qA.rig1".to_string(), buyer_target(), None, 0, 0.0, 0.0)
             .await
             .unwrap();
 

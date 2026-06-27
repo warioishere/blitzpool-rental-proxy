@@ -59,6 +59,11 @@ pub struct Order {
     pub id: String,
     pub worker: String,
     pub target: UpstreamTarget,
+    /// Optional fallback pool: if the proxy can't reach `target` (offline at the
+    /// switch, or it drops mid-rental), it routes the rented hashrate here
+    /// instead. Same protocol as the rented rig (the proxy doesn't translate).
+    #[serde(default)]
+    pub fallback: Option<UpstreamTarget>,
     pub created_ms: i64,
     /// Auto-revert deadline (epoch ms). `0` = open-ended (no auto-revert).
     pub until_ms: i64,
@@ -124,6 +129,10 @@ struct OrderRow {
     target_user: String,
     target_password: String,
     target_authority: Option<String>,
+    fallback_url: Option<String>,
+    fallback_user: Option<String>,
+    fallback_password: Option<String>,
+    fallback_authority: Option<String>,
     created_ms: i64,
     until_ms: i64,
     status: String,
@@ -145,6 +154,12 @@ impl OrderRow {
                 password: self.target_password,
                 authority_pubkey: self.target_authority,
             },
+            fallback: self.fallback_url.map(|url| UpstreamTarget {
+                url,
+                user: self.fallback_user.unwrap_or_default(),
+                password: self.fallback_password.unwrap_or_default(),
+                authority_pubkey: self.fallback_authority,
+            }),
             created_ms: self.created_ms,
             until_ms: self.until_ms,
             status: OrderStatus::from_db(&self.status),
@@ -210,6 +225,7 @@ impl OrderStore {
         &self,
         worker: String,
         target: UpstreamTarget,
+        fallback: Option<UpstreamTarget>,
         until_ms: i64,
         price_per_th_day: f64,
         budget: f64,
@@ -217,17 +233,26 @@ impl OrderStore {
         let now = now_ms();
         let id = format!("o{}-{}", now, SEQ.fetch_add(1, Ordering::Relaxed));
         let status = OrderStatus::Active;
+        let fb_url = fallback.as_ref().map(|f| f.url.clone());
+        let fb_user = fallback.as_ref().map(|f| f.user.clone());
+        let fb_pass = fallback.as_ref().map(|f| f.password.clone());
+        let fb_auth = fallback.as_ref().and_then(|f| f.authority_pubkey.clone());
         sqlx::query!(
             "INSERT INTO orders (id, worker, target_url, target_user, target_password, \
-             target_authority, created_ms, until_ms, status, delivered_work, accepted_shares, \
+             target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, \
+             created_ms, until_ms, status, delivered_work, accepted_shares, \
              submitted_shares, price_per_th_day, budget) \
-             VALUES (?,?,?,?,?,?,?,?,?,0,0,0,?,?)",
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?)",
             id,
             worker,
             target.url,
             target.user,
             target.password,
             target.authority_pubkey,
+            fb_url,
+            fb_user,
+            fb_pass,
+            fb_auth,
             now,
             until_ms,
             "active",
@@ -248,6 +273,7 @@ impl OrderStore {
             id,
             worker,
             target,
+            fallback,
             created_ms: now,
             until_ms,
             status,
@@ -263,6 +289,7 @@ impl OrderStore {
         sqlx::query_as!(
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             fallback_url, fallback_user, fallback_password, fallback_authority, \
              created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
              price_per_th_day, budget FROM orders WHERE id = ?",
             id
@@ -278,6 +305,7 @@ impl OrderStore {
         sqlx::query_as!(
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             fallback_url, fallback_user, fallback_password, fallback_authority, \
              created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
              price_per_th_day, budget FROM orders"
         )
@@ -294,6 +322,7 @@ impl OrderStore {
         let rows = sqlx::query_as!(
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             fallback_url, fallback_user, fallback_password, fallback_authority, \
              created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
              price_per_th_day, budget FROM orders \
              WHERE worker = ? AND status = 'active' AND (until_ms = 0 OR until_ms > ?)",
@@ -371,6 +400,7 @@ impl OrderStore {
         let active = sqlx::query_as!(
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             fallback_url, fallback_user, fallback_password, fallback_authority, \
              created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
              price_per_th_day, budget FROM orders WHERE status = 'active'"
         )
@@ -434,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn create_active_for_worker_and_cancel() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let o = store.create("w1".into(), target(), 0, 0.0, 0.0).await.unwrap(); // open-ended
+        let o = store.create("w1".into(), target(), None,0, 0.0, 0.0).await.unwrap(); // open-ended
         assert!(store.active_for_worker("w1", now_ms()).await.is_some());
         let cancelled = store.cancel(&o.id).await.unwrap();
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
@@ -444,24 +474,24 @@ mod tests {
     #[tokio::test]
     async fn one_active_order_per_worker() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let first = store.create("w7".into(), target(), 0, 0.0, 0.0).await.unwrap();
+        let first = store.create("w7".into(), target(), None,0, 0.0, 0.0).await.unwrap();
         // A second active order for the same worker is rejected by the DB guard.
         assert!(matches!(
-            store.create("w7".into(), target(), 0, 0.0, 0.0).await,
+            store.create("w7".into(), target(), None,0, 0.0, 0.0).await,
             Err(CreateOrderError::AlreadyActive)
         ));
         // A different worker is unaffected.
-        assert!(store.create("w8".into(), target(), 0, 0.0, 0.0).await.is_ok());
+        assert!(store.create("w8".into(), target(), None,0, 0.0, 0.0).await.is_ok());
         // Once the first ends, the worker can be rented again.
         store.cancel(&first.id).await.unwrap();
-        assert!(store.create("w7".into(), target(), 0, 0.0, 0.0).await.is_ok());
+        assert!(store.create("w7".into(), target(), None,0, 0.0, 0.0).await.is_ok());
     }
 
     #[tokio::test]
     async fn expiry_marks_ended_and_is_returned() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let _past = store.create("w2".into(), target(), now_ms() - 1000, 0.0, 0.0).await.unwrap();
-        let _live = store.create("w3".into(), target(), now_ms() + 60_000, 0.0, 0.0).await.unwrap();
+        let _past = store.create("w2".into(), target(), None,now_ms() - 1000, 0.0, 0.0).await.unwrap();
+        let _live = store.create("w3".into(), target(), None,now_ms() + 60_000, 0.0, 0.0).await.unwrap();
         let expired = store.take_expired(now_ms()).await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].worker, "w2");
@@ -473,7 +503,7 @@ mod tests {
     async fn funding_exhausted_ends_the_order() {
         let store = OrderStore::new(crate::db::test_pool().await);
         // price 1.0 per TH·day, prepaid budget 100, open-ended deadline.
-        let o = store.create("w5".into(), target(), 0, 1.0, 100.0).await.unwrap();
+        let o = store.create("w5".into(), target(), None,0, 1.0, 100.0).await.unwrap();
         assert!(store.take_expired(now_ms()).await.is_empty(), "fresh order is live");
 
         let work_for_100_th_days = 100.0 * HASHES_PER_TH_DAY / DIFF1_HASHES;
@@ -492,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn work_and_submitted_accumulate() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let o = store.create("w6".into(), target(), 0, 0.0, 0.0).await.unwrap();
+        let o = store.create("w6".into(), target(), None,0, 0.0, 0.0).await.unwrap();
         store.add_work(&o.id, 2.5, 2);
         store.add_work(&o.id, 1.5, 1);
         store.add_submitted(&o.id, 4);
@@ -504,9 +534,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallback_pool_round_trips() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let fb = UpstreamTarget {
+            url: "fallback:3333".into(),
+            user: "fb".into(),
+            password: "x".into(),
+            authority_pubkey: Some("KEY".into()),
+        };
+        let o = store.create("wf".into(), target(), Some(fb.clone()), 0, 0.0, 0.0).await.unwrap();
+        assert_eq!(o.fallback, Some(fb.clone()));
+        assert_eq!(store.get(&o.id).await.unwrap().fallback, Some(fb));
+        // No fallback round-trips as None.
+        let o2 = store.create("wf2".into(), target(), None, 0, 0.0, 0.0).await.unwrap();
+        assert!(store.get(&o2.id).await.unwrap().fallback.is_none());
+    }
+
+    #[tokio::test]
     async fn add_work_is_buffered_until_flush() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let o = store.create("wb".into(), target(), 0, 0.0, 0.0).await.unwrap();
+        let o = store.create("wb".into(), target(), None,0, 0.0, 0.0).await.unwrap();
         store.add_work(&o.id, 3.0, 2);
         store.add_submitted(&o.id, 5);
         // Buffered — not yet in the DB.
@@ -527,7 +574,7 @@ mod tests {
         let pool = crate::db::test_pool().await;
         let id = {
             let store = OrderStore::new(pool.clone());
-            store.create("w4".into(), target(), 0, 0.0, 0.0).await.unwrap().id
+            store.create("w4".into(), target(), None,0, 0.0, 0.0).await.unwrap().id
         };
         let reloaded = OrderStore::new(pool);
         assert!(reloaded.get(&id).await.is_some());

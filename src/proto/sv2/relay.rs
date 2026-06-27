@@ -1728,6 +1728,7 @@ mod tests {
             .create(
                 "bc1qSELLER.rig1".into(),
                 ext_target(&b_addr.to_string(), "acctB"),
+                None,
                 0,
                 0.0,
                 0.0,
@@ -2101,7 +2102,7 @@ mod tests {
         register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
         // Rental already active for this worker, targeting buyer pool B.
         let order = orders
-            .create("bc1qSELLER.rig1".into(), ext_target(&b_addr.to_string(), "acctB"), 0, 0.0, 0.0)
+            .create("bc1qSELLER.rig1".into(), ext_target(&b_addr.to_string(), "acctB"), None, 0, 0.0, 0.0)
             .await
             .unwrap();
 
