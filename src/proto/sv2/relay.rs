@@ -13,10 +13,13 @@
 //! `SetTarget` — the downstream `channel_id`s are unchanged, so the miner never
 //! reconnects. The new upstream's jobs + prev-hash then stream through.
 //!
-//! Multiple mining channels per connection are supported: the first is opened
-//! synchronously during the handshake; additional `OpenMiningChannel`s are
-//! forwarded to the upstream and finalized asynchronously when its success
-//! arrives. Each channel maps its own downstream↔upstream `channel_id`.
+//! Multiple mining channels per connection are supported. Every `OpenMiningChannel`
+//! — the miner's first as well as any additional one — is forwarded to the
+//! upstream as a `pending` open and finalized by the steady reader when its
+//! success arrives (assign a stable downstream id, map it, reply to the miner).
+//! Each channel maps its own downstream↔upstream `channel_id`. The only
+//! synchronous open is the switch re-open (see [`open_on`]), which must stage the
+//! new upstream before the atomic swap.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -352,7 +355,12 @@ async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, 
     }
 }
 
-/// Open a channel on an already-setup upstream and read until its success.
+/// Synchronously open a channel on an already-setup upstream and read until its
+/// success — the staging primitive for a rental switch. The switch must have the
+/// new upstream's channels fully open (new `channel_id`s known) *before* it
+/// atomically swaps `active`, so miner traffic is never routed to a channel that
+/// isn't open yet. The fresh-open path (initial + additional channels) instead
+/// finalizes through the steady reader; this is only used by [`Sv2Session::swap_upstream`].
 async fn open_on(
     read: &mut Read,
     write: &mut Write,
@@ -375,11 +383,14 @@ async fn open_on(
                 bail!("upstream rejected OpenMiningChannel")
             }
             other => {
-                // Frames the pool emits *before* OpenSuccess (e.g. a future
-                // NewExtendedMiningJob + SetNewPrevHash that bootstrap the new
-                // channel). Currently discarded — log so we can confirm the
-                // miner is starved of its initial job.
-                tracing::warn!(mt = ?other, "sv2 open_on discarding pre-OpenSuccess frame");
+                // Per the SV2 spec the pool assigns the channel in its
+                // OpenSuccess before it can address any job/prev-hash to it, so
+                // nothing channel-scoped legitimately precedes the success here.
+                // The pool's initial NewExtendedMiningJob + SetNewPrevHash arrive
+                // *after* it and are read by the steady upstream reader — the same
+                // `read` half (with its buffered frames) is handed to it, so they
+                // are not lost. A frame before the success is unexpected; skip it.
+                tracing::warn!(mt = ?other, "sv2 open_on: unexpected frame before OpenSuccess; skipping");
                 continue;
             }
         }
@@ -605,11 +616,18 @@ impl Sv2Session {
         }
 
         let (to_up, up_rx) = mpsc::unbounded_channel();
-        let writer = spawn_writer(write, up_rx);
-        let reader = spawn_upstream_reader(self.clone(), generation, read);
 
         let abandoned: Vec<u32> = {
             let mut i = self.inner.lock().await;
+            // Spawn the new upstream's reader/writer while holding the lock and
+            // install `active` (carrying the new generation) before releasing it.
+            // The reader tags each frame with `generation`, and `on_upstream_frame`
+            // drops frames whose generation != the active one. Spawning inside the
+            // lock means the reader cannot process the new pool's initial job /
+            // prev-hash until `active.generation` already equals `generation`, so
+            // that first job is never dropped as "stale".
+            let writer = spawn_writer(write, up_rx);
+            let reader = spawn_upstream_reader(self.clone(), generation, read);
             i.active.reader.abort();
             i.active.writer.abort();
             i.active = ActiveUpstream {
@@ -851,8 +869,7 @@ pub async fn handle_seller_miner_sv2(
         parse_miner_open(&mut open_frame).ok_or_else(|| anyhow!("expected OpenMiningChannel"))?;
 
     // 4. Register-only: the worker MUST have a registered rig (its idle pool).
-    //    No rig → reject and close. An active rental switches onto the buyer
-    //    after the channel is open (step 8).
+    //    No rig → reject and close.
     let idle_target = match ctx.sellers.default_pool(&worker).await {
         Some(t) => t,
         None => {
@@ -861,43 +878,56 @@ pub async fn handle_seller_miner_sv2(
         }
     };
 
-    // 5. Connect upstream = the rig's idle pool + open the same channel type.
+    // 5. Decide where the first channel opens: straight on the buyer's pool if a
+    //    rental is already active (resume on reconnect without an open-then-switch
+    //    round-trip), else the rig's idle pool. `default_target` stays the idle
+    //    pool either way, so a release/revert returns there.
+    let active_order = ctx
+        .orders
+        .active_for_worker(&worker, crate::orders::now_ms())
+        .await;
+    let (open_target, routing) = match &active_order {
+        Some(o) => (
+            o.target.clone(),
+            Routing::Rented {
+                order_id: o.id.clone(),
+                target: o.target.clone(),
+                until_unix_ms: 0,
+            },
+        ),
+        None => (idle_target.clone(), Routing::Idle),
+    };
+
+    // 6. Connect the chosen upstream (SetupConnection only). The channel open is
+    //    finalized by the steady reader below — the miner's OpenMiningChannel is
+    //    forwarded as a `pending` open, exactly like an additional channel or a
+    //    switch re-open, so there is a single open-finalize path.
     //    user_identity = pool account + the miner's worker, tagged -bp-proxy, so
     //    the pool shows the rig (not "default") and marks it as proxied.
-    let up_ident = crate::proto::relay::upstream_worker(&idle_target.user, &worker);
-    let (mut up_read, mut up_write, _up_flags) = connect_setup(&idle_target).await?;
-    let info = open_on(&mut up_read, &mut up_write, &spec, &up_ident).await?;
-    // Stable, proxy-assigned downstream channel id for the first channel.
-    let down_channel_id = 1u32;
-
-    // 6. Build the session and wire up the initial upstream.
+    let up_ident = crate::proto::relay::upstream_worker(&open_target.user, &worker);
+    let (up_read, up_write, _up_flags) = connect_setup(&open_target).await?;
     let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
     let up_writer = spawn_writer(up_write, up_rx);
-    let mut up_to_down = std::collections::HashMap::new();
-    up_to_down.insert(info.up_channel_id, down_channel_id);
+    let mut pending = std::collections::HashMap::new();
+    pending.insert(spec.request_id(), spec.clone());
     let session = Arc::new(Sv2Session {
         to_miner: to_miner.clone(),
         orders: ctx.orders.clone(),
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
                 generation: 0,
-                target: idle_target.clone(),
+                target: open_target.clone(),
                 to_up,
                 reader: tokio::spawn(async {}), // placeholder, replaced below
                 writer: up_writer,
             },
             generation_counter: 0,
-            channels: vec![Channel {
-                down_channel_id,
-                up_channel_id: info.up_channel_id,
-                spec: spec.clone(),
-                difficulty: difficulty_from_target(&info.target),
-            }],
-            up_to_down,
+            channels: Vec::new(),
+            up_to_down: std::collections::HashMap::new(),
             group_down_id: None,
-            pending: std::collections::HashMap::new(),
-            next_down_cid: 2,
-            routing: Routing::Idle,
+            pending,
+            next_down_cid: 1,
+            routing,
             default_target: idle_target.clone(),
             hashrate: HashrateWindow::new(Duration::from_secs(600)),
             delivered_work: 0.0,
@@ -907,43 +937,29 @@ pub async fn handle_seller_miner_sv2(
             label: worker.clone(),
         }),
     });
-    // Map the Extended group_channel_id into the downstream namespace so the
-    // pool's group-broadcast jobs reach the miner (Standard channels: no-op).
-    let down_group_id = {
+
+    // 7. Wire the steady reader to the session (replacing the placeholder), then
+    //    send the miner's OpenMiningChannel upstream. Its OpenSuccess streams back
+    //    through the reader, which assigns the stable downstream channel id, maps
+    //    it (incl. the Extended group id), and replies OpenSuccess to the miner;
+    //    the pool's jobs + prev-hash then follow on the same socket.
+    {
         let reader = spawn_upstream_reader(session.clone(), 0, up_read);
         let mut i = session.inner.lock().await;
         let old = std::mem::replace(&mut i.active.reader, reader);
         old.abort();
-        i.map_group(info.group_channel_id, spec.is_extended())
-    };
-
-    // 7. Tell the miner its channel is open (downstream channel id + upstream's
-    //    extranonce/target). The upstream's jobs + prev-hash then stream through.
-    to_miner
-        .send(open_success_downstream(
-            &spec,
-            down_channel_id,
-            down_group_id,
-            &info,
-        )?)
-        .map_err(|_| anyhow!("miner writer gone"))?;
+        i.active
+            .to_up
+            .send(open_channel_upstream(&spec, &up_ident)?)
+            .map_err(|_| anyhow!("upstream writer gone"))?;
+    }
 
     ctx.registry
         .insert(worker.clone(), AnySession::Sv2(session.clone()))
         .await;
-    info!(
-        %peer, %worker, upstream = %idle_target.url,
-        initial_diff = difficulty_from_target(&info.target),
-        "sv2 relay established (idle)"
-    );
-
-    // 8. We already opened on the rig's idle pool; if a rental is active, switch
-    //    the session onto the buyer's target now.
-    if let Some(order) = ctx.orders.active_for_worker(&worker, crate::orders::now_ms()).await {
-        match session.switch_to(order.id.clone(), order.target.clone()).await {
-            Ok(()) => info!(%worker, order = %order.id, "resumed active rental"),
-            Err(e) => warn!(%worker, error = %e, "resume rental failed"),
-        }
+    match &active_order {
+        Some(o) => info!(%peer, %worker, upstream = %open_target.url, order = %o.id, "sv2 relay established (rented)"),
+        None => info!(%peer, %worker, upstream = %open_target.url, "sv2 relay established (idle)"),
     }
 
     // 9. Downstream loop: open additional channels and forward shares/updates
@@ -1923,6 +1939,180 @@ mod tests {
             job_cid, down_group,
             "group-broadcast job remapped to the downstream group id"
         );
+    }
+
+    /// A pool that completes the channel open (cid 99) and then *immediately*
+    /// broadcasts a `NewExtendedMiningJob` addressed to that channel — like a real
+    /// pool bootstrapping a freshly opened channel right after its OpenSuccess.
+    async fn mock_pool_job_after_open(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
+        let (sock, _) = listener.accept().await?;
+        let _ = sock.set_nodelay(true);
+        let stream =
+            accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+                .await
+                .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+        let (mut read, mut write) = stream.into_split();
+        loop {
+            let f = read_one(&mut read).await?;
+            if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+                break;
+            }
+        }
+        write.write_frame(setup_success(0)).await.map_err(|e| anyhow!("{e:?}"))?;
+        while let Ok(mut f) = read_one(&mut read).await {
+            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
+                let Some(open) = parse_miner_open(&mut f) else {
+                    continue;
+                };
+                let info = ChannelInfo {
+                    request_id: open.spec.request_id(),
+                    up_channel_id: 99,
+                    extranonce_prefix: vec![0xBB; 8],
+                    target: diff1_target(),
+                    extranonce_size: 8,
+                    group_channel_id: 0,
+                };
+                write
+                    .write_frame(open_success_downstream(&open.spec, 99, 0, &info)?)
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?;
+                // Bootstrap job, sent right after OpenSuccess to the channel id.
+                let empty_path: Vec<U256> = vec![];
+                let job = mining::NewExtendedMiningJob {
+                    channel_id: 99,
+                    job_id: 7,
+                    min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                    version: 0x2000_0000,
+                    version_rolling_allowed: true,
+                    merkle_path: empty_path.into(),
+                    coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                    coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                };
+                write
+                    .write_frame(wire::frame_from(AnyMessage::Mining(
+                        Mining::NewExtendedMiningJob(job),
+                    )))
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn switch_delivers_new_upstream_initial_job() {
+        // Regression: on a rental switch the proxy opens a fresh channel on the
+        // new upstream, then the steady reader takes over the same socket. The
+        // job the new pool broadcasts right after OpenSuccess must reach the miner
+        // (remapped to its stable downstream channel id) — i.e. the reader must
+        // already be on the new generation when it processes that first frame, and
+        // the post-OpenSuccess frames buffered on the socket must not be lost.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = pool_b.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool_job_after_open(pool_b, NoiseKeys::generate()));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, _) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+
+        // Rent: switch onto pool B, which sends a job right after the reopen.
+        let sess = loop {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        sess.switch_to("o1".to_string(), ext_target(&b_addr.to_string(), "acctB"))
+            .await
+            .unwrap();
+
+        // The new upstream's bootstrap job must reach the miner, remapped to the
+        // stable downstream channel id (read_until_cid skips the switch's
+        // SetExtranoncePrefix/SetTarget re-point frames).
+        let job_cid = tokio::time::timeout(
+            Duration::from_secs(5),
+            miner.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+        )
+        .await
+        .expect("new upstream's post-switch job was dropped — timed out")
+        .unwrap();
+        assert_eq!(
+            job_cid, down_cid,
+            "post-switch job remapped to the stable downstream channel id"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_active_rental_opens_on_buyer_directly() {
+        // Reconnect-resume: when an order is already active as the miner connects,
+        // the first channel opens straight on the buyer's pool (no idle-then-switch
+        // round-trip) and the session reads rented immediately.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap(); // rig idle pool
+        let a_addr = pool_a.local_addr().unwrap();
+        let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap(); // buyer pool
+        let b_addr = pool_b.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let orders = crate::orders::OrderStore::new(db.clone());
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: orders.clone(),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        // Rental already active for this worker, targeting buyer pool B.
+        let order = orders
+            .create("bc1qSELLER.rig1".into(), ext_target(&b_addr.to_string(), "acctB"), 0, 0.0, 0.0)
+            .await;
+
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (_down_cid, prefix) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+        assert_eq!(prefix, vec![0xBB; 8], "first channel opened directly on the buyer pool");
+
+        let st = loop {
+            if let Some(s) = registry.aggregated_status("bc1qSELLER.rig1").await {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(st.routing, "rented", "session is rented on connect");
+        assert_eq!(st.order_id.as_deref(), Some(order.id.as_str()));
     }
 
     #[tokio::test]
