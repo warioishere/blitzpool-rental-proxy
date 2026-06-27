@@ -42,6 +42,11 @@ type Tx = mpsc::UnboundedSender<String>;
 /// How long a reconnect-hint stays valid (the miner should reconnect at once).
 const RECONNECT_HINT_TTL: Duration = Duration::from_secs(120);
 
+/// After authorize, how long to wait for the miner's `mining.extranonce.subscribe`
+/// before deciding live-switch vs reconnect. Miners (e.g. BitAxe) send it only
+/// after they receive the authorize result, so the proxy must give it a moment.
+const EXTRANONCE_GRACE: Duration = Duration::from_millis(800);
+
 /// Per-source-IP reconnect hints. When a miner that can't take a live
 /// extranonce change authorizes onto a pool different from its handshake pool,
 /// we remember that pool here, send `client.reconnect`, and on the reconnect run
@@ -57,6 +62,17 @@ fn reconnect_hints() -> &'static Mutex<HashMap<String, (UpstreamTarget, Instant)
 /// Source IP (no port) of a `host:port` peer string — the reconnect-hint key.
 fn peer_ip(peer: &str) -> String {
     peer.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_else(|| peer.to_string())
+}
+
+/// Worker name to send upstream: the upstream account (pool user / buyer) plus
+/// the miner's own worker name, tagged `-bp-proxy` so the pool clearly shows the
+/// hashrate is coming through the rental proxy. The account part (before the
+/// first `.`) stays a valid payout address; the tag rides on the worker suffix.
+fn upstream_worker(account: &str, miner_label: &str) -> String {
+    match miner_label.split_once('.').map(|(_, s)| s).filter(|s| !s.is_empty()) {
+        Some(suffix) => format!("{account}.{suffix}-bp-proxy"),
+        None => format!("{account}.bp-proxy"),
+    }
 }
 
 /// The live upstream for a session (replaced wholesale on a switch).
@@ -278,7 +294,8 @@ impl Session {
                         i.label = w.to_string();
                         registry.insert(w.to_string(), AnySession::Sv1(self.clone())).await;
                     }
-                    msg.params = Some(json!([i.active.target.user, i.active.target.password]));
+                    let up_worker = upstream_worker(&i.active.target.user, &i.label);
+                    msg.params = Some(json!([up_worker, i.active.target.password]));
                 }
                 Some("mining.submit") => {
                     let diff = i.current_difficulty;
@@ -288,9 +305,10 @@ impl Session {
                     if let Routing::Rented { order_id, .. } = &i.routing {
                         submit_order = Some(order_id.clone());
                     }
+                    let up_worker = upstream_worker(&i.active.target.user, &i.label);
                     if let Some(arr) = msg.params.as_mut().and_then(|p| p.as_array_mut()) {
                         if let Some(first) = arr.first_mut() {
-                            *first = json!(i.active.target.user);
+                            *first = json!(up_worker);
                         }
                     }
                 }
@@ -675,27 +693,76 @@ pub async fn handle_seller_miner(
                                 } else {
                                     info!(worker = %w, upstream = %want.url, "on seller default pool");
                                 }
-                            } else if session.inner.lock().await.extranonce_capable {
-                                // Live switch: the miner takes a set_extranonce.
-                                let res = match &order {
-                                    Some(o) => session.switch_to(o.id.clone(), o.target.clone()).await,
-                                    None => session.set_default(want.clone()).await,
-                                };
-                                match res {
-                                    Ok(()) => info!(worker = %w, upstream = %want.url, "switched upstream"),
-                                    Err(e) => warn!(worker = %w, error = %e, "upstream switch failed"),
-                                }
                             } else {
-                                // Can't take a live extranonce change → reconnect the
-                                // miner straight onto its pool (correct extranonce from
-                                // the first job, no mid-session switch).
-                                reconnect_hints()
-                                    .lock()
-                                    .await
-                                    .insert(ip.clone(), (want, Instant::now()));
-                                let _ = to_miner.send(RpcMessage::client_reconnect("", 0, 1).to_line());
-                                info!(worker = %w, "non-extranonce miner → client.reconnect onto its pool");
-                                break;
+                                // A switch is needed. The miner sends
+                                // mining.extranonce.subscribe only AFTER it receives
+                                // the authorize result (which the upstream is
+                                // delivering now), so wait briefly for it before
+                                // choosing a live switch vs a reconnect.
+                                if !session.inner.lock().await.extranonce_capable {
+                                    let deadline = Instant::now() + EXTRANONCE_GRACE;
+                                    loop {
+                                        if session.inner.lock().await.extranonce_capable {
+                                            break;
+                                        }
+                                        let remaining =
+                                            deadline.saturating_duration_since(Instant::now());
+                                        if remaining.is_zero() {
+                                            break;
+                                        }
+                                        match tokio::time::timeout(remaining, lines.next_line()).await
+                                        {
+                                            Ok(Ok(Some(l))) => {
+                                                let t = l.trim();
+                                                if t.is_empty() {
+                                                    continue;
+                                                }
+                                                let Ok(gm) = RpcMessage::parse(t) else {
+                                                    continue;
+                                                };
+                                                if gm.method.as_deref()
+                                                    == Some("mining.extranonce.subscribe")
+                                                {
+                                                    session.inner.lock().await.extranonce_capable =
+                                                        true;
+                                                    let reply = RpcMessage {
+                                                        id: gm.id.clone(),
+                                                        method: None,
+                                                        params: None,
+                                                        result: Some(json!(true)),
+                                                        error: Some(Value::Null),
+                                                    };
+                                                    let _ = to_miner.send(reply.to_line());
+                                                } else {
+                                                    session.on_miner_msg(gm, &registry).await;
+                                                }
+                                            }
+                                            _ => break, // timeout, EOF, or read error
+                                        }
+                                    }
+                                }
+                                if session.inner.lock().await.extranonce_capable {
+                                    // Live switch: the miner takes a set_extranonce.
+                                    let res = match &order {
+                                        Some(o) => session.switch_to(o.id.clone(), o.target.clone()).await,
+                                        None => session.set_default(want.clone()).await,
+                                    };
+                                    match res {
+                                        Ok(()) => info!(worker = %w, upstream = %want.url, "switched upstream (extranonce-capable)"),
+                                        Err(e) => warn!(worker = %w, error = %e, "upstream switch failed"),
+                                    }
+                                } else {
+                                    // Can't take a live extranonce change → reconnect the
+                                    // miner straight onto its pool (correct extranonce from
+                                    // the first job, no mid-session switch).
+                                    reconnect_hints()
+                                        .lock()
+                                        .await
+                                        .insert(ip.clone(), (want, Instant::now()));
+                                    let _ = to_miner.send(RpcMessage::client_reconnect("", 0, 1).to_line());
+                                    info!(worker = %w, "non-extranonce miner → client.reconnect onto its pool");
+                                    break;
+                                }
                             }
                         }
                     } else {
@@ -735,6 +802,22 @@ mod tests {
     /// them in `prelude` (so the relay can forward them) and still return the
     /// response — dropping them leaves the miner at "diff 0" → every share
     /// rejected as "Difficulty too low".
+    #[test]
+    fn upstream_worker_keeps_rig_and_tags_proxy() {
+        // Account stays a valid payout address; rig name kept + tagged.
+        assert_eq!(
+            upstream_worker("bc1qSELLER", "bc1qSELLER.bitaxe"),
+            "bc1qSELLER.bitaxe-bp-proxy"
+        );
+        // Rental: buyer account, seller's rig name, still tagged → reaches the buyer.
+        assert_eq!(
+            upstream_worker("bc1qBUYER", "bc1qSELLER.bitaxe"),
+            "bc1qBUYER.bitaxe-bp-proxy"
+        );
+        // No worker suffix → tag becomes the worker name (account stays valid).
+        assert_eq!(upstream_worker("bc1qADDR", "bc1qADDR"), "bc1qADDR.bp-proxy");
+    }
+
     #[test]
     fn peer_ip_strips_port() {
         assert_eq!(peer_ip("192.168.5.20:64178"), "192.168.5.20");
