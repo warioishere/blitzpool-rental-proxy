@@ -30,7 +30,10 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 #     (connect_with_noise / accept_noise_connection → NoiseTcpStream).
 # stratum-core and stratum-apps' transitive stratum-core unify on branch=main;
 # the exact rev is pinned in Cargo.lock (kept in sync with the sv2-apps rev).
-stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main", optional = true }
+# The `translation` feature adds the stratum_translation + sv1_api sub-crates:
+# SV1↔SV2 message conversion + the SV1 protocol types, used by the bidirectional
+# translator that lets a buyer pool speak either protocol regardless of the rig.
+stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main", features = ["translation"], optional = true }
 stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps", rev = "27985c63f7c47310281289d4da17b90780bb11fd", default-features = false, features = ["network", "std"], optional = true }
 # secp256k1 matched to noise_sv2's version so the keypair types line up; rand
 # for key generation.
