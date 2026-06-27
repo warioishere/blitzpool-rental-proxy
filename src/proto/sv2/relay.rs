@@ -814,7 +814,7 @@ impl Sv2Session {
         drop(i);
 
         if let Some((order_id, work, shares)) = order_credit {
-            self.orders.add_work(&order_id, work, shares).await;
+            self.orders.add_work(&order_id, work, shares);
         }
     }
 
@@ -1033,7 +1033,7 @@ pub async fn handle_seller_miner_sv2(
                     }
                 }
                 if let Some(order_id) = submit_order {
-                    session.orders.add_submitted(&order_id, 1).await;
+                    session.orders.add_submitted(&order_id, 1);
                 }
             } else {
                 debug!(mt, "ignoring non-channel-scoped downstream message");
@@ -1766,14 +1766,15 @@ mod tests {
             b_rx.recv().await.unwrap(); // pool B received the submit
         }
 
-        // Work is credited just after the success is forwarded; poll the order
-        // (bounded, so a regression fails the test instead of hanging).
+        // Work is buffered as the successes are forwarded; flush each poll to
+        // drain it to the DB (bounded, so a regression fails instead of hanging).
         let mut credited = orders.get(&order.id).await.unwrap();
         for _ in 0..100_000 {
             if credited.accepted_shares >= k {
                 break;
             }
             tokio::task::yield_now().await;
+            orders.flush().await;
             credited = orders.get(&order.id).await.unwrap();
         }
         assert_eq!(credited.accepted_shares, k, "accepted shares credited to order");

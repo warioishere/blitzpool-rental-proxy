@@ -8,8 +8,9 @@
 //! and finished orders are cleaned up after a restart. Measured delivered work
 //! (the billing basis) is accumulated durably here.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -183,13 +184,30 @@ impl std::fmt::Display for CreateOrderError {
 
 impl std::error::Error for CreateOrderError {}
 
+/// Per-order accounting buffered in memory between DB flushes.
+#[derive(Default, Clone, Copy)]
+struct WorkDelta {
+    work: f64,
+    accepted: u64,
+    submitted: u64,
+}
+
 pub struct OrderStore {
     pool: SqlitePool,
+    /// Measured work / share counts buffered per order, flushed to the DB
+    /// periodically by [`OrderStore::flush`] (one UPDATE per order) instead of
+    /// one write per share. The expiry task flushes every tick before checking
+    /// budgets, so funding enforcement stays current; a crash loses at most one
+    /// flush interval of credit (the buyer is then slightly under-charged).
+    pending: Mutex<HashMap<String, WorkDelta>>,
 }
 
 impl OrderStore {
     pub fn new(pool: SqlitePool) -> Arc<Self> {
-        Arc::new(Self { pool })
+        Arc::new(Self {
+            pool,
+            pending: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Record a new active rental. Fails with [`CreateOrderError::AlreadyActive`]
@@ -297,30 +315,48 @@ impl OrderStore {
             .find(|o| !o.funding_exhausted())
     }
 
-    /// Credit measured delivered work to an order. No-op if the order is unknown.
-    pub async fn add_work(&self, id: &str, work: f64, accepted_shares: u64) {
-        let shares = accepted_shares as i64;
-        let _ = sqlx::query!(
-            "UPDATE orders SET delivered_work = delivered_work + ?, \
-             accepted_shares = accepted_shares + ? WHERE id = ?",
-            work,
-            shares,
-            id
-        )
-        .execute(&self.pool)
-        .await;
+    /// Buffer measured delivered work + accepted shares for an order; written to
+    /// the DB by [`OrderStore::flush`]. Hot-path: in-memory only, no DB write.
+    pub fn add_work(&self, id: &str, work: f64, accepted_shares: u64) {
+        let mut p = self.pending.lock().unwrap();
+        let d = p.entry(id.to_string()).or_default();
+        d.work += work;
+        d.accepted += accepted_shares;
     }
 
-    /// Count submitted shares against an order (for the accept-ratio).
-    pub async fn add_submitted(&self, id: &str, submitted: u64) {
-        let n = submitted as i64;
-        let _ = sqlx::query!(
-            "UPDATE orders SET submitted_shares = submitted_shares + ? WHERE id = ?",
-            n,
-            id
-        )
-        .execute(&self.pool)
-        .await;
+    /// Buffer submitted shares for an order (for the accept-ratio); written by
+    /// [`OrderStore::flush`]. Hot-path: in-memory only.
+    pub fn add_submitted(&self, id: &str, submitted: u64) {
+        let mut p = self.pending.lock().unwrap();
+        p.entry(id.to_string()).or_default().submitted += submitted;
+    }
+
+    /// Flush buffered accounting to the DB — one UPDATE per order, coalescing all
+    /// the per-share deltas accumulated since the last flush. A no-op if nothing
+    /// is buffered. Never holds the buffer lock across the DB await.
+    pub async fn flush(&self) {
+        let drained: Vec<(String, WorkDelta)> = {
+            let mut p = self.pending.lock().unwrap();
+            if p.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *p).into_iter().collect()
+        };
+        for (id, d) in drained {
+            let accepted = d.accepted as i64;
+            let submitted = d.submitted as i64;
+            let _ = sqlx::query!(
+                "UPDATE orders SET delivered_work = delivered_work + ?, \
+                 accepted_shares = accepted_shares + ?, \
+                 submitted_shares = submitted_shares + ? WHERE id = ?",
+                d.work,
+                accepted,
+                submitted,
+                id
+            )
+            .execute(&self.pool)
+            .await;
+        }
     }
 
     /// Cancel an order; returns it (status updated) so the caller can revert.
@@ -373,6 +409,9 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
+            // Persist buffered share accounting before checking budgets, so
+            // funding_exhausted sees the just-delivered work.
+            orders.flush().await;
             for o in orders.take_expired(now_ms()).await {
                 let sessions = registry.get_all(&o.worker).await;
                 if !sessions.is_empty() {
@@ -445,7 +484,8 @@ mod tests {
         assert!(store.take_expired(now_ms()).await.is_empty(), "fresh order is live");
 
         let work_for_100_th_days = 100.0 * HASHES_PER_TH_DAY / DIFF1_HASHES;
-        store.add_work(&o.id, work_for_100_th_days, 1).await;
+        store.add_work(&o.id, work_for_100_th_days, 1);
+        store.flush().await;
 
         let after = store.get(&o.id).await.unwrap();
         assert!((after.cost() - 100.0).abs() < 1e-6, "cost ≈ budget");
@@ -460,13 +500,33 @@ mod tests {
     async fn work_and_submitted_accumulate() {
         let store = OrderStore::new(crate::db::test_pool().await);
         let o = store.create("w6".into(), target(), 0, 0.0, 0.0).await.unwrap();
-        store.add_work(&o.id, 2.5, 2).await;
-        store.add_work(&o.id, 1.5, 1).await;
-        store.add_submitted(&o.id, 4).await;
+        store.add_work(&o.id, 2.5, 2);
+        store.add_work(&o.id, 1.5, 1);
+        store.add_submitted(&o.id, 4);
+        store.flush().await;
         let got = store.get(&o.id).await.unwrap();
         assert!((got.delivered_work - 4.0).abs() < 1e-9);
         assert_eq!(got.accepted_shares, 3);
         assert_eq!(got.submitted_shares, 4);
+    }
+
+    #[tokio::test]
+    async fn add_work_is_buffered_until_flush() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let o = store.create("wb".into(), target(), 0, 0.0, 0.0).await.unwrap();
+        store.add_work(&o.id, 3.0, 2);
+        store.add_submitted(&o.id, 5);
+        // Buffered — not yet in the DB.
+        let before = store.get(&o.id).await.unwrap();
+        assert_eq!(before.delivered_work, 0.0);
+        assert_eq!(before.accepted_shares, 0);
+        assert_eq!(before.submitted_shares, 0);
+        // Flush coalesces the buffered deltas into one write.
+        store.flush().await;
+        let after = store.get(&o.id).await.unwrap();
+        assert!((after.delivered_work - 3.0).abs() < 1e-9);
+        assert_eq!(after.accepted_shares, 2);
+        assert_eq!(after.submitted_shares, 5);
     }
 
     #[tokio::test]

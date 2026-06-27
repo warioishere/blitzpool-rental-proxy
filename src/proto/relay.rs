@@ -287,7 +287,7 @@ impl Session {
             }
         }
         if let Some((order_id, diff)) = order_credit {
-            self.orders.add_work(&order_id, diff, 1).await;
+            self.orders.add_work(&order_id, diff, 1);
         }
         Some(msg.to_line())
     }
@@ -333,7 +333,7 @@ impl Session {
             let _ = i.active.to_up.send(msg.to_line());
         }
         if let Some(order_id) = submit_order {
-            self.orders.add_submitted(&order_id, 1).await;
+            self.orders.add_submitted(&order_id, 1);
         }
     }
 

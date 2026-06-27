@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE orders SET delivered_work = delivered_work + ?, accepted_shares = accepted_shares + ?, submitted_shares = submitted_shares + ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "8b851e127ed70b44ce59fe1d8d5b5aa6724251b7ad3cc24a96ecf9a56afb3082"
+}
