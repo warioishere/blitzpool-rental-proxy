@@ -93,7 +93,9 @@ pub struct Order {
 }
 
 impl Order {
-    fn is_live(&self, now: i64) -> bool {
+    /// An order that's currently in effect: active, not past its deadline, and
+    /// with prepaid budget remaining.
+    pub fn is_live(&self, now: i64) -> bool {
         self.status == OrderStatus::Active
             && (self.until_ms == 0 || self.until_ms > now)
             && !self.funding_exhausted()

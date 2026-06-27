@@ -9,7 +9,7 @@
 //!
 //! Seller-config + order endpoints are added by their modules (sellers/orders).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::orders::OrderStore;
+use crate::orders::{now_ms, OrderStore};
 use crate::registry::Registry;
 use crate::session::UpstreamTarget;
 use crate::store::{Rig, SellerStore};
@@ -202,10 +202,15 @@ fn is_delivering(hashrate_hs: f64) -> bool {
     hashrate_hs > 0.0
 }
 
-/// Merge each rig with its live status (`online` + `hashrate_hs`), keyed by
-/// worker. `live` maps currently-connected workers to their windowed hashrate
-/// estimate (hashes/second); a worker absent from `live` is offline.
-fn enrich_sellers(sellers: HashMap<String, Rig>, live: &HashMap<String, f64>) -> Map<String, Value> {
+/// Merge each rig with its live status (`online`, `hashrate_hs`, `rented`),
+/// keyed by worker. `live` maps currently-connected workers to their windowed
+/// hashrate estimate (hashes/second); a worker absent from `live` is offline.
+/// `rented` is the set of workers with an active rental order.
+fn enrich_sellers(
+    sellers: HashMap<String, Rig>,
+    live: &HashMap<String, f64>,
+    rented: &HashSet<String>,
+) -> Map<String, Value> {
     sellers
         .into_iter()
         .map(|(worker, rig)| {
@@ -214,6 +219,7 @@ fn enrich_sellers(sellers: HashMap<String, Rig>, live: &HashMap<String, f64>) ->
             if let Value::Object(map) = &mut v {
                 map.insert("hashrate_hs".into(), json!(hashrate_hs));
                 map.insert("online".into(), json!(is_delivering(hashrate_hs)));
+                map.insert("rented".into(), json!(rented.contains(&worker)));
             }
             (worker, v)
         })
@@ -221,8 +227,8 @@ fn enrich_sellers(sellers: HashMap<String, Rig>, live: &HashMap<String, f64>) ->
 }
 
 /// List rigs. `?seller=<address>` filters to that seller's rigs (dashboard);
-/// no filter returns all (operator view). Each rig carries live `online` +
-/// `hashrate_hs` derived from the connected sessions.
+/// no filter returns all (operator view). Each rig carries live `online`,
+/// `hashrate_hs` and `rented` derived from the connected sessions + orders.
 async fn list_sellers(State(s): State<AppState>, Query(q): Query<SellerQuery>) -> Json<Value> {
     let sellers = match q.seller.as_deref() {
         Some(addr) if !addr.is_empty() => s.sellers.list_for_seller(addr).await,
@@ -235,7 +241,16 @@ async fn list_sellers(State(s): State<AppState>, Query(q): Query<SellerQuery>) -
         .into_iter()
         .map(|st| (st.worker, st.hashrate_hs))
         .collect();
-    Json(json!({ "sellers": enrich_sellers(sellers, &live) }))
+    let now = now_ms();
+    let rented: HashSet<String> = s
+        .orders
+        .list()
+        .await
+        .into_iter()
+        .filter(|o| o.is_live(now))
+        .map(|o| o.worker)
+        .collect();
+    Json(json!({ "sellers": enrich_sellers(sellers, &live, &rented) }))
 }
 
 fn default_true() -> bool {
@@ -398,6 +413,10 @@ async fn create_order(
             return Err((StatusCode::CONFLICT, "rig is not listed for rent".into()));
         }
     }
+    // An already-rented rig (live order) can't be rented again.
+    if s.orders.active_for_worker(&req.worker, now_ms()).await.is_some() {
+        return Err((StatusCode::CONFLICT, "rig is already rented".into()));
+    }
     // Only rigs currently delivering hashrate can be rented.
     let live_hashrate = match s.registry.get(&req.worker).await {
         Some(sess) => sess.status().await.hashrate_hs,
@@ -466,6 +485,28 @@ mod tests {
 
     async fn app() -> Router {
         app_token(TOKEN).await
+    }
+
+    /// App plus a handle to its order store, to seed rentals directly in tests.
+    async fn app_with_orders() -> (Router, Arc<OrderStore>) {
+        let pool = crate::db::test_pool().await;
+        let orders = OrderStore::new(pool.clone());
+        let app = router(AppState {
+            registry: Registry::new(),
+            sellers: SellerStore::new(pool.clone()),
+            orders: orders.clone(),
+            api_token: TOKEN.into(),
+        });
+        (app, orders)
+    }
+
+    fn buyer_target() -> UpstreamTarget {
+        UpstreamTarget {
+            url: "buyer:3333".into(),
+            user: "b".into(),
+            password: "x".into(),
+            authority_pubkey: None,
+        }
     }
 
     async fn body_json(resp: axum::response::Response) -> Value {
@@ -603,6 +644,7 @@ mod tests {
         // A registered rig with no connected miner is offline (not delivering).
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["online"], false);
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["hashrate_hs"], 0.0);
+        assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["rented"], false);
     }
 
     #[tokio::test]
@@ -634,6 +676,26 @@ mod tests {
         assert_eq!(v["orders"].as_array().unwrap().len(), 0);
     }
 
+    #[tokio::test]
+    async fn create_order_for_already_rented_worker_is_rejected() {
+        // A worker with a live rental can't be rented again, even while online.
+        let (app, orders) = app_with_orders().await;
+        orders
+            .create("bc1qA.rig1".to_string(), buyer_target(), 0, 0.0, 0.0)
+            .await;
+
+        let post = Request::post("/api/orders")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(
+                r#"{"worker":"bc1qA.rig1","url":"buyer2:3333","user":"c","until_ms":0}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(post).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("already rented"));
+    }
+
     #[test]
     fn is_delivering_requires_positive_hashrate() {
         assert!(!is_delivering(0.0));
@@ -654,12 +716,29 @@ mod tests {
         live.insert("bc1qA.on".to_string(), 5.0e12);
         // "bc1qA.off" absent from the live map → offline.
 
-        let out = enrich_sellers(sellers, &live);
+        let out = enrich_sellers(sellers, &live, &HashSet::new());
         assert_eq!(out["bc1qA.on"]["online"], json!(true));
         assert_eq!(out["bc1qA.on"]["hashrate_hs"], json!(5.0e12));
         assert_eq!(out["bc1qA.on"]["advertised_ths"], json!(100.0));
+        assert_eq!(out["bc1qA.on"]["rented"], json!(false));
         assert_eq!(out["bc1qA.off"]["online"], json!(false));
         assert_eq!(out["bc1qA.off"]["hashrate_hs"], json!(0.0));
+        assert_eq!(out["bc1qA.off"]["rented"], json!(false));
+    }
+
+    #[test]
+    fn enrich_sellers_marks_rented() {
+        let mut sellers = HashMap::new();
+        sellers.insert("bc1qA.rig1".to_string(), Rig::default());
+
+        let mut live = HashMap::new();
+        live.insert("bc1qA.rig1".to_string(), 5.0e12); // online + delivering
+        let mut rented = HashSet::new();
+        rented.insert("bc1qA.rig1".to_string()); // but already rented
+
+        let out = enrich_sellers(sellers, &live, &rented);
+        assert_eq!(out["bc1qA.rig1"]["online"], json!(true));
+        assert_eq!(out["bc1qA.rig1"]["rented"], json!(true));
     }
 
     async fn put_rig(app: &Router, worker: &str) {
