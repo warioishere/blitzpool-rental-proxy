@@ -209,6 +209,11 @@ impl Session {
                 writer,
             };
             i.routing = routing;
+            // In-flight submits were sent to the old upstream; their responses
+            // won't arrive with the new generation, so their pending credit
+            // entries are orphaned. Drop them (the old reader is aborted, so they
+            // could never be credited anyway) instead of leaking them per switch.
+            i.pending.clear();
         }
 
         // Tell the miner about the new extranonce. Modern ASICs honor this
@@ -861,6 +866,111 @@ mod tests {
         assert_eq!(peer_ip("10.0.0.1:3333"), "10.0.0.1");
         // No port → returned as-is (defensive).
         assert_eq!(peer_ip("nohost"), "nohost");
+    }
+
+    /// Minimal SV1 pool: completes the `subscribe` (handing back `en1`) +
+    /// `authorize` handshake so [`connect_upstream`] succeeds, then idles.
+    async fn mock_sv1_pool(listener: TcpListener, en1: String) -> anyhow::Result<()> {
+        let (sock, _) = listener.accept().await?;
+        let (r, mut w) = sock.into_split();
+        let mut lines = BufReader::new(r).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(msg) = RpcMessage::parse(&line) else {
+                continue;
+            };
+            let result = match msg.method.as_deref() {
+                Some("mining.subscribe") => json!([
+                    [["mining.set_difficulty", "1"], ["mining.notify", "1"]],
+                    en1,
+                    4
+                ]),
+                Some("mining.authorize") => json!(true),
+                _ => continue,
+            };
+            let reply = RpcMessage {
+                id: msg.id.clone(),
+                method: None,
+                params: None,
+                result: Some(result),
+                error: Some(Value::Null),
+            };
+            let _ = w.write_all(reply.to_line().as_bytes()).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn switch_clears_orphaned_pending_submits() {
+        // A switch must drop submit-credit entries left in flight on the old
+        // upstream (their responses never arrive with the new generation), else
+        // `pending` grows unbounded across switches.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = pool_b.local_addr().unwrap();
+        tokio::spawn(mock_sv1_pool(pool_a, "aaaa".into()));
+        tokio::spawn(mock_sv1_pool(pool_b, "bbbb".into()));
+
+        let target_a = UpstreamTarget {
+            url: a_addr.to_string(),
+            user: "acctA".into(),
+            password: "x".into(),
+            authority_pubkey: None,
+        };
+        let conn = connect_upstream(&target_a, None).await.unwrap();
+        let (to_miner, _to_miner_rx) = mpsc::unbounded_channel::<String>();
+        let (to_up, up_rx) = mpsc::unbounded_channel::<String>();
+        let up_writer = spawn_writer(conn.write, up_rx);
+        let session = Arc::new(Session {
+            to_miner,
+            switch: Mutex::new(()),
+            orders: crate::orders::OrderStore::new(crate::db::test_pool().await),
+            inner: Mutex::new(Inner {
+                active: ActiveUpstream {
+                    generation: 0,
+                    target: target_a.clone(),
+                    to_up,
+                    reader: tokio::spawn(async {}),
+                    writer: up_writer,
+                },
+                generation_counter: 0,
+                current_difficulty: 1.0,
+                pending: HashMap::new(),
+                hashrate: HashrateWindow::new(Duration::from_secs(600)),
+                delivered_work: 0.0,
+                accepted_shares: 0,
+                submitted_shares: 0,
+                accept_low_logged: false,
+                routing: Routing::Idle,
+                default_target: target_a.clone(),
+                configure: None,
+                extranonce_capable: true,
+                label: "bc1qSELLER.rig1".into(),
+                pending_prelude: Vec::new(),
+            }),
+        });
+        {
+            let reader = spawn_upstream_reader(session.clone(), 0, conn.reader);
+            let mut i = session.inner.lock().await;
+            let old = std::mem::replace(&mut i.active.reader, reader);
+            old.abort();
+            // Two submits awaiting upstream responses.
+            i.pending.insert("1".into(), (0, 1000.0));
+            i.pending.insert("2".into(), (0, 1000.0));
+        }
+
+        let target_b = UpstreamTarget {
+            url: b_addr.to_string(),
+            user: "acctB".into(),
+            password: "x".into(),
+            authority_pubkey: None,
+        };
+        session.switch_to("o1".to_string(), target_b).await.unwrap();
+
+        assert!(
+            session.inner.lock().await.pending.is_empty(),
+            "switch cleared the orphaned pending submits"
+        );
     }
 
     #[tokio::test]
