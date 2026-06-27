@@ -33,22 +33,61 @@ impl NoiseKeys {
         })
     }
 
-    /// Read `RENTAL_PROXY_SV2_SECRET` or generate one (logging the public key).
+    /// Resolve the proxy's Noise authority key, in order of preference:
+    /// 1. `RENTAL_PROXY_SV2_SECRET` — an explicit base58 secret.
+    /// 2. `RENTAL_PROXY_SV2_SECRET_FILE` — a file holding the secret; created
+    ///    (0600) with a fresh key on first boot, then reused. This gives the
+    ///    proxy a **stable identity across restarts** so SV2 miners can pin it.
+    /// 3. Otherwise a fresh ephemeral key (changes every restart).
     pub fn from_env_or_generate() -> Self {
-        match std::env::var("RENTAL_PROXY_SV2_SECRET") {
-            Ok(s) => match Self::from_secret_str(&s) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::warn!(error = %e, "RENTAL_PROXY_SV2_SECRET invalid; generating an ephemeral key");
-                    Self::generate()
-                }
-            },
-            Err(_) => {
-                let k = Self::generate();
-                tracing::info!(public_key = %k.public_b58(), "generated ephemeral SV2 Noise authority key");
-                k
+        if let Ok(s) = std::env::var("RENTAL_PROXY_SV2_SECRET") {
+            match Self::from_secret_str(&s) {
+                Ok(k) => return k,
+                Err(e) => tracing::warn!(error = %e, "RENTAL_PROXY_SV2_SECRET invalid; trying file/ephemeral"),
             }
         }
+        if let Ok(path) = std::env::var("RENTAL_PROXY_SV2_SECRET_FILE") {
+            if !path.trim().is_empty() {
+                return Self::from_file_or_create(path.trim());
+            }
+        }
+        let k = Self::generate();
+        tracing::warn!(
+            public_key = %k.public_b58(),
+            "generated EPHEMERAL SV2 Noise authority key — it changes on restart; \
+             set RENTAL_PROXY_SV2_SECRET_FILE to persist it"
+        );
+        k
+    }
+
+    /// Load the secret from `path`, or generate one and persist it (0600).
+    fn from_file_or_create(path: &str) -> Self {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let s = contents.trim();
+            if !s.is_empty() {
+                match Self::from_secret_str(s) {
+                    Ok(k) => {
+                        tracing::info!(public_key = %k.public_b58(), path, "loaded persisted SV2 Noise authority key");
+                        return k;
+                    }
+                    Err(e) => tracing::warn!(error = %e, path, "persisted SV2 secret invalid; regenerating"),
+                }
+            }
+        }
+        let k = Self::generate();
+        let secret: String = k.secret().into();
+        match std::fs::write(path, format!("{secret}\n")) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+                tracing::info!(public_key = %k.public_b58(), path, "generated + persisted SV2 Noise authority key");
+            }
+            Err(e) => tracing::warn!(error = %e, path, "could not persist SV2 secret; key is ephemeral this run"),
+        }
+        k
     }
 
     /// The key_utils secret wrapper (consumed by `accept_noise_connection`).
@@ -108,5 +147,17 @@ mod tests {
         let s: String = k.secret().into();
         let reparsed = NoiseKeys::from_secret_str(&s).expect("reparse");
         assert_eq!(k.public_b58(), reparsed.public_b58());
+    }
+
+    #[test]
+    fn file_persist_is_stable_across_calls() {
+        let path = std::env::temp_dir().join(format!("srp_sv2_key_{}.b58", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+        // First call generates + writes; second call must reload the same key.
+        let first = NoiseKeys::from_file_or_create(p).public_b58();
+        let second = NoiseKeys::from_file_or_create(p).public_b58();
+        assert_eq!(first, second, "persisted key must be stable across restarts");
+        let _ = std::fs::remove_file(&path);
     }
 }
