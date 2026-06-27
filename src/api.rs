@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    middleware::{self, Next},
     routing::{get, post, put},
     Json, Router,
 };
@@ -32,11 +33,16 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     pub sellers: Arc<SellerStore>,
     pub orders: Arc<OrderStore>,
+    /// Bearer token required on every endpoint except `/api/health`. Empty =
+    /// not configured → the API fails closed (rejects all). See [`require_bearer`].
+    pub api_token: Arc<str>,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/api/health", get(health))
+    // Everything except health requires a valid bearer token. The pool sits
+    // behind pfSense (TLS termination); auth here is what keeps the control
+    // API safe to expose.
+    let protected = Router::new()
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{worker}", get(get_session))
         .route("/api/sessions/{worker}/rent", post(rent))
@@ -48,7 +54,56 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/orders", get(list_orders).post(create_order))
         .route("/api/orders/{id}", get(get_order).delete(cancel_order))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer));
+
+    Router::new()
+        .route("/api/health", get(health))
+        .merge(protected)
         .with_state(state)
+}
+
+/// Bearer-token gate for the control API. The token comes from
+/// `RENTAL_PROXY_API_TOKEN`; if it is unset the API fails closed (rejects
+/// everything) so it can never be accidentally exposed unauthenticated.
+async fn require_bearer(
+    State(s): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Result<axum::response::Response, ApiError> {
+    if s.api_token.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control API token not configured (set RENTAL_PROXY_API_TOKEN)".into(),
+        ));
+    }
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    if ct_eq(presented, &s.api_token) {
+        Ok(next.run(req).await)
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token".into(),
+        ))
+    }
+}
+
+/// Constant-time string compare — avoids leaking the token via response timing.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub async fn serve(addr: String, state: AppState) -> anyhow::Result<()> {
@@ -302,13 +357,21 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    async fn app() -> Router {
+    const TOKEN: &str = "testtoken";
+    const BEARER: &str = "Bearer testtoken";
+
+    async fn app_token(token: &str) -> Router {
         let pool = crate::db::test_pool().await;
         router(AppState {
             registry: Registry::new(),
             sellers: SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool),
+            api_token: token.into(),
         })
+    }
+
+    async fn app() -> Router {
+        app_token(TOKEN).await
     }
 
     async fn body_json(resp: axum::response::Response) -> Value {
@@ -317,7 +380,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_ok() {
+    async fn health_is_public() {
+        // No token needed for liveness checks (pfSense health probes).
         let resp = app()
             .await
             .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
@@ -327,10 +391,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_sessions_empty() {
+    async fn protected_route_without_token_is_401() {
         let resp = app()
             .await
             .oneshot(Request::get("/api/sessions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_route_with_wrong_token_is_401() {
+        let resp = app()
+            .await
+            .oneshot(
+                Request::get("/api/sessions")
+                    .header("authorization", "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_token_fails_closed() {
+        // Empty token (RENTAL_PROXY_API_TOKEN unset) → API rejects everything
+        // protected, even with a bearer header.
+        let resp = app_token("")
+            .await
+            .oneshot(
+                Request::get("/api/sessions")
+                    .header("authorization", "Bearer anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_empty() {
+        let resp = app()
+            .await
+            .oneshot(
+                Request::get("/api/sessions")
+                    .header("authorization", BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -342,6 +453,7 @@ mod tests {
     async fn rent_unknown_worker_is_404() {
         let req = Request::post("/api/sessions/ghost/rent")
             .header("content-type", "application/json")
+            .header("authorization", BEARER)
             .body(Body::from(r#"{"url":"x:1","user":"u"}"#))
             .unwrap();
         let resp = app().await.oneshot(req).await.unwrap();
@@ -354,6 +466,7 @@ mod tests {
             .await
             .oneshot(
                 Request::post("/api/sessions/ghost/release")
+                    .header("authorization", BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -367,6 +480,7 @@ mod tests {
         let app = app().await;
         let put = Request::put("/api/sellers/bc1qSELLER.rig1")
             .header("content-type", "application/json")
+            .header("authorization", BEARER)
             .body(Body::from(
                 r#"{"url":"poolA:3333","user":"acct","pass":"x","advertised_ths":220,"price_per_th_day":0.05}"#,
             ))
@@ -375,7 +489,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let resp = app
-            .oneshot(Request::get("/api/sellers").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/sellers")
+                    .header("authorization", BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let v = body_json(resp).await;
@@ -388,6 +507,7 @@ mod tests {
         let app = app().await;
         let post = Request::post("/api/orders")
             .header("content-type", "application/json")
+            .header("authorization", BEARER)
             .body(Body::from(
                 r#"{"worker":"bc1qSELLER.rig1","url":"buyer:3333","user":"b","pass":"x","until_ms":0}"#,
             ))
@@ -400,7 +520,12 @@ mod tests {
         assert_eq!(v["order"]["worker"], "bc1qSELLER.rig1");
 
         let resp = app
-            .oneshot(Request::get("/api/orders").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/orders")
+                    .header("authorization", BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let v = body_json(resp).await;

@@ -65,12 +65,24 @@ async fn main() -> anyhow::Result<()> {
     orders::spawn_expiry(orders.clone(), registry.clone());
 
     // HTTP control API — the proxy is fully steerable here; the web UI calls it.
+    // Every endpoint except /api/health requires this bearer token; unset means
+    // the API fails closed (rejects all) so it is never exposed unauthenticated.
+    let api_token: Arc<str> = std::env::var("RENTAL_PROXY_API_TOKEN")
+        .unwrap_or_default()
+        .into();
+    if api_token.is_empty() {
+        warn!(
+            "RENTAL_PROXY_API_TOKEN not set — control API will reject every request \
+             until a token is configured"
+        );
+    }
     let api_addr = std::env::var("RENTAL_PROXY_API").unwrap_or_else(|_| "127.0.0.1:8080".into());
     {
         let state = api::AppState {
             registry: registry.clone(),
             sellers: sellers.clone(),
             orders: orders.clone(),
+            api_token: api_token.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = api::serve(api_addr, state).await {
