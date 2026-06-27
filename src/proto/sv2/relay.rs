@@ -630,6 +630,33 @@ impl Sv2Session {
 
         let up_cid = wire::read_channel_id(&mut frame);
 
+        // Diagnostic: trace job/prev-hash flow (with job_id = bytes 4..8) so we
+        // can see whether extended jobs + their SetNewPrevHash reach the miner
+        // with matching ids and channel mapping.
+        if matches!(
+            mt,
+            mining::MESSAGE_TYPE_NEW_MINING_JOB
+                | mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB
+                | mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH
+        ) {
+            let job_id = {
+                let p = frame.payload();
+                if p.len() >= 8 {
+                    u32::from_le_bytes([p[4], p[5], p[6], p[7]])
+                } else {
+                    0
+                }
+            };
+            info!(
+                worker = %i.label,
+                mt,
+                up_cid,
+                down_cid = ?i.up_to_down.get(&up_cid),
+                job_id,
+                "sv2 job/prev-hash upstream→miner"
+            );
+        }
+
         // Vardiff: a new target changes this channel's share difficulty.
         if mt == mining::MESSAGE_TYPE_SET_TARGET {
             if let Some(target) = parse_set_target(&mut frame) {
