@@ -41,6 +41,10 @@ pub struct Rig {
     /// rentals. Defaults to true (a freshly registered rig is rentable).
     #[serde(default = "default_true")]
     pub rentable: bool,
+    /// Optional cap on a single rental's duration, in seconds. `0` = no cap
+    /// (open-ended rentals allowed). Enforced at order creation.
+    #[serde(default)]
+    pub max_rental_secs: i64,
 }
 
 fn default_true() -> bool {
@@ -59,7 +63,8 @@ impl SellerStore {
     pub async fn get(&self, worker: &str) -> Option<Rig> {
         let row = sqlx::query!(
             "SELECT pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
-             price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable \
+             price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, \
+             max_rental_secs \
              FROM rigs WHERE worker = ?",
             worker
         )
@@ -79,6 +84,7 @@ impl SellerStore {
                 price_max_per_th_day: r.price_max_per_th_day,
                 payout_address: r.payout_address,
                 rentable: r.rentable != 0,
+                max_rental_secs: r.max_rental_secs,
             }),
             Ok(None) => None,
             Err(e) => {
@@ -97,15 +103,16 @@ impl SellerStore {
         let rentable = rig.rentable as i64;
         sqlx::query!(
             "INSERT INTO rigs (worker, pool_url, pool_user, pool_password, pool_authority, \
-             advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+             advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, \
+             max_rental_secs) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?) \
              ON CONFLICT(worker) DO UPDATE SET \
                pool_url=excluded.pool_url, pool_user=excluded.pool_user, \
                pool_password=excluded.pool_password, pool_authority=excluded.pool_authority, \
                advertised_ths=excluded.advertised_ths, price_per_th_day=excluded.price_per_th_day, \
                price_min_per_th_day=excluded.price_min_per_th_day, \
                price_max_per_th_day=excluded.price_max_per_th_day, payout_address=excluded.payout_address, \
-               rentable=excluded.rentable",
+               rentable=excluded.rentable, max_rental_secs=excluded.max_rental_secs",
             worker,
             rig.default_pool.url,
             rig.default_pool.user,
@@ -117,6 +124,7 @@ impl SellerStore {
             rig.price_max_per_th_day,
             rig.payout_address,
             rentable,
+            rig.max_rental_secs,
         )
         .execute(&self.pool)
         .await
@@ -142,7 +150,8 @@ impl SellerStore {
     pub async fn list(&self) -> HashMap<String, Rig> {
         let rows = sqlx::query!(
             "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
-             price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable FROM rigs"
+             price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, \
+             max_rental_secs FROM rigs"
         )
         .fetch_all(&self.pool)
         .await
@@ -164,6 +173,7 @@ impl SellerStore {
                         price_max_per_th_day: r.price_max_per_th_day,
                         payout_address: r.payout_address,
                         rentable: r.rentable != 0,
+                        max_rental_secs: r.max_rental_secs,
                     },
                 )
             })
@@ -177,7 +187,8 @@ impl SellerStore {
         let prefix = format!("{address}.%");
         let rows = sqlx::query!(
             "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
-             price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable \
+             price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, \
+             max_rental_secs \
              FROM rigs WHERE worker = ? OR worker LIKE ?",
             address,
             prefix
@@ -202,6 +213,7 @@ impl SellerStore {
                         price_max_per_th_day: r.price_max_per_th_day,
                         payout_address: r.payout_address,
                         rentable: r.rentable != 0,
+                        max_rental_secs: r.max_rental_secs,
                     },
                 )
             })
@@ -227,6 +239,7 @@ mod tests {
             price_max_per_th_day: 0.06,
             payout_address: Some("bc1qPAYOUT".into()),
             rentable: true,
+            max_rental_secs: 0,
         }
     }
 

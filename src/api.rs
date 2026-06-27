@@ -312,6 +312,10 @@ struct SellerReq {
     /// idle-mines when false; it just can't be rented.
     #[serde(default = "default_true")]
     rentable: bool,
+    /// Optional cap on a single rental's duration, in seconds (`0` = no cap).
+    /// The UI collects this in hours and converts. Enforced at order creation.
+    #[serde(default)]
+    max_rental_secs: i64,
 }
 
 /// Register/update a seller's rig: idle/default pool plus the marketplace
@@ -336,6 +340,7 @@ async fn set_seller(
         price_max_per_th_day: req.price_max_per_th_day,
         payout_address: req.payout_address,
         rentable: req.rentable,
+        max_rental_secs: req.max_rental_secs.max(0),
     };
     s.sellers
         .set(worker.clone(), rig)
@@ -436,10 +441,27 @@ async fn create_order(
     State(s): State<AppState>,
     Json(req): Json<OrderReq>,
 ) -> Result<Json<Value>, ApiError> {
-    // A registered rig that's toggled off can't be rented.
+    // A registered rig that's toggled off can't be rented; and a rig with a
+    // max-duration cap rejects open-ended or too-long rentals.
     if let Some(rig) = s.sellers.get(&req.worker).await {
         if !rig.rentable {
             return Err((StatusCode::CONFLICT, "rig is not listed for rent".into()));
+        }
+        if rig.max_rental_secs > 0 {
+            let max_h = rig.max_rental_secs / 3600;
+            if req.until_ms <= 0 {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("this rig caps rentals at {max_h} h — set an end time"),
+                ));
+            }
+            let duration_ms = req.until_ms - now_ms();
+            if duration_ms > rig.max_rental_secs.saturating_mul(1000) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("rental too long — this rig caps at {max_h} h"),
+                ));
+            }
         }
     }
     // An already-rented rig (live order) can't be rented again.
@@ -709,6 +731,46 @@ mod tests {
             .unwrap();
         let v = body_json(resp).await;
         assert_eq!(v["orders"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_order_exceeding_max_duration_is_rejected() {
+        // A rig capped at 1h rejects both a too-long rental and an open-ended one.
+        let app = app().await;
+        let set = Request::put("/api/sellers/bc1qSELLER.rig1")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(
+                r#"{"url":"poolA:3333","user":"acct","max_rental_secs":3600}"#,
+            ))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(set).await.unwrap().status(), StatusCode::OK);
+
+        // 5h rental on a 1h-capped rig → rejected as too long (before the
+        // offline check, so no connected miner needed).
+        let until = now_ms() + 5 * 3600 * 1000;
+        let post = Request::post("/api/orders")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(format!(
+                r#"{{"worker":"bc1qSELLER.rig1","url":"buyer:3333","user":"b","until_ms":{until}}}"#
+            )))
+            .unwrap();
+        let resp = app.clone().oneshot(post).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("too long"));
+
+        // Open-ended (until_ms=0) on a capped rig → rejected (needs an end time).
+        let post2 = Request::post("/api/orders")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(
+                r#"{"worker":"bc1qSELLER.rig1","url":"buyer:3333","user":"b","until_ms":0}"#,
+            ))
+            .unwrap();
+        let resp2 = app.oneshot(post2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp2).await.contains("set an end time"));
     }
 
     #[tokio::test]

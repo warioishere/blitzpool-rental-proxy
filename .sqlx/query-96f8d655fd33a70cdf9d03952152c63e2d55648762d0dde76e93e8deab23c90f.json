@@ -1,80 +1,80 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable FROM rigs",
+  "query": "SELECT pool_url, pool_user, pool_password, pool_authority, advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, max_rental_secs FROM rigs WHERE worker = ?",
   "describe": {
     "columns": [
       {
-        "name": "worker",
+        "name": "pool_url",
         "ordinal": 0,
         "type_info": "Text"
       },
       {
-        "name": "pool_url",
+        "name": "pool_user",
         "ordinal": 1,
         "type_info": "Text"
       },
       {
-        "name": "pool_user",
+        "name": "pool_password",
         "ordinal": 2,
         "type_info": "Text"
       },
       {
-        "name": "pool_password",
+        "name": "pool_authority",
         "ordinal": 3,
         "type_info": "Text"
       },
       {
-        "name": "pool_authority",
-        "ordinal": 4,
-        "type_info": "Text"
-      },
-      {
         "name": "advertised_ths",
-        "ordinal": 5,
+        "ordinal": 4,
         "type_info": "Float"
       },
       {
         "name": "price_per_th_day",
-        "ordinal": 6,
+        "ordinal": 5,
         "type_info": "Float"
       },
       {
         "name": "price_min_per_th_day",
-        "ordinal": 7,
+        "ordinal": 6,
         "type_info": "Float"
       },
       {
         "name": "price_max_per_th_day",
-        "ordinal": 8,
+        "ordinal": 7,
         "type_info": "Float"
       },
       {
         "name": "payout_address",
-        "ordinal": 9,
+        "ordinal": 8,
         "type_info": "Text"
       },
       {
         "name": "rentable",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "max_rental_secs",
         "ordinal": 10,
         "type_info": "Integer"
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       false,
       false,
       false,
-      false,
       true,
       false,
       false,
       false,
       false,
       true,
+      false,
       false
     ]
   },
-  "hash": "5862e1c71b2b969425bbf0226f83184f7e42b6976da6520adcd890735bbb795a"
+  "hash": "96f8d655fd33a70cdf9d03952152c63e2d55648762d0dde76e93e8deab23c90f"
 }

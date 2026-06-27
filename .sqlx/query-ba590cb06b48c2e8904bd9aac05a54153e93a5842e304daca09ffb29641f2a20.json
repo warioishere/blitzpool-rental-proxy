@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO rigs (worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, max_rental_secs) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(worker) DO UPDATE SET pool_url=excluded.pool_url, pool_user=excluded.pool_user, pool_password=excluded.pool_password, pool_authority=excluded.pool_authority, advertised_ths=excluded.advertised_ths, price_per_th_day=excluded.price_per_th_day, price_min_per_th_day=excluded.price_min_per_th_day, price_max_per_th_day=excluded.price_max_per_th_day, payout_address=excluded.payout_address, rentable=excluded.rentable, max_rental_secs=excluded.max_rental_secs",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 12
+    },
+    "nullable": []
+  },
+  "hash": "ba590cb06b48c2e8904bd9aac05a54153e93a5842e304daca09ffb29641f2a20"
+}
