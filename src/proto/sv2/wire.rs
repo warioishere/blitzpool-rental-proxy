@@ -45,20 +45,27 @@ pub fn msg_type(frame: &Sv2Frame) -> Option<u8> {
 }
 
 /// Overwrite the `channel_id` (first 4 LE bytes of the payload) of a decoded,
-/// channel-scoped frame. Only valid for [`is_channel_scoped`] message types.
+/// channel-scoped frame. No-op if the payload is shorter than 4 bytes (a
+/// malformed frame) so a bad upstream/downstream frame can't panic the relay.
+/// Callers read the id first and drop short frames, so this guard is a safety net.
 pub fn rewrite_channel_id(frame: &mut Sv2Frame, channel_id: u32) {
     let payload = frame.payload();
-    debug_assert!(payload.len() >= 4);
+    if payload.len() < 4 {
+        return;
+    }
     payload[..4].copy_from_slice(&channel_id.to_le_bytes());
 }
 
 /// Read the `channel_id` (first 4 LE bytes of the payload) of a decoded,
-/// channel-scoped frame.
-pub fn read_channel_id(frame: &mut Sv2Frame) -> u32 {
+/// channel-scoped frame. Returns `None` if the payload is shorter than 4 bytes
+/// (a malformed frame) so the relay drops it instead of panicking — the upstream
+/// pool is only semi-trusted (a buyer supplies its target).
+pub fn read_channel_id(frame: &mut Sv2Frame) -> Option<u32> {
     let payload = frame.payload();
-    let mut b = [0u8; 4];
-    b.copy_from_slice(&payload[..4]);
-    u32::from_le_bytes(b)
+    if payload.len() < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
 }
 
 /// Channel-scoped mining messages carry `channel_id` as their first field, so
@@ -109,9 +116,22 @@ mod tests {
         let bytes = encode_to_vec(into_sv2(frame_from(msg)).expect("sv2 frame"));
         let mut decoded = decode_from_bytes(&bytes);
 
-        assert_eq!(read_channel_id(&mut decoded), 1);
+        assert_eq!(read_channel_id(&mut decoded), Some(1));
         rewrite_channel_id(&mut decoded, 42);
-        assert_eq!(read_channel_id(&mut decoded), 42);
+        assert_eq!(read_channel_id(&mut decoded), Some(42));
+    }
+
+    #[test]
+    fn short_payload_is_rejected_not_panicked() {
+        // A channel-scoped frame whose payload is shorter than the 4-byte
+        // channel_id (a malformed frame) must not panic: read returns None and
+        // rewrite is a no-op. Hand-built header (ext=0, msg_type=0, len=2) + 2
+        // payload bytes.
+        let bytes = [0u8, 0, 0, 2, 0, 0, 0xAA, 0xBB];
+        let mut frame = decode_from_bytes(&bytes);
+        assert_eq!(read_channel_id(&mut frame), None);
+        rewrite_channel_id(&mut frame, 7); // must not panic
+        assert_eq!(read_channel_id(&mut frame), None);
     }
 
     fn encode_to_vec(frame: Sv2Frame) -> Vec<u8> {

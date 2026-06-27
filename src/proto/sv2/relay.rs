@@ -718,7 +718,10 @@ impl Sv2Session {
             return;
         }
 
-        let up_cid = wire::read_channel_id(&mut frame);
+        let Some(up_cid) = wire::read_channel_id(&mut frame) else {
+            debug!(mt, "channel-scoped upstream frame too short for a channel_id; dropping");
+            return;
+        };
 
         // Trace job/prev-hash flow (job_id = bytes 4..8) at debug level: lets us
         // confirm extended jobs + their SetNewPrevHash reach the miner with
@@ -1012,7 +1015,10 @@ pub async fn handle_seller_miner_sv2(
                 let mut submit_order: Option<String> = None;
                 {
                     let mut i = session.inner.lock().await;
-                    let down_cid = wire::read_channel_id(&mut frame);
+                    let Some(down_cid) = wire::read_channel_id(&mut frame) else {
+                        debug!("channel-scoped downstream frame too short for a channel_id; dropping");
+                        continue;
+                    };
                     if let Some(up_cid) = i.up_for_down(down_cid) {
                         if is_submit {
                             i.submitted_shares += 1;
@@ -1220,7 +1226,9 @@ mod tests {
                         .map_err(|e| anyhow!("{e:?}"))?;
                 }
                 Some(mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED) => {
-                    let cid = wire::read_channel_id(&mut f);
+                    let Some(cid) = wire::read_channel_id(&mut f) else {
+                        continue;
+                    };
                     let _ = submits.send(cid);
                     let ok = SubmitSharesSuccess {
                         channel_id: cid,
@@ -1237,7 +1245,9 @@ mod tests {
                 }
                 Some(mining::MESSAGE_TYPE_UPDATE_CHANNEL) => {
                     // Vardiff: answer the miner's hashrate update with a target.
-                    let cid = wire::read_channel_id(&mut f);
+                    let Some(cid) = wire::read_channel_id(&mut f) else {
+                        continue;
+                    };
                     let st = SetTarget {
                         channel_id: cid,
                         maximum_target: U256::from([0x33u8; 32]),
@@ -1356,7 +1366,9 @@ mod tests {
             loop {
                 let mut f = read_one(&mut self.read).await?;
                 if wire::msg_type(&f) == Some(want) {
-                    return Ok(wire::read_channel_id(&mut f));
+                    if let Some(cid) = wire::read_channel_id(&mut f) {
+                        return Ok(cid);
+                    }
                 }
             }
         }
