@@ -17,8 +17,8 @@
 //! so a stale reader (post-swap) is ignored.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -38,6 +38,26 @@ use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 const VERSION_ROLLING_MASK: &str = "1fffe000";
 
 type Tx = mpsc::UnboundedSender<String>;
+
+/// How long a reconnect-hint stays valid (the miner should reconnect at once).
+const RECONNECT_HINT_TTL: Duration = Duration::from_secs(120);
+
+/// Per-source-IP reconnect hints. When a miner that can't take a live
+/// extranonce change authorizes onto a pool different from its handshake pool,
+/// we remember that pool here, send `client.reconnect`, and on the reconnect run
+/// the handshake directly against it — so the miner gets the right extranonce
+/// from its first job and no mid-session switch is needed. Keyed by source IP;
+/// fine for the common one-miner-per-IP case (a NAT farm whose rigs sit on
+/// different pools just costs an extra reconnect to converge).
+fn reconnect_hints() -> &'static Mutex<HashMap<String, (UpstreamTarget, Instant)>> {
+    static HINTS: OnceLock<Mutex<HashMap<String, (UpstreamTarget, Instant)>>> = OnceLock::new();
+    HINTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Source IP (no port) of a `host:port` peer string — the reconnect-hint key.
+fn peer_ip(peer: &str) -> String {
+    peer.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_else(|| peer.to_string())
+}
 
 /// The live upstream for a session (replaced wholesale on a switch).
 struct ActiveUpstream {
@@ -110,6 +130,23 @@ impl Session {
 
     pub async fn default_target(&self) -> UpstreamTarget {
         self.inner.lock().await.default_target.clone()
+    }
+
+    /// Current upstream this session relays to (idle pool or rented target).
+    pub async fn active_target(&self) -> UpstreamTarget {
+        self.inner.lock().await.active.target.clone()
+    }
+
+    /// Mark this session as serving `order` WITHOUT reconnecting the upstream —
+    /// used when the handshake already connected the rental's target (a resolved
+    /// reconnect), so the miner keeps the extranonce it was given.
+    pub async fn attach_order(&self, order_id: String, target: UpstreamTarget) {
+        let mut i = self.inner.lock().await;
+        i.routing = Routing::Rented {
+            order_id,
+            target,
+            until_unix_ms: 0,
+        };
     }
 
     async fn swap_upstream(self: &Arc<Self>, target: UpstreamTarget, routing: Routing) -> anyhow::Result<()> {
@@ -453,11 +490,22 @@ pub async fn handle_seller_miner(
         sellers,
         orders,
     } = ctx;
-    // SV1 must answer mining.subscribe (extranonce) before the worker is known
-    // at mining.authorize, so it needs a bootstrap pool to source that
-    // extranonce. Register-only: unregistered workers are rejected at authorize
-    // (below); the bootstrap never serves them.
-    let Some(default_target) = default_target else {
+    let ip = peer_ip(&peer);
+    // A fresh reconnect-hint (the miner returning onto its own pool) wins over
+    // the bootstrap pool: we run the handshake straight against the right pool,
+    // so the miner gets the correct extranonce from its first job and needs no
+    // mid-session switch. Otherwise SV1 must answer mining.subscribe (extranonce)
+    // before the worker is known at mining.authorize, so it falls back to the
+    // bootstrap pool. Register-only: unregistered workers are rejected at
+    // authorize (below); the bootstrap never serves them.
+    let resolved_target = {
+        let mut hints = reconnect_hints().lock().await;
+        match hints.remove(&ip) {
+            Some((t, at)) if at.elapsed() < RECONNECT_HINT_TTL => Some(t),
+            _ => None,
+        }
+    };
+    let Some(handshake_target) = resolved_target.or(default_target) else {
         anyhow::bail!(
             "SV1 needs a handshake bootstrap pool (RENTAL_PROXY_POOL_URL); \
              register-only SV1 is unavailable without one — use SV2"
@@ -469,10 +517,10 @@ pub async fn handle_seller_miner(
     let (to_miner, to_miner_rx) = mpsc::unbounded_channel::<String>();
     let miner_writer = spawn_writer(miner_w, to_miner_rx);
 
-    // Connect the default upstream up front (idle routing).
-    let conn = connect_upstream(&default_target, None)
+    // Connect the handshake upstream up front (idle routing).
+    let conn = connect_upstream(&handshake_target, None)
         .await
-        .map_err(|e| anyhow::anyhow!("connect default upstream {}: {e}", default_target.url))?;
+        .map_err(|e| anyhow::anyhow!("connect upstream {}: {e}", handshake_target.url))?;
     let en1 = conn.extranonce1.clone();
     let en2 = conn.extranonce2_size;
     let initial_prelude = conn.prelude;
@@ -486,7 +534,7 @@ pub async fn handle_seller_miner(
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
                 generation: 0,
-                target: default_target.clone(),
+                target: handshake_target.clone(),
                 to_up,
                 reader: tokio::spawn(async {}), // placeholder, replaced below
                 writer: up_writer,
@@ -500,7 +548,7 @@ pub async fn handle_seller_miner(
             submitted_shares: 0,
             accept_low_logged: false,
             routing: Routing::Idle,
-            default_target: default_target.clone(),
+            default_target: handshake_target.clone(),
             configure: None,
             extranonce_capable: false,
             label: peer.clone(),
@@ -516,7 +564,7 @@ pub async fn handle_seller_miner(
         old.abort();
     }
 
-    info!(%peer, upstream = %default_target.url, "relay established (idle)");
+    info!(%peer, upstream = %handshake_target.url, "relay established (idle)");
 
     // Miner reader loop (runs on this task): answer handshake locally, relay
     // the rest to the active upstream.
@@ -610,17 +658,44 @@ pub async fn handle_seller_miner(
                             break;
                         }
                         session.on_miner_msg(msg, &registry).await;
-                        if let Some(o) = order {
-                            match session.switch_to(o.id.clone(), o.target.clone()).await {
-                                Ok(()) => info!(worker = %w, order = %o.id, upstream = %o.target.url, "resumed active rental"),
-                                Err(e) => warn!(worker = %w, error = %e, "resume rental failed"),
-                            }
-                        } else if let Some(def) = rig {
-                            if session.default_target().await != def {
-                                match session.set_default(def.clone()).await {
-                                    Ok(()) => info!(worker = %w, upstream = %def.url, "applied seller default pool"),
-                                    Err(e) => warn!(worker = %w, error = %e, "apply seller default failed"),
+                        // Where this worker should mine: its active rental's target,
+                        // else its seller default pool.
+                        let want = order
+                            .as_ref()
+                            .map(|o| o.target.clone())
+                            .or_else(|| rig.clone());
+                        if let Some(want) = want {
+                            if session.active_target().await == want {
+                                // Already on the right pool (resolved reconnect, or
+                                // the handshake pool happens to be it). No switch →
+                                // the miner keeps the correct extranonce.
+                                if let Some(o) = &order {
+                                    session.attach_order(o.id.clone(), o.target.clone()).await;
+                                    info!(worker = %w, order = %o.id, "resumed active rental (no switch)");
+                                } else {
+                                    info!(worker = %w, upstream = %want.url, "on seller default pool");
                                 }
+                            } else if session.inner.lock().await.extranonce_capable {
+                                // Live switch: the miner takes a set_extranonce.
+                                let res = match &order {
+                                    Some(o) => session.switch_to(o.id.clone(), o.target.clone()).await,
+                                    None => session.set_default(want.clone()).await,
+                                };
+                                match res {
+                                    Ok(()) => info!(worker = %w, upstream = %want.url, "switched upstream"),
+                                    Err(e) => warn!(worker = %w, error = %e, "upstream switch failed"),
+                                }
+                            } else {
+                                // Can't take a live extranonce change → reconnect the
+                                // miner straight onto its pool (correct extranonce from
+                                // the first job, no mid-session switch).
+                                reconnect_hints()
+                                    .lock()
+                                    .await
+                                    .insert(ip.clone(), (want, Instant::now()));
+                                let _ = to_miner.send(RpcMessage::client_reconnect("", 0, 1).to_line());
+                                info!(worker = %w, "non-extranonce miner → client.reconnect onto its pool");
+                                break;
                             }
                         }
                     } else {
@@ -660,6 +735,14 @@ mod tests {
     /// them in `prelude` (so the relay can forward them) and still return the
     /// response — dropping them leaves the miner at "diff 0" → every share
     /// rejected as "Difficulty too low".
+    #[test]
+    fn peer_ip_strips_port() {
+        assert_eq!(peer_ip("192.168.5.20:64178"), "192.168.5.20");
+        assert_eq!(peer_ip("10.0.0.1:3333"), "10.0.0.1");
+        // No port → returned as-is (defensive).
+        assert_eq!(peer_ip("nohost"), "nohost");
+    }
+
     #[tokio::test]
     async fn read_response_keeps_handshake_notifications() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
