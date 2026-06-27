@@ -164,6 +164,7 @@ fn open_channel_upstream(spec: &OpenSpec, account: &str) -> anyhow::Result<Eithe
 fn open_success_downstream(
     spec: &OpenSpec,
     down_channel_id: u32,
+    down_group_id: u32,
     info: &ChannelInfo,
 ) -> anyhow::Result<EitherFrame> {
     let target = U256::try_from(info.target.clone()).map_err(|_| anyhow!("bad target"))?;
@@ -176,7 +177,10 @@ fn open_success_downstream(
             target,
             extranonce_size: info.extranonce_size,
             extranonce_prefix: prefix,
-            group_channel_id: info.group_channel_id,
+            // Remapped into the downstream id namespace so the group-broadcast
+            // jobs the pool addresses to this id reach the miner (see
+            // `Inner::map_group`). Extended channels are the only grouped ones.
+            group_channel_id: down_group_id,
         })
     } else {
         Mining::OpenStandardMiningChannelSuccess(OpenStandardMiningChannelSuccess {
@@ -429,7 +433,16 @@ struct Inner {
     /// All open channels on this connection (one per rig chain, usually one).
     channels: Vec<Channel>,
     /// upstream channel_id → downstream channel_id (for upstream→miner frames).
+    /// Holds both real channel ids AND the group_channel_id of grouped Extended
+    /// channels, so the pool's group-broadcast jobs (NewExtendedMiningJob +
+    /// SetNewPrevHash addressed to the group id) are remapped to the miner too.
     up_to_down: std::collections::HashMap<u32, u32>,
+    /// Stable downstream id we assigned to this connection's Extended group, if
+    /// any. Only Extended channels are grouped (per the SV2 spec), and a single
+    /// 1:1 miner connection has at most one group — every Extended channel/reopen
+    /// on it maps its (re-issued) upstream group_channel_id to this one id, which
+    /// the miner learned from its OpenExtendedMiningChannelSuccess.
+    group_down_id: Option<u32>,
     /// request_id → spec for additional opens awaiting the upstream's success.
     pending: std::collections::HashMap<u32, OpenSpec>,
     /// Next downstream channel_id to hand out (proxy-assigned, stable).
@@ -463,6 +476,30 @@ impl Inner {
             spec,
             difficulty,
         });
+    }
+
+    /// Map an Extended channel's upstream `group_channel_id` into the downstream
+    /// id namespace and return the downstream group id the miner should see in
+    /// its OpenSuccess. The first grouped Extended channel allocates a stable
+    /// downstream id; every later channel/reopen on this connection maps its
+    /// (re-issued) upstream group id onto that same id. Returns `up_group_id`
+    /// unchanged for non-Extended or ungrouped (`group_channel_id == 0`)
+    /// channels, leaving Standard channels untouched.
+    fn map_group(&mut self, up_group_id: u32, is_extended: bool) -> u32 {
+        if !is_extended || up_group_id == 0 {
+            return up_group_id;
+        }
+        let down = match self.group_down_id {
+            Some(d) => d,
+            None => {
+                let id = self.next_down_cid;
+                self.next_down_cid += 1;
+                self.group_down_id = Some(id);
+                id
+            }
+        };
+        self.up_to_down.insert(up_group_id, down);
+        down
     }
 }
 
@@ -512,8 +549,10 @@ impl Sv2Session {
         target: UpstreamTarget,
         routing: Routing,
     ) -> anyhow::Result<()> {
-        // Snapshot the channels to re-open (down_channel_id + spec) + worker.
-        let (specs, generation, label) = {
+        // Snapshot the channels to re-open (down_channel_id + spec) + worker +
+        // the stable downstream group id (the miner already knows it, so the new
+        // upstream's re-issued group id must map back onto it).
+        let (specs, generation, label, group_down_id) = {
             let mut i = self.inner.lock().await;
             i.generation_counter += 1;
             let specs: Vec<(u32, OpenSpec)> = i
@@ -521,7 +560,7 @@ impl Sv2Session {
                 .iter()
                 .map(|c| (c.down_channel_id, c.spec.clone()))
                 .collect();
-            (specs, i.generation_counter, i.label.clone())
+            (specs, i.generation_counter, i.label.clone(), i.group_down_id)
         };
         // user_identity on the new pool: its account + the miner's worker, tagged.
         let up_ident = crate::proto::relay::upstream_worker(&target.user, &label);
@@ -542,6 +581,20 @@ impl Sv2Session {
                 .await
                 .map_err(|e| anyhow!("switch reopen channel {down_cid}: {e}"))?;
             up_to_down.insert(info.up_channel_id, *down_cid);
+            // Remap the new pool's group id onto the stable downstream group id
+            // so group-broadcast jobs keep reaching the miner after the switch.
+            if spec.is_extended() && info.group_channel_id != 0 {
+                match group_down_id {
+                    Some(g) => {
+                        up_to_down.insert(info.group_channel_id, g);
+                    }
+                    None => warn!(
+                        worker = %label,
+                        down_cid,
+                        "extended channel grouped on new upstream but no stable group id from open — group jobs may be dropped"
+                    ),
+                }
+            }
             new_channels.push(Channel {
                 down_channel_id: *down_cid,
                 up_channel_id: info.up_channel_id,
@@ -616,10 +669,13 @@ impl Sv2Session {
                     i.next_down_cid += 1;
                     let diff = difficulty_from_target(&info.target);
                     i.register_channel(down_cid, info.up_channel_id, spec.clone(), diff);
-                    if let Ok(reply) = open_success_downstream(&spec, down_cid, &info) {
+                    let down_group_id = i.map_group(info.group_channel_id, spec.is_extended());
+                    if let Ok(reply) =
+                        open_success_downstream(&spec, down_cid, down_group_id, &info)
+                    {
                         let _ = self.to_miner.send(reply);
                     }
-                    info!(worker = %i.label, down_cid, up_cid = info.up_channel_id, "sv2 additional channel opened");
+                    info!(worker = %i.label, down_cid, up_cid = info.up_channel_id, down_group_id, "sv2 additional channel opened");
                 }
             }
             return;
@@ -838,6 +894,7 @@ pub async fn handle_seller_miner_sv2(
                 difficulty: difficulty_from_target(&info.target),
             }],
             up_to_down,
+            group_down_id: None,
             pending: std::collections::HashMap::new(),
             next_down_cid: 2,
             routing: Routing::Idle,
@@ -850,17 +907,25 @@ pub async fn handle_seller_miner_sv2(
             label: worker.clone(),
         }),
     });
-    {
+    // Map the Extended group_channel_id into the downstream namespace so the
+    // pool's group-broadcast jobs reach the miner (Standard channels: no-op).
+    let down_group_id = {
         let reader = spawn_upstream_reader(session.clone(), 0, up_read);
         let mut i = session.inner.lock().await;
         let old = std::mem::replace(&mut i.active.reader, reader);
         old.abort();
-    }
+        i.map_group(info.group_channel_id, spec.is_extended())
+    };
 
     // 7. Tell the miner its channel is open (downstream channel id + upstream's
     //    extranonce/target). The upstream's jobs + prev-hash then stream through.
     to_miner
-        .send(open_success_downstream(&spec, down_channel_id, &info)?)
+        .send(open_success_downstream(
+            &spec,
+            down_channel_id,
+            down_group_id,
+            &info,
+        )?)
         .map_err(|_| anyhow!("miner writer gone"))?;
 
     ctx.registry
@@ -1083,7 +1148,12 @@ mod tests {
                         group_channel_id: 0,
                     };
                     write
-                        .write_frame(open_success_downstream(&open.spec, cid, &info)?)
+                        .write_frame(open_success_downstream(
+                            &open.spec,
+                            cid,
+                            info.group_channel_id,
+                            &info,
+                        )?)
                         .await
                         .map_err(|e| anyhow!("{e:?}"))?;
                 }
@@ -1225,6 +1295,30 @@ mod tests {
                 let mut f = read_one(&mut self.read).await?;
                 if wire::msg_type(&f) == Some(want) {
                     return Ok(wire::read_channel_id(&mut f));
+                }
+            }
+        }
+
+        /// Open an Extended channel; returns the OpenSuccess `(channel_id,
+        /// group_channel_id, prefix)` the miner sees (all already remapped into
+        /// the proxy's downstream id namespace).
+        async fn open_full(
+            &mut self,
+            worker: &str,
+            request_id: u32,
+        ) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+            self.send_open(worker, request_id).await?;
+            loop {
+                let mut f = read_one(&mut self.read).await?;
+                if wire::msg_type(&f)
+                    == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
+                {
+                    let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
+                    return Ok((
+                        info.up_channel_id,
+                        info.group_channel_id,
+                        info.extranonce_prefix,
+                    ));
                 }
             }
         }
@@ -1467,7 +1561,12 @@ mod tests {
                     group_channel_id: 0,
                 };
                 write
-                    .write_frame(open_success_downstream(&open.spec, 7, &info)?)
+                    .write_frame(open_success_downstream(
+                        &open.spec,
+                        7,
+                        info.group_channel_id,
+                        &info,
+                    )?)
                     .await
                     .map_err(|e| anyhow!("{e:?}"))?;
             } else {
@@ -1678,5 +1777,115 @@ mod tests {
             "unregistered worker open must fail (connection closed)"
         );
         assert!(registry.get("bc1qUNREGISTERED").await.is_none());
+    }
+
+    /// A mock pool that groups the Extended channel the way the real pool does:
+    /// its OpenSuccess carries a distinct `group_channel_id`, and it then
+    /// broadcasts ONE `NewExtendedMiningJob` addressed to that GROUP id (not the
+    /// channel id). Exercises the proxy's group-id remapping.
+    async fn mock_pool_group(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
+        let (sock, _) = listener.accept().await?;
+        let _ = sock.set_nodelay(true);
+        let stream =
+            accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+                .await
+                .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+        let (mut read, mut write) = stream.into_split();
+        loop {
+            let f = read_one(&mut read).await?;
+            if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+                break;
+            }
+        }
+        write.write_frame(setup_success(0)).await.map_err(|e| anyhow!("{e:?}"))?;
+        while let Ok(mut f) = read_one(&mut read).await {
+            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
+                let Some(open) = parse_miner_open(&mut f) else {
+                    continue;
+                };
+                // Channel id 10, a DISTINCT group id 77 (mimics the pool's group).
+                let success =
+                    Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+                        request_id: open.spec.request_id(),
+                        channel_id: 10,
+                        target: U256::try_from(diff1_target()).unwrap(),
+                        extranonce_size: 8,
+                        extranonce_prefix: B032::try_from(vec![0xCC; 8]).unwrap(),
+                        group_channel_id: 77,
+                    });
+                write
+                    .write_frame(wire::frame_from(AnyMessage::Mining(success)))
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?;
+                // The job is broadcast to the GROUP id (77), not the channel (10).
+                let empty_path: Vec<U256> = vec![];
+                let job = mining::NewExtendedMiningJob {
+                    channel_id: 77,
+                    job_id: 1,
+                    min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                    version: 0x2000_0000,
+                    version_rolling_allowed: true,
+                    merkle_path: empty_path.into(),
+                    coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                    coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                };
+                write
+                    .write_frame(wire::frame_from(AnyMessage::Mining(
+                        Mining::NewExtendedMiningJob(job),
+                    )))
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_broadcast_job_reaches_miner() {
+        // Regression: Extended channels are grouped, so the pool broadcasts
+        // NewExtendedMiningJob to the group_channel_id — not the channel id. The
+        // proxy must remap the group id into its downstream namespace, else the
+        // job is dropped (down_cid=None) and the miner never starts real work.
+        let pool = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = pool.local_addr().unwrap();
+        tokio::spawn(mock_pool_group(pool, NoiseKeys::generate()));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&addr.to_string(), "acct")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, down_group, prefix) = miner.open_full("bc1qSELLER.rig1", 1).await.unwrap();
+        assert_eq!(prefix, vec![0xCC; 8], "miner sees the pool's extranonce prefix");
+        assert_ne!(down_group, 0, "Extended OpenSuccess carries a remapped group id");
+        assert_ne!(down_group, down_cid, "group id is distinct from the channel id");
+
+        // The group-broadcast job must reach the miner, remapped to the
+        // downstream group id (before the fix it was dropped as unmapped).
+        let job_cid = tokio::time::timeout(
+            Duration::from_secs(5),
+            miner.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+        )
+        .await
+        .expect("group-broadcast job was dropped (not remapped) — timed out")
+        .unwrap();
+        assert_eq!(
+            job_cid, down_group,
+            "group-broadcast job remapped to the downstream group id"
+        );
     }
 }
