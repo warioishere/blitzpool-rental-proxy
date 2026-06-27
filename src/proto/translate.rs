@@ -23,7 +23,7 @@ use anyhow::{anyhow, Result};
 
 use stratum_core::binary_sv2::{Seq0255, Sv2Option, U256};
 use stratum_core::channels_sv2::target::{hash_rate_from_target, hash_rate_to_target};
-use stratum_core::mining_sv2::{NewExtendedMiningJob, SetNewPrevHash, SetTarget, SubmitSharesExtended};
+use stratum_core::mining_sv2::{NewExtendedMiningJob, SetNewPrevHash, SubmitSharesExtended};
 use stratum_core::stratum_translation::sv2_to_sv1;
 use stratum_core::sv1_api::{
     json_rpc,
@@ -33,6 +33,12 @@ use stratum_core::sv1_api::{
 
 /// Difficulty-1 share = 2^32 hashes.
 const DIFF1_HASHES: f64 = 4_294_967_296.0;
+
+/// How long to wait for a native-protocol upstream connect before concluding the
+/// pool speaks the *other* protocol and switching to translation. Detection is
+/// folded into the connect: the native attempt is tried first (and its socket
+/// reused on success); only on its failure/timeout is the other protocol tried.
+pub const UPSTREAM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Default BIP320 version-rolling mask advertised to miners and used to extract
 /// the version-rolling bits from a submitted SV2 version field.
@@ -186,16 +192,6 @@ pub fn sv1_notify_to_sv2_job(
         None
     };
     Ok((job, prev_hash))
-}
-
-/// Build an SV2 `SetTarget` for a channel from an SV1 difficulty.
-pub fn sv1_difficulty_to_sv2_set_target(channel_id: u32, difficulty: f64) -> Result<SetTarget<'static>> {
-    let target = U256::try_from(target_from_difficulty(difficulty).to_vec())
-        .map_err(|e| anyhow!("target: {e:?}"))?;
-    Ok(SetTarget {
-        channel_id,
-        maximum_target: target,
-    })
 }
 
 /// Convert an SV2 `SubmitSharesExtended` into an SV1 `mining.submit`.
@@ -436,13 +432,6 @@ mod tests {
         let line = "{\"method\":\"mining.set_difficulty\",\"params\":[1024.0]}";
         assert_eq!(set_difficulty_from_line(line), Some(1024.0));
         assert_eq!(set_difficulty_from_line("{\"method\":\"mining.notify\",\"params\":[]}"), None);
-    }
-
-    #[test]
-    fn set_target_matches_target_from_difficulty() {
-        let st = sv1_difficulty_to_sv2_set_target(4, 8192.0).unwrap();
-        assert_eq!(st.channel_id, 4);
-        assert_eq!(st.maximum_target.inner_as_ref(), &target_from_difficulty(8192.0));
     }
 
     #[test]

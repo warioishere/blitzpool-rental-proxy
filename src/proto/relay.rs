@@ -406,16 +406,21 @@ enum RawUpstream {
     /// Same protocol as the miner: SV1 lines are forwarded verbatim.
     Sv1(UpstreamConn),
     /// An SV2 buyer pool behind an SV1 miner: an open Extended channel whose jobs
-    /// and shares are translated (see [`crate::proto::translate`]).
+    /// and shares are translated (see [`crate::proto::translate`]). Boxed — the
+    /// Noise halves are far larger than the SV1 variant.
     #[cfg(feature = "sv2")]
-    Sv2 {
-        read: crate::proto::sv2::relay::Read,
-        write: crate::proto::sv2::relay::Write,
-        channel_id: u32,
-        extranonce1: String,
-        extranonce2_size: u32,
-        initial_diff: f64,
-    },
+    Sv2(Box<Sv2RawUpstream>),
+}
+
+/// An opened SV2 Extended channel ready to translate for an SV1 miner.
+#[cfg(feature = "sv2")]
+struct Sv2RawUpstream {
+    read: crate::proto::sv2::relay::Read,
+    write: crate::proto::sv2::relay::Write,
+    channel_id: u32,
+    extranonce1: String,
+    extranonce2_size: u32,
+    initial_diff: f64,
 }
 
 /// Connect to `target`, auto-detecting SV1 (passthrough) vs SV2 (translate).
@@ -426,15 +431,27 @@ async fn connect_raw(
     configure: Option<&RpcMessage>,
     user_identity: &str,
 ) -> anyhow::Result<RawUpstream> {
-    #[cfg(feature = "sv2")]
+    #[cfg(not(feature = "sv2"))]
     {
-        use crate::config::Protocol;
-        if crate::proto::detect::upstream_protocol(target, Protocol::Sv1).await? == Protocol::Sv2 {
-            return connect_sv2_translate(target, user_identity).await;
+        let _ = user_identity;
+        return Ok(RawUpstream::Sv1(connect_upstream(target, configure).await?));
+    }
+    // Native first: try SV1 (reusing its socket on success); if the pool doesn't
+    // answer as SV1, it's an SV2 buyer pool → open an Extended channel + translate.
+    #[cfg(feature = "sv2")]
+    match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_upstream(target, configure))
+        .await
+    {
+        Ok(Ok(conn)) => Ok(RawUpstream::Sv1(conn)),
+        res => {
+            if let Ok(Err(e)) = &res {
+                debug!(url = %target.url, error = %e, "upstream not SV1; trying SV2 translation");
+            } else if res.is_err() {
+                debug!(url = %target.url, "SV1 connect timed out; trying SV2 translation");
+            }
+            connect_sv2_translate(target, user_identity).await
         }
     }
-    let _ = user_identity;
-    Ok(RawUpstream::Sv1(connect_upstream(target, configure).await?))
 }
 
 /// Open an Extended channel on an SV2 pool to serve an SV1 miner through it.
@@ -455,14 +472,14 @@ async fn connect_sv2_translate(
     let info = open_on(&mut read, &mut write, &spec, user_identity).await?;
     let extranonce1 = hex_encode(&info.extranonce_prefix);
     let initial_diff = translate::difficulty_from_target(&info.target);
-    Ok(RawUpstream::Sv2 {
+    Ok(RawUpstream::Sv2(Box::new(Sv2RawUpstream {
         read,
         write,
         channel_id: info.up_channel_id,
         extranonce1,
         extranonce2_size: info.extranonce_size as u32,
         initial_diff,
-    })
+    })))
 }
 
 #[cfg(feature = "sv2")]
@@ -496,25 +513,23 @@ impl Session {
         let mut i = self.inner.lock().await;
         i.active.reader.abort();
         i.active.writer.abort();
-        #[allow(unused_assignments)]
-        let mut translate_diff: Option<f64> = None;
-        let (to_up, reader, writer, en1, en2, prelude, translating) = match raw {
+        let (to_up, reader, writer, en1, en2, prelude, translating, translate_diff) = match raw {
             RawUpstream::Sv1(conn) => {
                 let (to_up, rx) = mpsc::unbounded_channel::<String>();
                 let writer = spawn_writer(conn.write, rx);
                 let reader = spawn_upstream_reader(self.clone(), generation, conn.reader);
-                (to_up, reader, writer, conn.extranonce1, conn.extranonce2_size, conn.prelude, false)
+                (to_up, reader, writer, conn.extranonce1, conn.extranonce2_size, conn.prelude, false, None)
             }
             #[cfg(feature = "sv2")]
-            RawUpstream::Sv2 {
-                read,
-                write,
-                channel_id,
-                extranonce1,
-                extranonce2_size,
-                initial_diff,
-            } => {
-                translate_diff = Some(initial_diff);
+            RawUpstream::Sv2(b) => {
+                let Sv2RawUpstream {
+                    read,
+                    write,
+                    channel_id,
+                    extranonce1,
+                    extranonce2_size,
+                    initial_diff,
+                } = *b;
                 let state = Arc::new(Mutex::new(Sv2UpState {
                     channel_id,
                     ..Default::default()
@@ -530,6 +545,7 @@ impl Session {
                     extranonce2_size,
                     vec![set_difficulty_line(initial_diff)],
                     true,
+                    Some(initial_diff),
                 )
             }
         };
