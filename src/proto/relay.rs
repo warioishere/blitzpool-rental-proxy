@@ -118,6 +118,11 @@ struct Inner {
 pub struct Session {
     to_miner: Tx,
     inner: Mutex<Inner>,
+    /// Serializes upstream swaps so two concurrent switches (e.g. an API rent and
+    /// the expiry revert) can't interleave their connect/install and leave
+    /// `active` pointing at one upstream while `routing` describes another. Always
+    /// taken before `inner`, never the reverse, so it can't deadlock.
+    switch: Mutex<()>,
     /// For crediting measured delivered work to the active rental order.
     orders: Arc<crate::orders::OrderStore>,
 }
@@ -171,6 +176,9 @@ impl Session {
     }
 
     async fn swap_upstream(self: &Arc<Self>, target: UpstreamTarget, routing: Routing) -> anyhow::Result<()> {
+        // Hold the switch lock for the whole swap so concurrent switches run
+        // strictly one after another (the last to acquire wins). Released on return.
+        let _switch = self.switch.lock().await;
         // Snapshot what the handshake needs without holding the lock across IO.
         let (configure, capable, generation) = {
             let mut i = self.inner.lock().await;
@@ -557,6 +565,7 @@ pub async fn handle_seller_miner(
 
     let session = Arc::new(Session {
         to_miner: to_miner.clone(),
+        switch: Mutex::new(()),
         orders: orders.clone(),
         inner: Mutex::new(Inner {
             active: ActiveUpstream {

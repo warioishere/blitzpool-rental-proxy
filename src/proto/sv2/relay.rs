@@ -518,6 +518,11 @@ impl Inner {
 pub struct Sv2Session {
     to_miner: mpsc::UnboundedSender<EitherFrame>,
     inner: Mutex<Inner>,
+    /// Serializes upstream swaps so two concurrent switches (e.g. an API rent and
+    /// the expiry revert) can't interleave their connect/install and leave
+    /// `active` pointing at one upstream while `routing` describes another. Always
+    /// taken before `inner`, never the reverse, so it can't deadlock.
+    switch: Mutex<()>,
     /// For crediting measured delivered work to the active rental order.
     orders: Arc<OrderStore>,
 }
@@ -560,6 +565,10 @@ impl Sv2Session {
         target: UpstreamTarget,
         routing: Routing,
     ) -> anyhow::Result<()> {
+        // Hold the switch lock for the whole swap so concurrent switches run
+        // strictly one after another (the last to acquire wins). Released on
+        // return.
+        let _switch = self.switch.lock().await;
         // Snapshot the channels to re-open (down_channel_id + spec) + worker +
         // the stable downstream group id (the miner already knows it, so the new
         // upstream's re-issued group id must map back onto it).
@@ -912,6 +921,7 @@ pub async fn handle_seller_miner_sv2(
     pending.insert(spec.request_id(), spec.clone());
     let session = Arc::new(Sv2Session {
         to_miner: to_miner.clone(),
+        switch: Mutex::new(()),
         orders: ctx.orders.clone(),
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
@@ -2115,6 +2125,80 @@ mod tests {
         };
         assert_eq!(st.routing, "rented", "session is rented on connect");
         assert_eq!(st.order_id.as_deref(), Some(order.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_switches_leave_a_consistent_session() {
+        // Two switches fired at once must serialize (the switch lock) and leave the
+        // session internally consistent: `routing`/`order_id` agree with the active
+        // upstream, and a submit reaches exactly that pool on its remapped cid.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = pool_b.local_addr().unwrap();
+        let pool_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c_addr = pool_c.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        let (b_tx, mut b_rx) = mpsc::unbounded_channel::<u32>();
+        let (c_tx, mut c_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+        tokio::spawn(mock_pool(pool_c, vec![0xCC; 8], 199, NoiseKeys::generate(), c_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, _) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+
+        let sess = loop {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        // Fire both switches concurrently; the switch lock serializes them.
+        let b_url = b_addr.to_string();
+        let c_url = c_addr.to_string();
+        let (rb, rc) = tokio::join!(
+            sess.switch_to("oB".to_string(), ext_target(&b_url, "acctB")),
+            sess.switch_to("oC".to_string(), ext_target(&c_url, "acctC")),
+        );
+        rb.unwrap();
+        rc.unwrap();
+
+        // Whichever won, routing/order and the active upstream must agree, and a
+        // submit must reach that same pool (its remapped upstream cid).
+        let st = sess.status().await;
+        assert_eq!(st.routing, "rented");
+        miner.submit(down_cid, 0).await.unwrap();
+        match st.order_id.as_deref() {
+            Some("oB") => {
+                assert_eq!(st.upstream_url, b_url, "active matches the winning order (B)");
+                assert_eq!(b_rx.recv().await.unwrap(), 99, "submit reached pool B");
+            }
+            Some("oC") => {
+                assert_eq!(st.upstream_url, c_url, "active matches the winning order (C)");
+                assert_eq!(c_rx.recv().await.unwrap(), 199, "submit reached pool C");
+            }
+            other => panic!("unexpected winning order {other:?}"),
+        }
     }
 
     #[tokio::test]
