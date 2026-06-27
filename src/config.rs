@@ -3,7 +3,9 @@
 //!
 //! Milestone 1 has no seller registry yet, so a single default upstream is
 //! taken from the environment to make the relay testable end-to-end:
-//!   RENTAL_PROXY_LISTEN     (default 0.0.0.0:3333)
+//!   RENTAL_PROXY_LISTEN     (default 0.0.0.0:3333) — the one downstream port
+//!   RENTAL_PROXY_PROTOCOL   sv1 | sv2 | both (default sv1). `both` auto-detects
+//!                           SV1 vs SV2 per connection on the same port.
 //!   RENTAL_PROXY_POOL_URL   host:port of the upstream to relay to
 //!   RENTAL_PROXY_POOL_USER  account/worker at the upstream
 //!   RENTAL_PROXY_POOL_PASS  (default "x")
@@ -17,6 +19,10 @@ pub enum Protocol {
     #[default]
     Sv1,
     Sv2,
+    /// Serve SV1 and SV2 on the same port: the first byte of each connection
+    /// is peeked to classify it (SV1 JSON vs SV2 Noise) and dispatched to the
+    /// matching adapter. One listener, one shared registry/state/control API.
+    Both,
 }
 
 impl Protocol {
@@ -24,6 +30,7 @@ impl Protocol {
         match s.trim().to_ascii_lowercase().as_str() {
             "sv1" | "v1" | "1" | "stratum1" => Some(Protocol::Sv1),
             "sv2" | "v2" | "2" | "stratum2" => Some(Protocol::Sv2),
+            "both" | "sv1+sv2" | "all" => Some(Protocol::Both),
             _ => None,
         }
     }
@@ -70,5 +77,26 @@ impl Config {
             });
         }
         c
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_parse_accepts_known_aliases() {
+        assert_eq!(Protocol::parse("sv1"), Some(Protocol::Sv1));
+        assert_eq!(Protocol::parse("V1"), Some(Protocol::Sv1));
+        assert_eq!(Protocol::parse("sv2"), Some(Protocol::Sv2));
+        assert_eq!(Protocol::parse("2"), Some(Protocol::Sv2));
+        assert_eq!(Protocol::parse(" both "), Some(Protocol::Both));
+        assert_eq!(Protocol::parse("SV1+SV2"), Some(Protocol::Both));
+        assert_eq!(Protocol::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn protocol_defaults_to_sv1() {
+        assert_eq!(Protocol::default(), Protocol::Sv1);
     }
 }

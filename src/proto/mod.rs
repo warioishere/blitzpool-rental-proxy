@@ -8,6 +8,7 @@
 //!   milestone).
 
 pub mod adapter;
+pub mod detect;
 pub mod relay;
 pub mod sv1;
 pub mod sv2;

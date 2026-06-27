@@ -91,7 +91,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Select the wire protocol's adapter at boot; the accept loop is
-    // monomorphised over it (generics, no per-message dyn dispatch).
+    // monomorphised over it (generics, no per-message dyn dispatch). `Both`
+    // peeks the first byte of each connection and dispatches per-connection.
     match cfg.protocol {
         Protocol::Sv1 => accept_loop(listener, proto::relay::Sv1Adapter, ctx).await,
         Protocol::Sv2 => {
@@ -101,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
             let adapter = proto::sv2::Sv2Adapter::default();
             accept_loop(listener, adapter, ctx).await
         }
+        Protocol::Both => accept_loop_auto(listener, ctx).await,
     }
 }
 
@@ -125,6 +127,48 @@ async fn accept_loop<A: DownstreamAdapter>(
         tokio::spawn(async move {
             let peer = peer.to_string();
             if let Err(e) = adapter.serve(sock, peer.clone(), ctx).await {
+                warn!(%peer, error = %e, "session ended with error");
+            }
+        });
+    }
+}
+
+/// Accept seller miners and auto-detect SV1 vs SV2 per connection (one port).
+/// The first byte is peeked (not consumed) and routed to the matching adapter,
+/// which then reads the full stream from the start.
+async fn accept_loop_auto(listener: TcpListener, ctx: ProxyContext) -> anyhow::Result<()> {
+    info!("listening for seller miners (auto SV1/SV2 on one port)");
+    let sv1 = proto::relay::Sv1Adapter;
+    #[allow(clippy::default_constructed_unit_structs)]
+    let sv2 = proto::sv2::Sv2Adapter::default();
+    loop {
+        let (sock, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "accept failed");
+                continue;
+            }
+        };
+        let sv1 = sv1.clone();
+        let sv2 = sv2.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let peer = peer.to_string();
+            // Peek one byte to classify; if the peer never sends, drop quietly.
+            let mut first = [0u8; 1];
+            match sock.peek(&mut first).await {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(%peer, error = %e, "protocol peek failed");
+                    return;
+                }
+            }
+            let result = match proto::detect::detect(first[0]) {
+                Protocol::Sv2 => sv2.serve(sock, peer.clone(), ctx).await,
+                _ => sv1.serve(sock, peer.clone(), ctx).await,
+            };
+            if let Err(e) = result {
                 warn!(%peer, error = %e, "session ended with error");
             }
         });
