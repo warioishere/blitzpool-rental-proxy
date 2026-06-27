@@ -54,12 +54,12 @@ const CERT_VALIDITY: u64 = 3600;
 /// SV2 protocol version the proxy speaks.
 const SV2_VERSION: u16 = 2;
 
-type Read = NoiseTcpReadHalf<Msg>;
-type Write = NoiseTcpWriteHalf<Msg>;
+pub(crate) type Read = NoiseTcpReadHalf<Msg>;
+pub(crate) type Write = NoiseTcpWriteHalf<Msg>;
 
 /// The miner's channel-open request, captured to re-open against each upstream.
 #[derive(Clone)]
-enum OpenSpec {
+pub(crate) enum OpenSpec {
     Standard {
         request_id: u32,
         nominal_hash_rate: f32,
@@ -93,13 +93,13 @@ struct MinerOpen {
 }
 
 /// An upstream's channel-open result (success), copied out as owned bytes.
-struct ChannelInfo {
-    request_id: u32,
-    up_channel_id: u32,
-    extranonce_prefix: Vec<u8>,
-    target: Vec<u8>,
-    extranonce_size: u16,
-    group_channel_id: u32,
+pub(crate) struct ChannelInfo {
+    pub(crate) request_id: u32,
+    pub(crate) up_channel_id: u32,
+    pub(crate) extranonce_prefix: Vec<u8>,
+    pub(crate) target: Vec<u8>,
+    pub(crate) extranonce_size: u16,
+    pub(crate) group_channel_id: u32,
 }
 
 // ── message builders ────────────────────────────────────────────────
@@ -252,7 +252,7 @@ fn parse_miner_open(frame: &mut Sv2Frame) -> Option<MinerOpen> {
     }
 }
 
-fn parse_open_success(frame: &mut Sv2Frame) -> Option<ChannelInfo> {
+pub(crate) fn parse_open_success(frame: &mut Sv2Frame) -> Option<ChannelInfo> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
@@ -285,7 +285,7 @@ fn parse_setup_success_flags(frame: &mut Sv2Frame) -> Option<u32> {
     }
 }
 
-fn parse_accepted_count(frame: &mut Sv2Frame) -> Option<u32> {
+pub(crate) fn parse_accepted_count(frame: &mut Sv2Frame) -> Option<u32> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
@@ -294,11 +294,51 @@ fn parse_accepted_count(frame: &mut Sv2Frame) -> Option<u32> {
     }
 }
 
-fn parse_set_target(frame: &mut Sv2Frame) -> Option<Vec<u8>> {
+/// `(last_sequence_number, new_submits_accepted_count)` of a `SubmitSharesSuccess`.
+pub(crate) fn parse_submit_success(frame: &mut Sv2Frame) -> Option<(u32, u32)> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::SubmitSharesSuccess(s) => Some((s.last_sequence_number, s.new_submits_accepted_count)),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_set_target(frame: &mut Sv2Frame) -> Option<Vec<u8>> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
         Mining::SetTarget(m) => Some(m.maximum_target.inner_as_ref().to_vec()),
+        _ => None,
+    }
+}
+
+/// Parse a `NewExtendedMiningJob` out of a frame (owned/`'static`).
+pub(crate) fn parse_new_extended_job(frame: &mut Sv2Frame) -> Option<mining::NewExtendedMiningJob<'static>> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::NewExtendedMiningJob(m) => Some(m.into_static()),
+        _ => None,
+    }
+}
+
+/// Parse a `SetNewPrevHash` out of a frame (owned/`'static`).
+pub(crate) fn parse_set_new_prev_hash(frame: &mut Sv2Frame) -> Option<mining::SetNewPrevHash<'static>> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::SetNewPrevHash(m) => Some(m.into_static()),
+        _ => None,
+    }
+}
+
+/// The `sequence_number` of a `SubmitSharesError` (the rejected share's id).
+pub(crate) fn parse_submit_error_seq(frame: &mut Sv2Frame) -> Option<u32> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::SubmitSharesError(m) => Some(m.sequence_number),
         _ => None,
     }
 }
@@ -327,7 +367,7 @@ async fn read_one(read: &mut Read) -> anyhow::Result<Sv2Frame> {
 
 /// Connect an upstream, run SetupConnection, return the (post-setup) halves and
 /// the upstream's negotiated flags.
-async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, u32)> {
+pub(crate) async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, u32)> {
     let tcp = TcpStream::connect(&target.url)
         .await
         .with_context(|| format!("connect upstream {}", target.url))?;
@@ -361,7 +401,7 @@ async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, 
 /// atomically swaps `active`, so miner traffic is never routed to a channel that
 /// isn't open yet. The fresh-open path (initial + additional channels) instead
 /// finalizes through the steady reader; this is only used by [`Sv2Session::swap_upstream`].
-async fn open_on(
+pub(crate) async fn open_on(
     read: &mut Read,
     write: &mut Write,
     spec: &OpenSpec,
