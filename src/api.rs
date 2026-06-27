@@ -4,8 +4,9 @@
 //!   GET  /api/health
 //!   GET  /api/sessions                      list live miners + status
 //!   GET  /api/sessions/{worker}             one session
-//!   POST /api/sessions/{worker}/rent        body {url,user,pass,order_id,until_unix_ms}
-//!   POST /api/sessions/{worker}/release     back to default pool
+//!
+//! Rentals are driven through the orders layer (`POST /api/orders`), which gates,
+//! records, bills and auto-reverts. There is no raw session-switch endpoint.
 //!
 //! Seller-config + order endpoints are added by their modules (sellers/orders).
 
@@ -46,8 +47,6 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{worker}", get(get_session))
-        .route("/api/sessions/{worker}/rent", post(rent))
-        .route("/api/sessions/{worker}/release", post(release))
         .route("/api/sellers", get(list_sellers))
         .route(
             "/api/sellers/{worker}",
@@ -135,46 +134,6 @@ async fn get_session(
     }
 }
 
-#[derive(Deserialize)]
-struct RentReq {
-    url: String,
-    user: String,
-    #[serde(default)]
-    pass: String,
-    /// SV2 only: pool Noise authority public key (base58).
-    #[serde(default)]
-    authority: Option<String>,
-    #[serde(default)]
-    order_id: Option<String>,
-    #[serde(default)]
-    until_unix_ms: i64,
-}
-
-async fn rent(
-    State(s): State<AppState>,
-    Path(worker): Path<String>,
-    Json(req): Json<RentReq>,
-) -> Result<Json<Value>, ApiError> {
-    let sessions = s.registry.get_all(&worker).await;
-    if sessions.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "worker not connected".to_string()));
-    }
-    let _ = req.until_unix_ms; // honored by the orders layer
-    let target = UpstreamTarget {
-        url: req.url,
-        user: req.user,
-        password: req.pass,
-        authority_pubkey: req.authority,
-    };
-    let order_id = req.order_id.unwrap_or_default();
-    // Switch every miner of this rig to the buyer's target.
-    let switched = switch_all(&sessions, &order_id, &target).await;
-    if switched == 0 {
-        return Err((StatusCode::BAD_GATEWAY, "no session could be switched".into()));
-    }
-    Ok(Json(json!({"ok": true, "switched": switched, "of": sessions.len()})))
-}
-
 /// Switch all of a rig's sessions to `target`; returns how many succeeded.
 /// Tolerates partial failure (a dead session's reconnect resumes the order),
 /// but logs it.
@@ -203,18 +162,6 @@ async fn revert_all(sessions: &[crate::control::AnySession]) -> usize {
         }
     }
     ok
-}
-
-async fn release(
-    State(s): State<AppState>,
-    Path(worker): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let sessions = s.registry.get_all(&worker).await;
-    if sessions.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "worker not connected".to_string()));
-    }
-    let reverted = revert_all(&sessions).await;
-    Ok(Json(json!({"ok": true, "reverted": reverted, "of": sessions.len()})))
 }
 
 #[derive(Deserialize)]
@@ -645,32 +592,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["sessions"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn rent_unknown_worker_is_404() {
-        let req = Request::post("/api/sessions/ghost/rent")
-            .header("content-type", "application/json")
-            .header("authorization", BEARER)
-            .body(Body::from(r#"{"url":"x:1","user":"u"}"#))
-            .unwrap();
-        let resp = app().await.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn release_unknown_worker_is_404() {
-        let resp = app()
-            .await
-            .oneshot(
-                Request::post("/api/sessions/ghost/release")
-                    .header("authorization", BEARER)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
