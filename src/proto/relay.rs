@@ -45,7 +45,10 @@ const RECONNECT_HINT_TTL: Duration = Duration::from_secs(120);
 /// After authorize, how long to wait for the miner's `mining.extranonce.subscribe`
 /// before deciding live-switch vs reconnect. Miners (e.g. BitAxe) send it only
 /// after they receive the authorize result, so the proxy must give it a moment.
-const EXTRANONCE_GRACE: Duration = Duration::from_millis(800);
+/// The wait ends as soon as the subscribe arrives — this is only the ceiling for
+/// miners that never send it (they then take the reconnect path). 50ms is enough
+/// in practice (confirmed from earlier TS-pool testing with a BitAxe).
+const EXTRANONCE_GRACE: Duration = Duration::from_millis(50);
 
 /// Per-source-IP reconnect hints. When a miner that can't take a live
 /// extranonce change authorizes onto a pool different from its handshake pool,
@@ -675,7 +678,26 @@ pub async fn handle_seller_miner(
                             warn!(worker = %w, "rejected unregistered worker (register-only)");
                             break;
                         }
-                        session.on_miner_msg(msg, &registry).await;
+                        // Register the worker and answer the authorize OURSELVES.
+                        // The upstream is authorized in the handshake/switch (with
+                        // the pool/buyer account), so we don't forward the miner's
+                        // authorize — and crucially, answering it now is what makes
+                        // the miner proceed to send suggest_difficulty +
+                        // mining.extranonce.subscribe (it waits for the authorize
+                        // result first). Without this the grace window below never
+                        // sees the subscribe and we always fall back to reconnect.
+                        session.inner.lock().await.label = w.clone();
+                        registry
+                            .insert(w.clone(), AnySession::Sv1(session.clone()))
+                            .await;
+                        let auth_reply = RpcMessage {
+                            id: msg.id.clone(),
+                            method: None,
+                            params: None,
+                            result: Some(json!(true)),
+                            error: Some(Value::Null),
+                        };
+                        let _ = to_miner.send(auth_reply.to_line());
                         // Where this worker should mine: its active rental's target,
                         // else its seller default pool.
                         let want = order
