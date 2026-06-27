@@ -9,6 +9,7 @@
 //!
 //! Seller-config + order endpoints are added by their modules (sellers/orders).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -19,14 +20,14 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::orders::OrderStore;
 use crate::registry::Registry;
 use crate::session::UpstreamTarget;
-use crate::store::SellerStore;
+use crate::store::{Rig, SellerStore};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -194,14 +195,47 @@ struct SellerQuery {
     seller: Option<String>,
 }
 
+/// A rig is rentable only while it's actually delivering hashrate. The live
+/// windowed estimate reads 0 h/s when a worker is disconnected or hasn't landed
+/// an accepted share recently, so `> 0` means "online and delivering".
+fn is_delivering(hashrate_hs: f64) -> bool {
+    hashrate_hs > 0.0
+}
+
+/// Merge each rig with its live status (`online` + `hashrate_hs`), keyed by
+/// worker. `live` maps currently-connected workers to their windowed hashrate
+/// estimate (hashes/second); a worker absent from `live` is offline.
+fn enrich_sellers(sellers: HashMap<String, Rig>, live: &HashMap<String, f64>) -> Map<String, Value> {
+    sellers
+        .into_iter()
+        .map(|(worker, rig)| {
+            let hashrate_hs = live.get(&worker).copied().unwrap_or(0.0);
+            let mut v = serde_json::to_value(&rig).unwrap_or_else(|_| json!({}));
+            if let Value::Object(map) = &mut v {
+                map.insert("hashrate_hs".into(), json!(hashrate_hs));
+                map.insert("online".into(), json!(is_delivering(hashrate_hs)));
+            }
+            (worker, v)
+        })
+        .collect()
+}
+
 /// List rigs. `?seller=<address>` filters to that seller's rigs (dashboard);
-/// no filter returns all (operator view).
+/// no filter returns all (operator view). Each rig carries live `online` +
+/// `hashrate_hs` derived from the connected sessions.
 async fn list_sellers(State(s): State<AppState>, Query(q): Query<SellerQuery>) -> Json<Value> {
     let sellers = match q.seller.as_deref() {
         Some(addr) if !addr.is_empty() => s.sellers.list_for_seller(addr).await,
         _ => s.sellers.list().await,
     };
-    Json(json!({ "sellers": sellers }))
+    let live: HashMap<String, f64> = s
+        .registry
+        .snapshot()
+        .await
+        .into_iter()
+        .map(|st| (st.worker, st.hashrate_hs))
+        .collect();
+    Json(json!({ "sellers": enrich_sellers(sellers, &live) }))
 }
 
 fn default_true() -> bool {
@@ -364,6 +398,14 @@ async fn create_order(
             return Err((StatusCode::CONFLICT, "rig is not listed for rent".into()));
         }
     }
+    // Only rigs currently delivering hashrate can be rented.
+    let live_hashrate = match s.registry.get(&req.worker).await {
+        Some(sess) => sess.status().await.hashrate_hs,
+        None => 0.0,
+    };
+    if !is_delivering(live_hashrate) {
+        return Err((StatusCode::CONFLICT, "rig is offline".into()));
+    }
     let target = UpstreamTarget {
         url: req.url,
         user: req.user,
@@ -429,6 +471,12 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Plain-text body (error responses are `(StatusCode, String)`).
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     #[tokio::test]
@@ -552,10 +600,15 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["default_pool"]["url"], "poolA:3333");
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["advertised_ths"], 220.0);
+        // A registered rig with no connected miner is offline (not delivering).
+        assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["online"], false);
+        assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["hashrate_hs"], 0.0);
     }
 
     #[tokio::test]
-    async fn create_order_for_offline_worker_is_recorded_not_applied() {
+    async fn create_order_for_offline_worker_is_rejected() {
+        // Only rigs currently delivering hashrate can be rented; an offline
+        // worker (no connected session) is rejected and no order is recorded.
         let app = app().await;
         let post = Request::post("/api/orders")
             .header("content-type", "application/json")
@@ -565,11 +618,8 @@ mod tests {
             ))
             .unwrap();
         let resp = app.clone().oneshot(post).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["applied"], false); // worker not connected
-        assert_eq!(v["order"]["worker"], "bc1qSELLER.rig1");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("offline"));
 
         let resp = app
             .oneshot(
@@ -581,7 +631,35 @@ mod tests {
             .await
             .unwrap();
         let v = body_json(resp).await;
-        assert_eq!(v["orders"].as_array().unwrap().len(), 1);
+        assert_eq!(v["orders"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn is_delivering_requires_positive_hashrate() {
+        assert!(!is_delivering(0.0));
+        assert!(is_delivering(1.0));
+        assert!(is_delivering(5.0e12));
+    }
+
+    #[test]
+    fn enrich_sellers_marks_online_only_when_delivering() {
+        let mut sellers = HashMap::new();
+        sellers.insert(
+            "bc1qA.on".to_string(),
+            Rig { advertised_ths: 100.0, ..Default::default() },
+        );
+        sellers.insert("bc1qA.off".to_string(), Rig::default());
+
+        let mut live = HashMap::new();
+        live.insert("bc1qA.on".to_string(), 5.0e12);
+        // "bc1qA.off" absent from the live map → offline.
+
+        let out = enrich_sellers(sellers, &live);
+        assert_eq!(out["bc1qA.on"]["online"], json!(true));
+        assert_eq!(out["bc1qA.on"]["hashrate_hs"], json!(5.0e12));
+        assert_eq!(out["bc1qA.on"]["advertised_ths"], json!(100.0));
+        assert_eq!(out["bc1qA.off"]["online"], json!(false));
+        assert_eq!(out["bc1qA.off"]["hashrate_hs"], json!(0.0));
     }
 
     async fn put_rig(app: &Router, worker: &str) {
@@ -631,7 +709,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.clone().oneshot(off).await.unwrap().status(), StatusCode::OK);
 
-        // Creating a rental for a non-rentable rig is rejected.
+        // Creating a rental for a non-rentable rig is rejected by the rentable gate.
         let order = Request::post("/api/orders")
             .header("content-type", "application/json")
             .header("authorization", BEARER)
@@ -639,9 +717,13 @@ mod tests {
                 r#"{"worker":"bc1qA.rig1","url":"buyer:3333","user":"b","until_ms":0}"#,
             ))
             .unwrap();
-        assert_eq!(app.clone().oneshot(order).await.unwrap().status(), StatusCode::CONFLICT);
+        let resp = app.clone().oneshot(order).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("not listed for rent"));
 
-        // Toggle back on → rental allowed.
+        // Toggle back on → the rentable gate no longer blocks. The rig is still
+        // offline (no connected miner), so it's now rejected for that reason —
+        // proving the toggle worked (the rejection reason changed).
         let on = Request::post("/api/sellers/bc1qA.rig1/rentable")
             .header("content-type", "application/json")
             .header("authorization", BEARER)
@@ -656,7 +738,9 @@ mod tests {
                 r#"{"worker":"bc1qA.rig1","url":"buyer:3333","user":"b","until_ms":0}"#,
             ))
             .unwrap();
-        assert_eq!(app.clone().oneshot(order2).await.unwrap().status(), StatusCode::OK);
+        let resp = app.clone().oneshot(order2).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("offline"));
     }
 
     #[tokio::test]
