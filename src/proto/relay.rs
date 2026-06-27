@@ -68,6 +68,9 @@ struct Inner {
     configure: Option<RpcMessage>,
     extranonce_capable: bool,
     label: String,
+    /// Upstream handshake notifications (set_difficulty/notify) captured before
+    /// the miner subscribed; flushed to the miner right after the subscribe reply.
+    pending_prelude: Vec<String>,
 }
 
 /// A live seller-miner session. Held by the relay tasks and the registry.
@@ -151,6 +154,12 @@ impl Session {
                 .send(RpcMessage::set_extranonce(&conn.extranonce1, conn.extranonce2_size).to_line());
         } else {
             warn!(upstream = %target.url, "miner not extranonce-capable; live switch may need a reconnect");
+        }
+        // Forward the new upstream's initial set_difficulty + notify so the miner
+        // re-targets to the new pool (else it keeps the old / "diff 0" and the new
+        // pool rejects every share as "Difficulty too low").
+        for line in conn.prelude {
+            let _ = self.to_miner.send(line);
         }
         info!(upstream = %target.url, generation, capable, "upstream switched");
         Ok(())
@@ -300,6 +309,10 @@ struct UpstreamConn {
     write: OwnedWriteHalf,
     extranonce1: String,
     extranonce2_size: u32,
+    /// Notifications (`set_difficulty`/`notify`) the pool sent during the
+    /// handshake, in order. Must be forwarded to the miner — otherwise it never
+    /// gets its initial difficulty (mines at "diff 0" → all shares rejected).
+    prelude: Vec<String>,
 }
 
 /// Connect to `target`, drive `configure`(replay)→`subscribe`→`authorize`, and
@@ -312,33 +325,41 @@ async fn connect_upstream(
     let _ = stream.set_nodelay(true);
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
+    let mut prelude: Vec<String> = Vec::new();
 
     if let Some(cfg) = configure {
         w.write_all(cfg.to_line().as_bytes()).await?;
-        let _ = read_response(&mut reader).await?; // discard upstream configure reply
+        let _ = read_response(&mut reader, &mut prelude).await?; // discard upstream configure reply
     }
 
     let sub = RpcMessage::request(json!(1), "mining.subscribe", json!(["stratum-rental-proxy/0.1"]));
     w.write_all(sub.to_line().as_bytes()).await?;
-    let sub_resp = read_response(&mut reader).await?;
+    let sub_resp = read_response(&mut reader, &mut prelude).await?;
     let (extranonce1, extranonce2_size) =
         parse_subscribe_result(&sub_resp).ok_or_else(|| anyhow::anyhow!("bad subscribe result"))?;
 
     let auth = RpcMessage::request(json!(2), "mining.authorize", json!([target.user, target.password]));
     w.write_all(auth.to_line().as_bytes()).await?;
-    let _ = read_response(&mut reader).await?; // authorize reply (value ignored for now)
+    let _ = read_response(&mut reader, &mut prelude).await?; // authorize reply (value ignored for now)
 
     Ok(UpstreamConn {
         reader,
         write: w,
         extranonce1,
         extranonce2_size,
+        prelude,
     })
 }
 
-/// Read lines until a *response* (has `result`/`error`, no `method`), skipping
-/// notifications (`set_difficulty`/`notify`) that may interleave a handshake.
-async fn read_response(reader: &mut BufReader<OwnedReadHalf>) -> anyhow::Result<RpcMessage> {
+/// Read lines until a *response* (has `result`/`error`, no `method`). Any
+/// notifications (`set_difficulty`/`notify`) that interleave the handshake are
+/// pushed to `prelude` so the caller can forward them to the miner — the pool's
+/// initial `set_difficulty`+`notify` arrive here, and dropping them leaves the
+/// miner mining at "diff 0" (every share rejected as "Difficulty too low").
+async fn read_response(
+    reader: &mut BufReader<OwnedReadHalf>,
+    prelude: &mut Vec<String>,
+) -> anyhow::Result<RpcMessage> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -354,6 +375,7 @@ async fn read_response(reader: &mut BufReader<OwnedReadHalf>) -> anyhow::Result<
             if msg.method.is_none() {
                 return Ok(msg);
             }
+            prelude.push(trimmed.to_string());
         }
     }
 }
@@ -453,6 +475,7 @@ pub async fn handle_seller_miner(
         .map_err(|e| anyhow::anyhow!("connect default upstream {}: {e}", default_target.url))?;
     let en1 = conn.extranonce1.clone();
     let en2 = conn.extranonce2_size;
+    let initial_prelude = conn.prelude;
 
     let (to_up, up_rx) = mpsc::unbounded_channel::<String>();
     let up_writer = spawn_writer(conn.write, up_rx);
@@ -481,6 +504,7 @@ pub async fn handle_seller_miner(
             configure: None,
             extranonce_capable: false,
             label: peer.clone(),
+            pending_prelude: initial_prelude,
         }),
     });
 
@@ -537,6 +561,12 @@ pub async fn handle_seller_miner(
                         error: Some(Value::Null),
                     };
                     let _ = to_miner.send(reply.to_line());
+                    // Now flush the upstream's initial set_difficulty + notify that
+                    // arrived during the handshake (before the miner subscribed).
+                    let prelude = std::mem::take(&mut session.inner.lock().await.pending_prelude);
+                    for line in prelude {
+                        let _ = to_miner.send(line);
+                    }
                 }
                 Some("mining.extranonce.subscribe") => {
                     session.inner.lock().await.extranonce_capable = true;
@@ -618,4 +648,45 @@ pub async fn handle_seller_miner(
     miner_writer.abort();
     info!(%peer, "relay closed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// The pool's initial `set_difficulty` + `notify` interleave the handshake
+    /// (they arrive before/around the authorize reply). `read_response` must keep
+    /// them in `prelude` (so the relay can forward them) and still return the
+    /// response — dropping them leaves the miner at "diff 0" → every share
+    /// rejected as "Difficulty too low".
+    #[tokio::test]
+    async fn read_response_keeps_handshake_notifications() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            s.write_all(b"{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[512]}\n")
+                .await
+                .unwrap();
+            s.write_all(b"{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"job1\"]}\n")
+                .await
+                .unwrap();
+            s.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, _w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut prelude: Vec<String> = Vec::new();
+        let resp = read_response(&mut reader, &mut prelude).await.unwrap();
+
+        assert!(resp.method.is_none(), "returned message is the response");
+        assert_eq!(resp.result, Some(json!(true)));
+        assert_eq!(prelude.len(), 2, "both handshake notifications kept");
+        assert!(prelude[0].contains("set_difficulty"));
+        assert!(prelude[1].contains("notify"));
+        server.await.unwrap();
+    }
 }
