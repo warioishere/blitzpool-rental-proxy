@@ -414,7 +414,54 @@ fn spawn_upstream_reader(session: Arc<Sv2Session>, generation: u64, mut read: Re
                 session.on_upstream_frame(generation, sv2).await;
             }
         }
+        // The loop ended = the pool closed/errored (an intentional swap aborts
+        // this task before here). Tell the supervisor so it can reconnect/fail over.
+        let _ = session.died_tx.send(generation);
     })
+}
+
+/// Per-session supervisor: when the active upstream drops while a rental is in
+/// effect, reconnect to the order's pool (primary→fallback); when an idle pool
+/// drops, reconnect the seller's default. Retries with capped backoff. Each
+/// reconnect bumps the generation, so a recovered/superseded session ends the
+/// retry loop; stale signals (from an already-swapped reader) are ignored.
+async fn supervise_upstream(session: Arc<Sv2Session>, mut died_rx: mpsc::UnboundedReceiver<u64>) {
+    while let Some(gen) = died_rx.recv().await {
+        if session.inner.lock().await.active.generation != gen {
+            continue; // stale (already swapped away)
+        }
+        warn!(gen, "sv2 upstream dropped — reconnecting/failing over");
+        let mut backoff = Duration::from_millis(500);
+        loop {
+            let order_id = {
+                let i = session.inner.lock().await;
+                if i.active.generation != gen {
+                    None // re-established, or reverted/switched elsewhere
+                } else {
+                    match &i.routing {
+                        Routing::Rented { order_id } => Some(Some(order_id.clone())),
+                        Routing::Idle => Some(None),
+                    }
+                }
+            };
+            let res = match order_id {
+                None => break,
+                Some(Some(oid)) => session.switch_to_order(oid).await,
+                Some(None) => session.revert().await,
+            };
+            match res {
+                Ok(()) => {
+                    info!(gen, "sv2 upstream re-established after drop");
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "sv2 reconnect failed; backing off");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    }
 }
 
 // ── session ─────────────────────────────────────────────────────────
@@ -523,6 +570,10 @@ pub struct Sv2Session {
     /// `active` pointing at one upstream while `routing` describes another. Always
     /// taken before `inner`, never the reverse, so it can't deadlock.
     switch: Mutex<()>,
+    /// An upstream reader sends its generation here when its read loop ends on a
+    /// dropped/closed pool (an intentional swap aborts the reader, which doesn't
+    /// signal). The supervisor task reconnects / fails over to the fallback.
+    died_tx: mpsc::UnboundedSender<u64>,
     /// For crediting measured delivered work to the active rental order.
     orders: Arc<OrderStore>,
 }
@@ -943,9 +994,11 @@ pub async fn handle_seller_miner_sv2(
     let up_writer = spawn_writer(up_write, up_rx);
     let mut pending = std::collections::HashMap::new();
     pending.insert(spec.request_id(), spec.clone());
+    let (died_tx, died_rx) = mpsc::unbounded_channel::<u64>();
     let session = Arc::new(Sv2Session {
         to_miner: to_miner.clone(),
         switch: Mutex::new(()),
+        died_tx,
         orders: ctx.orders.clone(),
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
@@ -991,6 +1044,8 @@ pub async fn handle_seller_miner_sv2(
     ctx.registry
         .insert(worker.clone(), AnySession::Sv2(session.clone()))
         .await;
+    // Supervisor: reconnect / fail over to the fallback if the upstream drops.
+    let supervisor = tokio::spawn(supervise_upstream(session.clone(), died_rx));
     match &active_order {
         Some(o) => info!(%peer, %worker, upstream = %open_target.url, order = %o.id, "sv2 relay established (rented)"),
         None => info!(%peer, %worker, upstream = %open_target.url, "sv2 relay established (idle)"),
@@ -1072,6 +1127,7 @@ pub async fn handle_seller_miner_sv2(
     ctx.registry
         .remove_if(&label, &AnySession::Sv2(session.clone()))
         .await;
+    supervisor.abort();
     {
         let i = session.inner.lock().await;
         i.active.reader.abort();
@@ -2107,6 +2163,119 @@ mod tests {
             job_cid, down_cid,
             "post-switch job remapped to the stable downstream channel id"
         );
+    }
+
+    /// A pool that completes one channel open then drops the connection AND its
+    /// listener — simulating a pool that goes away mid-rental (reconnects refused).
+    async fn mock_pool_drop_once(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
+        let (sock, _) = listener.accept().await?;
+        let _ = sock.set_nodelay(true);
+        let stream =
+            accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+                .await
+                .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+        let (mut read, mut write) = stream.into_split();
+        loop {
+            let f = read_one(&mut read).await?;
+            if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+                break;
+            }
+        }
+        write.write_frame(setup_success(0)).await.map_err(|e| anyhow!("{e:?}"))?;
+        while let Ok(mut f) = read_one(&mut read).await {
+            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
+                let Some(open) = parse_miner_open(&mut f) else {
+                    continue;
+                };
+                let info = ChannelInfo {
+                    request_id: open.spec.request_id(),
+                    up_channel_id: 99,
+                    extranonce_prefix: vec![0xBB; 8],
+                    target: diff1_target(),
+                    extranonce_size: 8,
+                    group_channel_id: 0,
+                };
+                write
+                    .write_frame(open_success_downstream(&open.spec, 99, 0, &info)?)
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?;
+                break;
+            }
+        }
+        // Return → drops the connection (EOF to the proxy) + the listener (port
+        // freed), so the proxy's reconnect to the primary is refused → fail over.
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mid_rental_failover_to_fallback_on_primary_drop() {
+        // Rental primary serves the open then drops; the supervisor must reconnect,
+        // find the primary gone, and fail over to the fallback pool.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        let pool_fb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fb_addr = pool_fb.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        let (fb_tx, _fb_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool_drop_once(primary, NoiseKeys::generate()));
+        tokio::spawn(mock_pool(pool_fb, vec![0xCC; 8], 55, NoiseKeys::generate(), fb_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let orders = crate::orders::OrderStore::new(db.clone());
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: orders.clone(),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (_down_cid, _) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+
+        let order = orders
+            .create(
+                "bc1qSELLER.rig1".into(),
+                ext_target(&primary_addr.to_string(), "acctP"),
+                Some(ext_target(&fb_addr.to_string(), "acctFB")),
+                0,
+                0.0,
+                0.0,
+            )
+            .await
+            .unwrap();
+        let sess = loop {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        // Lands on the primary; the primary then drops → supervisor fails over.
+        sess.switch_to_order(order.id.clone()).await.unwrap();
+
+        // The miner is eventually re-pointed to the fallback (0xCC) by the supervisor.
+        let mut got_fb = false;
+        for _ in 0..50 {
+            let res = tokio::time::timeout(Duration::from_secs(5), miner.read_until_set_extranonce()).await;
+            let Ok(Ok((_, prefix))) = res else { break };
+            if prefix == vec![0xCC; 8] {
+                got_fb = true;
+                break;
+            }
+        }
+        assert!(got_fb, "supervisor failed the dropped primary over to the fallback pool");
     }
 
     #[tokio::test]
