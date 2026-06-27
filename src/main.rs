@@ -6,10 +6,6 @@
 //! Persistent rig/order state lives in SQLite; the HTTP control API steers
 //! rentals and the expiry task auto-reverts finished ones.
 
-// Foundations are scaffolded ahead of being wired; silence dead-code noise
-// until the relay + control layers consume them.
-#![allow(dead_code)]
-
 mod api;
 mod config;
 mod control;

@@ -95,14 +95,6 @@ impl AnySession {
         }
     }
 
-    pub async fn default_target(&self) -> UpstreamTarget {
-        match self {
-            AnySession::Sv1(s) => s.default_target().await,
-            #[cfg(feature = "sv2")]
-            AnySession::Sv2(s) => s.default_target().await,
-        }
-    }
-
     pub async fn status(&self) -> SessionStatus {
         match self {
             AnySession::Sv1(s) => s.status().await,

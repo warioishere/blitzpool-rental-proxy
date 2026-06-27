@@ -28,50 +28,10 @@ pub struct UpstreamTarget {
 pub enum Routing {
     /// Not rented — mine on the seller's own default pool.
     Idle,
-    /// Rented — forward to the buyer's target until `until_unix_ms`.
-    Rented {
-        order_id: String,
-        target: UpstreamTarget,
-        until_unix_ms: i64,
-    },
-}
-
-impl Routing {
-    /// The upstream this routing points at, given the seller's default.
-    pub fn upstream<'a>(&'a self, default: &'a UpstreamTarget) -> &'a UpstreamTarget {
-        match self {
-            Routing::Idle => default,
-            Routing::Rented { target, .. } => target,
-        }
-    }
-}
-
-/// A registered seller miner and its live routing + hashrate.
-pub struct Session {
-    pub seller_id: String,
-    pub default_pool: UpstreamTarget,
-    pub routing: Routing,
-    pub hashrate: HashrateWindow,
-}
-
-impl Session {
-    pub fn new(seller_id: impl Into<String>, default_pool: UpstreamTarget) -> Self {
-        Self {
-            seller_id: seller_id.into(),
-            default_pool,
-            routing: Routing::Idle,
-            hashrate: HashrateWindow::new(Duration::from_secs(600)),
-        }
-    }
-
-    /// Current upstream target (default when idle, buyer target when rented).
-    pub fn current_upstream(&self) -> &UpstreamTarget {
-        self.routing.upstream(&self.default_pool)
-    }
-
-    pub fn is_rented(&self) -> bool {
-        matches!(self.routing, Routing::Rented { .. })
-    }
+    /// Rented to an order. The live buyer target is `ActiveUpstream::target`; the
+    /// order id is kept here to credit delivered work to the rental. The rental's
+    /// deadline + budget live on the [`crate::orders::Order`].
+    Rented { order_id: String },
 }
 
 /// Rolling window of accepted-share difficulty → hashrate estimate.
@@ -143,32 +103,6 @@ impl HashrateWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn idle_uses_default_rented_uses_target() {
-        let def = UpstreamTarget {
-            url: "pool.a:3333".into(),
-            user: "seller".into(),
-            password: "x".into(),
-            authority_pubkey: None,
-        };
-        let mut s = Session::new("seller1", def.clone());
-        assert_eq!(s.current_upstream(), &def);
-
-        let target = UpstreamTarget {
-            url: "buyer-pool:3333".into(),
-            user: "buyer".into(),
-            password: "x".into(),
-            authority_pubkey: None,
-        };
-        s.routing = Routing::Rented {
-            order_id: "o1".into(),
-            target: target.clone(),
-            until_unix_ms: 0,
-        };
-        assert_eq!(s.current_upstream(), &target);
-        assert!(s.is_rented());
-    }
 
     #[test]
     fn hashrate_divides_by_elapsed_span_not_full_window() {

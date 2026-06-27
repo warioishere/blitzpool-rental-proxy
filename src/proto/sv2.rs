@@ -55,11 +55,6 @@
 //!    Extended) onto each upstream, so jobs/shares map 1:1 with only the
 //!    `channel_id` rewritten; no Standard↔Extended translation is needed.
 
-/// Verified SV2 wire-layer building blocks (Noise handshake + frame
-/// round-trips), behind the `sv2` feature.
-#[cfg(feature = "sv2")]
-pub mod foundation;
-
 /// Frame plumbing: build/parse/forward SV2 frames with channel-id rewriting.
 #[cfg(feature = "sv2")]
 pub mod wire;

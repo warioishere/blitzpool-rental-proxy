@@ -45,13 +45,6 @@ pub enum OrderStatus {
 }
 
 impl OrderStatus {
-    fn as_db(&self) -> &'static str {
-        match self {
-            OrderStatus::Active => "active",
-            OrderStatus::Ended => "ended",
-            OrderStatus::Cancelled => "cancelled",
-        }
-    }
     fn from_db(s: &str) -> OrderStatus {
         match s {
             "ended" => OrderStatus::Ended,

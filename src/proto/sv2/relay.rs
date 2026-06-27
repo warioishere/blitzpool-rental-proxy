@@ -533,15 +533,7 @@ impl Sv2Session {
         order_id: String,
         target: UpstreamTarget,
     ) -> anyhow::Result<()> {
-        self.swap_upstream(
-            target.clone(),
-            Routing::Rented {
-                order_id,
-                target,
-                until_unix_ms: 0,
-            },
-        )
-        .await
+        self.swap_upstream(target, Routing::Rented { order_id }).await
     }
 
     pub async fn revert(self: &Arc<Self>) -> anyhow::Result<()> {
@@ -554,10 +546,6 @@ impl Sv2Session {
             self.inner.lock().await.default_target = target.clone();
         }
         self.swap_upstream(target, Routing::Idle).await
-    }
-
-    pub async fn default_target(&self) -> UpstreamTarget {
-        self.inner.lock().await.default_target.clone()
     }
 
     async fn swap_upstream(
@@ -903,8 +891,6 @@ pub async fn handle_seller_miner_sv2(
             o.target.clone(),
             Routing::Rented {
                 order_id: o.id.clone(),
-                target: o.target.clone(),
-                until_unix_ms: 0,
             },
         ),
         None => (idle_target.clone(), Routing::Idle),

@@ -129,12 +129,7 @@ pub struct Session {
 impl Session {
     /// Switch this session's hashrate to `target` (a rental starts).
     pub async fn switch_to(self: &Arc<Self>, order_id: String, target: UpstreamTarget) -> anyhow::Result<()> {
-        self.swap_upstream(target.clone(), Routing::Rented {
-            order_id,
-            target,
-            until_unix_ms: 0,
-        })
-        .await
+        self.swap_upstream(target, Routing::Rented { order_id }).await
     }
 
     /// Switch back to the seller's default upstream (a rental ends).
@@ -153,10 +148,6 @@ impl Session {
         self.swap_upstream(target, Routing::Idle).await
     }
 
-    pub async fn default_target(&self) -> UpstreamTarget {
-        self.inner.lock().await.default_target.clone()
-    }
-
     /// Current upstream this session relays to (idle pool or rented target).
     pub async fn active_target(&self) -> UpstreamTarget {
         self.inner.lock().await.active.target.clone()
@@ -165,13 +156,8 @@ impl Session {
     /// Mark this session as serving `order` WITHOUT reconnecting the upstream —
     /// used when the handshake already connected the rental's target (a resolved
     /// reconnect), so the miner keeps the extranonce it was given.
-    pub async fn attach_order(&self, order_id: String, target: UpstreamTarget) {
-        let mut i = self.inner.lock().await;
-        i.routing = Routing::Rented {
-            order_id,
-            target,
-            until_unix_ms: 0,
-        };
+    pub async fn attach_order(&self, order_id: String) {
+        self.inner.lock().await.routing = Routing::Rented { order_id };
     }
 
     async fn swap_upstream(self: &Arc<Self>, target: UpstreamTarget, routing: Routing) -> anyhow::Result<()> {
@@ -722,7 +708,7 @@ pub async fn handle_seller_miner(
                                 // the handshake pool happens to be it). No switch →
                                 // the miner keeps the correct extranonce.
                                 if let Some(o) = &order {
-                                    session.attach_order(o.id.clone(), o.target.clone()).await;
+                                    session.attach_order(o.id.clone()).await;
                                     info!(worker = %w, order = %o.id, "resumed active rental (no switch)");
                                 } else {
                                     info!(worker = %w, upstream = %want.url, "on seller default pool");

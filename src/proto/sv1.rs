@@ -36,10 +36,6 @@ impl RpcMessage {
         s
     }
 
-    pub fn is_method(&self, m: &str) -> bool {
-        self.method.as_deref() == Some(m)
-    }
-
     /// A request/notification (`id` may be `Null` for notifications).
     pub fn request(id: Value, method: &str, params: Value) -> Self {
         Self {
@@ -49,11 +45,6 @@ impl RpcMessage {
             result: None,
             error: None,
         }
-    }
-
-    /// `mining.set_difficulty` notification (server → miner).
-    pub fn set_difficulty(diff: f64) -> Self {
-        Self::request(Value::Null, "mining.set_difficulty", json!([diff]))
     }
 
     /// `mining.set_extranonce` notification (server → miner) — used on an
@@ -78,34 +69,6 @@ impl RpcMessage {
     }
 }
 
-/// Fields of a `mining.submit` (miner → upstream), positional params:
-/// `[worker_name, job_id, extranonce2, ntime, nonce]`.
-#[derive(Debug, Clone)]
-pub struct Submit {
-    pub worker: String,
-    pub job_id: String,
-    pub extranonce2: String,
-    pub ntime: String,
-    pub nonce: String,
-}
-
-impl Submit {
-    pub fn from_message(msg: &RpcMessage) -> Option<Self> {
-        if !msg.is_method("mining.submit") {
-            return None;
-        }
-        let p = msg.params.as_ref()?.as_array()?;
-        let s = |i: usize| p.get(i).and_then(|v| v.as_str()).map(str::to_string);
-        Some(Self {
-            worker: s(0)?,
-            job_id: s(1)?,
-            extranonce2: s(2)?,
-            ntime: s(3)?,
-            nonce: s(4)?,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,7 +77,7 @@ mod tests {
     fn parses_subscribe_request() {
         let line = r#"{"id":1,"method":"mining.subscribe","params":["cgminer/4.10"]}"#;
         let m = RpcMessage::parse(line).unwrap();
-        assert!(m.is_method("mining.subscribe"));
+        assert_eq!(m.method.as_deref(), Some("mining.subscribe"));
         assert_eq!(m.id, Some(json!(1)));
     }
 
@@ -127,21 +90,9 @@ mod tests {
     }
 
     #[test]
-    fn reads_submit_fields() {
-        let line = r#"{"id":4,"method":"mining.submit","params":["addr.worker","job1","00000000","65000000","12345678"]}"#;
-        let m = RpcMessage::parse(line).unwrap();
-        let s = Submit::from_message(&m).unwrap();
-        assert_eq!(s.worker, "addr.worker");
-        assert_eq!(s.job_id, "job1");
-        assert_eq!(s.nonce, "12345678");
-    }
-
-    #[test]
-    fn set_difficulty_and_extranonce_roundtrip() {
-        let d = RpcMessage::set_difficulty(1024.0);
-        assert!(d.to_line().contains("mining.set_difficulty"));
+    fn set_extranonce_roundtrip() {
         let e = RpcMessage::set_extranonce("deadbeef", 4);
         let parsed = RpcMessage::parse(e.to_line().trim()).unwrap();
-        assert!(parsed.is_method("mining.set_extranonce"));
+        assert_eq!(parsed.method.as_deref(), Some("mining.set_extranonce"));
     }
 }

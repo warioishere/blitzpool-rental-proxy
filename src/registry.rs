@@ -60,10 +60,6 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    pub async fn list(&self) -> Vec<String> {
-        self.inner.lock().await.keys().cloned().collect()
-    }
-
     /// Aggregated status of a rig: sums hashrate/work across its sessions, with
     /// routing/order taken from a rented session if any (the rig is "rented"
     /// when any session is). `None` if the rig has no connected sessions.
