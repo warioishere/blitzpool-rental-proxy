@@ -693,9 +693,9 @@ impl Sv2Session {
 
         let up_cid = wire::read_channel_id(&mut frame);
 
-        // Diagnostic: trace job/prev-hash flow (with job_id = bytes 4..8) so we
-        // can see whether extended jobs + their SetNewPrevHash reach the miner
-        // with matching ids and channel mapping.
+        // Trace job/prev-hash flow (job_id = bytes 4..8) at debug level: lets us
+        // confirm extended jobs + their SetNewPrevHash reach the miner with
+        // matching ids + channel mapping (incl. the group_channel_id remap).
         if matches!(
             mt,
             mining::MESSAGE_TYPE_NEW_MINING_JOB
@@ -710,7 +710,7 @@ impl Sv2Session {
                     0
                 }
             };
-            info!(
+            debug!(
                 worker = %i.label,
                 mt,
                 up_cid,
@@ -725,7 +725,7 @@ impl Sv2Session {
             if let Some(target) = parse_set_target(&mut frame) {
                 let diff = difficulty_from_target(&target);
                 let mapped = i.up_to_down.get(&up_cid).copied();
-                info!(
+                debug!(
                     worker = %i.label,
                     up_cid,
                     down_cid = ?mapped,
