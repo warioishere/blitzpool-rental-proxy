@@ -24,8 +24,14 @@ use crate::store::SellerStore;
 /// Shared, protocol-independent state handed to every connection handler.
 #[derive(Clone)]
 pub struct ProxyContext {
-    /// Process-wide fallback pool used when a seller has no per-worker default.
-    pub default_target: UpstreamTarget,
+    /// Optional SV1 handshake-bootstrap pool. The proxy is **register-only**:
+    /// only workers with a registered rig (or an active rental) are served;
+    /// unregistered miners are rejected. SV2 needs nothing here (it learns the
+    /// worker from `OpenMiningChannel` before connecting upstream). SV1 must
+    /// answer `mining.subscribe` (extranonce) *before* the worker is known at
+    /// `mining.authorize`, so it needs a bootstrap pool to source that
+    /// extranonce; `None` ⇒ SV1 is unavailable, SV2 still works.
+    pub default_target: Option<UpstreamTarget>,
     /// Live sessions, keyed by worker name (for the control API + rentals).
     pub registry: Arc<Registry>,
     /// Per-worker default pools configured by sellers.

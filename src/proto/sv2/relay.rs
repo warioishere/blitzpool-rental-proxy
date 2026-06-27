@@ -733,24 +733,34 @@ pub async fn handle_seller_miner_sv2(
         bail!("expected SetupConnection from miner");
     }
 
-    // 2. Connect the default upstream + SetupConnection; mirror its flags back.
-    let default_target = ctx.default_target.clone();
-    let (mut up_read, mut up_write, up_flags) = connect_setup(&default_target).await?;
-
-    // 3. Tell the miner setup succeeded.
+    // 2. Acknowledge setup (flags=0, permissive). Register-only: no upstream is
+    //    contacted yet — it is resolved from the worker in the OpenMiningChannel
+    //    below, so SV2 needs no bootstrap/fallback pool at all.
     let (to_miner, to_miner_rx) = mpsc::unbounded_channel::<EitherFrame>();
     let miner_writer = spawn_writer(down_write, to_miner_rx);
     to_miner
-        .send(setup_success(up_flags))
+        .send(setup_success(0))
         .map_err(|_| anyhow!("miner writer gone"))?;
 
-    // 4. Miner OpenMiningChannel → capture spec + worker.
+    // 3. Miner OpenMiningChannel → capture spec + worker.
     let mut open_frame = read_one(&mut down_read).await?;
     let MinerOpen { spec, worker } =
         parse_miner_open(&mut open_frame).ok_or_else(|| anyhow!("expected OpenMiningChannel"))?;
 
-    // 5. Open the same channel type on the upstream (rewriting the account).
-    let info = open_on(&mut up_read, &mut up_write, &spec, &default_target.user).await?;
+    // 4. Register-only: the worker MUST have a registered rig (its idle pool).
+    //    No rig → reject and close. An active rental switches onto the buyer
+    //    after the channel is open (step 8).
+    let idle_target = match ctx.sellers.default_pool(&worker).await {
+        Some(t) => t,
+        None => {
+            warn!(%peer, %worker, "rejected unregistered worker (register-only)");
+            bail!("unregistered worker {worker} — register the rig first");
+        }
+    };
+
+    // 5. Connect upstream = the rig's idle pool + open the same channel type.
+    let (mut up_read, mut up_write, _up_flags) = connect_setup(&idle_target).await?;
+    let info = open_on(&mut up_read, &mut up_write, &spec, &idle_target.user).await?;
     // Stable, proxy-assigned downstream channel id for the first channel.
     let down_channel_id = 1u32;
 
@@ -765,7 +775,7 @@ pub async fn handle_seller_miner_sv2(
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
                 generation: 0,
-                target: default_target.clone(),
+                target: idle_target.clone(),
                 to_up,
                 reader: tokio::spawn(async {}), // placeholder, replaced below
                 writer: up_writer,
@@ -781,7 +791,7 @@ pub async fn handle_seller_miner_sv2(
             pending: std::collections::HashMap::new(),
             next_down_cid: 2,
             routing: Routing::Idle,
-            default_target: default_target.clone(),
+            default_target: idle_target.clone(),
             hashrate: HashrateWindow::new(Duration::from_secs(600)),
             delivered_work: 0.0,
             accepted_shares: 0,
@@ -806,20 +816,14 @@ pub async fn handle_seller_miner_sv2(
     ctx.registry
         .insert(worker.clone(), AnySession::Sv2(session.clone()))
         .await;
-    info!(%peer, %worker, upstream = %default_target.url, "sv2 relay established (idle)");
+    info!(%peer, %worker, upstream = %idle_target.url, "sv2 relay established (idle)");
 
-    // 8. Resume an active rental, else apply the seller's configured default.
+    // 8. We already opened on the rig's idle pool; if a rental is active, switch
+    //    the session onto the buyer's target now.
     if let Some(order) = ctx.orders.active_for_worker(&worker, crate::orders::now_ms()).await {
         match session.switch_to(order.id.clone(), order.target.clone()).await {
             Ok(()) => info!(%worker, order = %order.id, "resumed active rental"),
             Err(e) => warn!(%worker, error = %e, "resume rental failed"),
-        }
-    } else if let Some(def) = ctx.sellers.default_pool(&worker).await {
-        if session.default_target().await != def {
-            match session.set_default(def.clone()).await {
-                Ok(()) => info!(%worker, upstream = %def.url, "applied seller default pool"),
-                Err(e) => warn!(%worker, error = %e, "apply seller default failed"),
-            }
         }
     }
 
@@ -949,6 +953,21 @@ mod tests {
             password: String::new(),
             authority_pubkey: None,
         }
+    }
+
+    /// Register a worker's rig (its idle pool) so the register-only relay serves
+    /// it — every test miner authorizes as `bc1qSELLER.rig1`.
+    async fn register_rig(sellers: &crate::store::SellerStore, worker: &str, idle: UpstreamTarget) {
+        sellers
+            .set(
+                worker.to_string(),
+                crate::store::Rig {
+                    default_pool: idle,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
     }
 
     /// A channel target (little-endian) of 2^224 ⇒ difficulty ≈ 1, so accepted
@@ -1188,11 +1207,12 @@ mod tests {
         let registry = crate::registry::Registry::new();
         let pool = crate::db::test_pool().await;
         let ctx = ProxyContext {
-            default_target: ext_target(&a_addr.to_string(), "acctA"),
+            default_target: None,
             registry: registry.clone(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -1257,11 +1277,12 @@ mod tests {
         let registry = crate::registry::Registry::new();
         let pool = crate::db::test_pool().await;
         let ctx = ProxyContext {
-            default_target: ext_target(&a_addr.to_string(), "acctA"),
+            default_target: None,
             registry: registry.clone(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -1324,11 +1345,12 @@ mod tests {
         let registry = crate::registry::Registry::new();
         let pool = crate::db::test_pool().await;
         let ctx = ProxyContext {
-            default_target: ext_target(&addr.to_string(), "acct"),
+            default_target: None,
             registry: registry.clone(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&addr.to_string(), "acct")).await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -1417,11 +1439,12 @@ mod tests {
         let registry = crate::registry::Registry::new();
         let pool = crate::db::test_pool().await;
         let ctx = ProxyContext {
-            default_target: ext_target(&a_addr.to_string(), "acctA"),
+            default_target: None,
             registry: registry.clone(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -1470,11 +1493,12 @@ mod tests {
         let pool = crate::db::test_pool().await;
         let orders = crate::orders::OrderStore::new(pool.clone());
         let ctx = ProxyContext {
-            default_target: ext_target(&a_addr.to_string(), "acctA"),
+            default_target: None,
             registry: registry.clone(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: orders.clone(),
         };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -1569,5 +1593,35 @@ mod tests {
             connect_setup(&target).await.is_err(),
             "wrong authority key must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn unregistered_worker_is_rejected() {
+        // Register-only: a worker with no rig is refused at channel-open, before
+        // any upstream is contacted (no mock pool needed).
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let pool = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(pool.clone()),
+            orders: crate::orders::OrderStore::new(pool.clone()),
+        };
+        // No rig registered for the worker.
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        assert!(
+            miner.open("bc1qUNREGISTERED", 1).await.is_err(),
+            "unregistered worker open must fail (connection closed)"
+        );
+        assert!(registry.get("bc1qUNREGISTERED").await.is_none());
     }
 }

@@ -431,6 +431,16 @@ pub async fn handle_seller_miner(
         sellers,
         orders,
     } = ctx;
+    // SV1 must answer mining.subscribe (extranonce) before the worker is known
+    // at mining.authorize, so it needs a bootstrap pool to source that
+    // extranonce. Register-only: unregistered workers are rejected at authorize
+    // (below); the bootstrap never serves them.
+    let Some(default_target) = default_target else {
+        anyhow::bail!(
+            "SV1 needs a handshake bootstrap pool (RENTAL_PROXY_POOL_URL); \
+             register-only SV1 is unavailable without one — use SV2"
+        );
+    };
     let _ = miner.set_nodelay(true);
     let (miner_r, miner_w) = miner.into_split();
 
@@ -551,16 +561,31 @@ pub async fn handle_seller_miner(
                     } else {
                         None
                     };
-                    session.on_miner_msg(msg, &registry).await;
-                    // On authorize: resume an active rental if one exists,
-                    // else apply this seller's configured default pool.
+                    // On authorize: register-only. Resume an active rental, else
+                    // apply the seller's configured default pool. A worker with
+                    // neither is unregistered → reject and close.
                     if let Some(w) = auth_worker {
-                        if let Some(o) = orders.active_for_worker(&w, crate::orders::now_ms()).await {
+                        let order = orders.active_for_worker(&w, crate::orders::now_ms()).await;
+                        let rig = sellers.default_pool(&w).await;
+                        if order.is_none() && rig.is_none() {
+                            let reply = RpcMessage {
+                                id: msg.id.clone(),
+                                method: None,
+                                params: None,
+                                result: Some(json!(false)),
+                                error: Some(json!([24, "unregistered worker — register the rig first", Value::Null])),
+                            };
+                            let _ = to_miner.send(reply.to_line());
+                            warn!(worker = %w, "rejected unregistered worker (register-only)");
+                            break;
+                        }
+                        session.on_miner_msg(msg, &registry).await;
+                        if let Some(o) = order {
                             match session.switch_to(o.id.clone(), o.target.clone()).await {
                                 Ok(()) => info!(worker = %w, order = %o.id, upstream = %o.target.url, "resumed active rental"),
                                 Err(e) => warn!(worker = %w, error = %e, "resume rental failed"),
                             }
-                        } else if let Some(def) = sellers.default_pool(&w).await {
+                        } else if let Some(def) = rig {
                             if session.default_target().await != def {
                                 match session.set_default(def.clone()).await {
                                     Ok(()) => info!(worker = %w, upstream = %def.url, "applied seller default pool"),
@@ -568,6 +593,8 @@ pub async fn handle_seller_miner(
                                 }
                             }
                         }
+                    } else {
+                        session.on_miner_msg(msg, &registry).await;
                     }
                 }
             }

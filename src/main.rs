@@ -40,13 +40,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::from_env();
     info!(listen = %cfg.listen, "stratum-rental-proxy starting");
 
-    // M1: one default upstream for everyone (per-seller config = M3,
-    // rentals = M2). Without it there's nothing to relay to.
-    let upstream = cfg.default_upstream.clone().context(
-        "set RENTAL_PROXY_POOL_URL (+ _USER/_PASS) — milestone 1 relays every \
-         miner to this default upstream",
-    )?;
-    info!(upstream = %upstream.url, "default upstream");
+    // Register-only: only workers with a registered rig (or an active rental)
+    // are served. The optional default upstream is purely an SV1 handshake
+    // bootstrap (SV2 needs none). Unset ⇒ SV1 unavailable, SV2 register-only.
+    match &cfg.default_upstream {
+        Some(u) => info!(bootstrap = %u.url, "SV1 handshake bootstrap configured (register-only routing)"),
+        None => info!("no SV1 bootstrap (RENTAL_PROXY_POOL_URL unset) — SV2 register-only; SV1 miners rejected"),
+    }
 
     let registry = registry::Registry::new();
 
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {}", cfg.listen))?;
 
     let ctx = ProxyContext {
-        default_target: upstream,
+        default_target: cfg.default_upstream.clone(),
         registry,
         sellers,
         orders,
@@ -161,7 +161,9 @@ async fn accept_loop_auto(listener: TcpListener, ctx: ProxyContext) -> anyhow::R
                 continue;
             }
         };
-        let sv1 = sv1.clone();
+        // The real (`--features sv2`) adapter holds Noise keys and needs a clone
+        // per task; the no-feature stub is a Copy unit (clone_on_copy is inert).
+        #[allow(clippy::clone_on_copy)]
         let sv2 = sv2.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
