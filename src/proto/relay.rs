@@ -435,7 +435,11 @@ async fn read_response(
             if msg.method.is_none() {
                 return Ok(msg);
             }
-            prelude.push(trimmed.to_string());
+            // Keep the newline — the writer sends lines verbatim, and stratum is
+            // newline-delimited. Without it this notification glues onto the next
+            // message (e.g. set_difficulty + authorize result run together) and
+            // the miner only parses the first, missing the authorize result.
+            prelude.push(format!("{trimmed}\n"));
         }
     }
 }
@@ -877,6 +881,10 @@ mod tests {
         assert_eq!(prelude.len(), 2, "both handshake notifications kept");
         assert!(prelude[0].contains("set_difficulty"));
         assert!(prelude[1].contains("notify"));
+        // Each kept line must end with a newline so it isn't glued to the next
+        // message when forwarded to the miner.
+        assert!(prelude[0].ends_with('\n'));
+        assert!(prelude[1].ends_with('\n'));
         server.await.unwrap();
     }
 }
