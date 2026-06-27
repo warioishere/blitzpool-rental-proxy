@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "worker",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_url",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_user",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_password",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_authority",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_ms",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "until_ms",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "status",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "delivered_work",
+        "ordinal": 9,
+        "type_info": "Float"
+      },
+      {
+        "name": "accepted_shares",
+        "ordinal": 10,
+        "type_info": "Integer"
+      },
+      {
+        "name": "submitted_shares",
+        "ordinal": 11,
+        "type_info": "Integer"
+      },
+      {
+        "name": "price_per_th_day",
+        "ordinal": 12,
+        "type_info": "Float"
+      },
+      {
+        "name": "budget",
+        "ordinal": 13,
+        "type_info": "Float"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3b361e77e85bc79a73de5adf27d1a016386d5c6f9a2fc545e2652704c4930c26"
+}

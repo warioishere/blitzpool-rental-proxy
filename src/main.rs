@@ -12,6 +12,7 @@
 mod api;
 mod config;
 mod control;
+mod db;
 mod orders;
 mod proto;
 mod registry;
@@ -49,15 +50,16 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = registry::Registry::new();
 
-    let sellers_path = std::env::var("RENTAL_PROXY_SELLERS")
-        .unwrap_or_else(|_| "sellers.json".into())
-        .into();
-    let sellers = store::SellerStore::load(sellers_path).await;
+    // Persistent state (rigs + orders) in one embedded SQLite file.
+    let db_url = std::env::var("RENTAL_PROXY_DB")
+        .unwrap_or_else(|_| "sqlite://rental-proxy.db".into());
+    let pool = db::connect(&db_url)
+        .await
+        .with_context(|| format!("open state DB {db_url}"))?;
+    info!(db = %db_url, "state database ready");
 
-    let orders_path = std::env::var("RENTAL_PROXY_ORDERS")
-        .unwrap_or_else(|_| "orders.json".into())
-        .into();
-    let orders = orders::OrderStore::load(orders_path).await;
+    let sellers = store::SellerStore::new(pool.clone());
+    let orders = orders::OrderStore::new(pool.clone());
 
     // Auto-revert expired rentals.
     orders::spawn_expiry(orders.clone(), registry.clone());

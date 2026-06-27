@@ -1,19 +1,19 @@
-//! Rental orders: a buyer rents a worker's hashrate until a deadline.
+//! Rental orders (SQLite, `orders` table): a buyer rents a worker's hashrate
+//! until a deadline and/or a prepaid budget.
 //!
 //! Creating an order switches the session to the buyer's target; a background
-//! expiry task reverts the session to its default when the deadline passes.
-//! Orders are persisted, so a rental is resumed when the miner reconnects
-//! (the relay checks for an active order on authorize) and expired orders are
-//! cleaned up after a restart.
+//! expiry task reverts the session to its default when the deadline passes or
+//! the prepaid budget is consumed. Orders are persisted, so a rental is resumed
+//! when the miner reconnects (the relay checks for an active order on authorize)
+//! and finished orders are cleaned up after a restart. Measured delivered work
+//! (the billing basis) is accumulated durably here.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -41,6 +41,23 @@ pub enum OrderStatus {
     Active,
     Ended,
     Cancelled,
+}
+
+impl OrderStatus {
+    fn as_db(&self) -> &'static str {
+        match self {
+            OrderStatus::Active => "active",
+            OrderStatus::Ended => "ended",
+            OrderStatus::Cancelled => "cancelled",
+        }
+    }
+    fn from_db(s: &str) -> OrderStatus {
+        match s {
+            "ended" => OrderStatus::Ended,
+            "cancelled" => OrderStatus::Cancelled,
+            _ => OrderStatus::Active,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +94,9 @@ pub struct Order {
 
 impl Order {
     fn is_live(&self, now: i64) -> bool {
-        self.status == OrderStatus::Active && (self.until_ms == 0 || self.until_ms > now)
+        self.status == OrderStatus::Active
+            && (self.until_ms == 0 || self.until_ms > now)
+            && !self.funding_exhausted()
     }
 
     /// Billable cost so far = delivered TH·days × price.
@@ -101,21 +120,54 @@ impl Order {
     }
 }
 
+/// Flat DB row → [`Order`].
+struct OrderRow {
+    id: String,
+    worker: String,
+    target_url: String,
+    target_user: String,
+    target_password: String,
+    target_authority: Option<String>,
+    created_ms: i64,
+    until_ms: i64,
+    status: String,
+    delivered_work: f64,
+    accepted_shares: i64,
+    submitted_shares: i64,
+    price_per_th_day: f64,
+    budget: f64,
+}
+
+impl OrderRow {
+    fn into_order(self) -> Order {
+        Order {
+            id: self.id,
+            worker: self.worker,
+            target: UpstreamTarget {
+                url: self.target_url,
+                user: self.target_user,
+                password: self.target_password,
+                authority_pubkey: self.target_authority,
+            },
+            created_ms: self.created_ms,
+            until_ms: self.until_ms,
+            status: OrderStatus::from_db(&self.status),
+            delivered_work: self.delivered_work,
+            accepted_shares: self.accepted_shares as u64,
+            submitted_shares: self.submitted_shares as u64,
+            price_per_th_day: self.price_per_th_day,
+            budget: self.budget,
+        }
+    }
+}
+
 pub struct OrderStore {
-    path: PathBuf,
-    inner: Mutex<HashMap<String, Order>>,
+    pool: SqlitePool,
 }
 
 impl OrderStore {
-    pub async fn load(path: PathBuf) -> Arc<Self> {
-        let map = match tokio::fs::read(&path).await {
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        };
-        Arc::new(Self {
-            path,
-            inner: Mutex::new(map),
-        })
+    pub fn new(pool: SqlitePool) -> Arc<Self> {
+        Arc::new(Self { pool })
     }
 
     pub async fn create(
@@ -128,113 +180,162 @@ impl OrderStore {
     ) -> Order {
         let now = now_ms();
         let id = format!("o{}-{}", now, SEQ.fetch_add(1, Ordering::Relaxed));
-        let order = Order {
-            id: id.clone(),
+        let status = OrderStatus::Active;
+        let _ = sqlx::query!(
+            "INSERT INTO orders (id, worker, target_url, target_user, target_password, \
+             target_authority, created_ms, until_ms, status, delivered_work, accepted_shares, \
+             submitted_shares, price_per_th_day, budget) \
+             VALUES (?,?,?,?,?,?,?,?,?,0,0,0,?,?)",
+            id,
+            worker,
+            target.url,
+            target.user,
+            target.password,
+            target.authority_pubkey,
+            now,
+            until_ms,
+            "active",
+            price_per_th_day,
+            budget,
+        )
+        .execute(&self.pool)
+        .await;
+
+        Order {
+            id,
             worker,
             target,
             created_ms: now,
             until_ms,
-            status: OrderStatus::Active,
+            status,
             delivered_work: 0.0,
             accepted_shares: 0,
             submitted_shares: 0,
             price_per_th_day,
             budget,
-        };
-        self.inner.lock().await.insert(id, order.clone());
-        let _ = self.save().await;
-        order
+        }
     }
 
     pub async fn get(&self, id: &str) -> Option<Order> {
-        self.inner.lock().await.get(id).cloned()
+        sqlx::query_as!(
+            OrderRow,
+            "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
+             price_per_th_day, budget FROM orders WHERE id = ?",
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .map(OrderRow::into_order)
     }
 
     pub async fn list(&self) -> Vec<Order> {
-        self.inner.lock().await.values().cloned().collect()
+        sqlx::query_as!(
+            OrderRow,
+            "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
+             price_per_th_day, budget FROM orders"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(OrderRow::into_order)
+        .collect()
     }
 
     /// The live order for a worker (used to resume a rental on reconnect).
     pub async fn active_for_worker(&self, worker: &str, now: i64) -> Option<Order> {
-        self.inner
-            .lock()
-            .await
-            .values()
-            .find(|o| o.worker == worker && o.is_live(now))
-            .cloned()
+        let rows = sqlx::query_as!(
+            OrderRow,
+            "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
+             price_per_th_day, budget FROM orders \
+             WHERE worker = ? AND status = 'active' AND (until_ms = 0 OR until_ms > ?)",
+            worker,
+            now
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(OrderRow::into_order)
+            .find(|o| !o.funding_exhausted())
     }
 
-    /// Credit measured delivered work to an order (in-memory; persisted by the
-    /// periodic [`flush`](Self::flush)). No-op if the order is unknown.
+    /// Credit measured delivered work to an order. No-op if the order is unknown.
     pub async fn add_work(&self, id: &str, work: f64, accepted_shares: u64) {
-        let mut map = self.inner.lock().await;
-        if let Some(o) = map.get_mut(id) {
-            o.delivered_work += work;
-            o.accepted_shares += accepted_shares;
-        }
+        let shares = accepted_shares as i64;
+        let _ = sqlx::query!(
+            "UPDATE orders SET delivered_work = delivered_work + ?, \
+             accepted_shares = accepted_shares + ? WHERE id = ?",
+            work,
+            shares,
+            id
+        )
+        .execute(&self.pool)
+        .await;
     }
 
     /// Count submitted shares against an order (for the accept-ratio).
     pub async fn add_submitted(&self, id: &str, submitted: u64) {
-        let mut map = self.inner.lock().await;
-        if let Some(o) = map.get_mut(id) {
-            o.submitted_shares += submitted;
-        }
+        let n = submitted as i64;
+        let _ = sqlx::query!(
+            "UPDATE orders SET submitted_shares = submitted_shares + ? WHERE id = ?",
+            n,
+            id
+        )
+        .execute(&self.pool)
+        .await;
     }
 
-    /// Persist the store (called periodically so accumulated work survives a
-    /// restart; at most one tick's worth of work is lost on a crash).
-    pub async fn flush(&self) -> std::io::Result<()> {
-        self.save().await
-    }
-
-    /// Cancel an order; returns it so the caller can revert the session.
+    /// Cancel an order; returns it (status updated) so the caller can revert.
     pub async fn cancel(&self, id: &str) -> Option<Order> {
-        let order = {
-            let mut map = self.inner.lock().await;
-            let o = map.get_mut(id)?;
-            o.status = OrderStatus::Cancelled;
-            o.clone()
-        };
-        let _ = self.save().await;
-        Some(order)
+        let existing = self.get(id).await?;
+        let _ = sqlx::query!("UPDATE orders SET status = 'cancelled' WHERE id = ?", id)
+            .execute(&self.pool)
+            .await;
+        Some(Order {
+            status: OrderStatus::Cancelled,
+            ..existing
+        })
     }
 
     /// Mark every finished active order as ended (past its deadline OR with its
     /// prepaid budget consumed) and return them so the caller can revert the
     /// corresponding sessions.
     pub async fn take_expired(&self, now: i64) -> Vec<Order> {
-        let expired: Vec<Order> = {
-            let mut map = self.inner.lock().await;
-            let mut out = Vec::new();
-            for o in map.values_mut() {
-                let deadline_passed = o.until_ms > 0 && o.until_ms <= now;
-                if o.status == OrderStatus::Active && (deadline_passed || o.funding_exhausted()) {
-                    o.status = OrderStatus::Ended;
-                    out.push(o.clone());
-                }
-            }
-            out
-        };
-        if !expired.is_empty() {
-            let _ = self.save().await;
-        }
-        expired
-    }
+        let active = sqlx::query_as!(
+            OrderRow,
+            "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
+             price_per_th_day, budget FROM orders WHERE status = 'active'"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
 
-    async fn save(&self) -> std::io::Result<()> {
-        let data = {
-            let map = self.inner.lock().await;
-            serde_json::to_vec_pretty(&*map).unwrap_or_else(|_| b"{}".to_vec())
-        };
-        let tmp = self.path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, &data).await?;
-        tokio::fs::rename(&tmp, &self.path).await
+        let mut finished = Vec::new();
+        for o in active.into_iter().map(OrderRow::into_order) {
+            let deadline_passed = o.until_ms > 0 && o.until_ms <= now;
+            if deadline_passed || o.funding_exhausted() {
+                let _ = sqlx::query!("UPDATE orders SET status = 'ended' WHERE id = ?", o.id)
+                    .execute(&self.pool)
+                    .await;
+                finished.push(Order {
+                    status: OrderStatus::Ended,
+                    ..o
+                });
+            }
+        }
+        finished
     }
 }
 
-/// Background task: every 5s, revert expired rentals and persist accumulated
-/// delivered work (so billing survives a restart).
+/// Background task: every 5s, revert sessions whose rental has finished
+/// (deadline reached or prepaid budget consumed).
 pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -243,10 +344,9 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
             for o in orders.take_expired(now_ms()).await {
                 if let Some(session) = registry.get(&o.worker).await {
                     let _ = session.revert().await;
-                    info!(order = %o.id, worker = %o.worker, "rental expired → reverted to default");
+                    info!(order = %o.id, worker = %o.worker, "rental finished → reverted to default");
                 }
             }
-            let _ = orders.flush().await;
         }
     })
 }
@@ -255,9 +355,6 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
 mod tests {
     use super::*;
 
-    fn tmp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("srp_orders_{}_{}.json", std::process::id(), tag))
-    }
     fn target() -> UpstreamTarget {
         UpstreamTarget {
             url: "buyer:3333".into(),
@@ -269,45 +366,33 @@ mod tests {
 
     #[tokio::test]
     async fn create_active_for_worker_and_cancel() {
-        let p = tmp_path("crud");
-        let _ = std::fs::remove_file(&p);
-        let store = OrderStore::load(p.clone()).await;
+        let store = OrderStore::new(crate::db::test_pool().await);
         let o = store.create("w1".into(), target(), 0, 0.0, 0.0).await; // open-ended
         assert!(store.active_for_worker("w1", now_ms()).await.is_some());
         let cancelled = store.cancel(&o.id).await.unwrap();
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
         assert!(store.active_for_worker("w1", now_ms()).await.is_none());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[tokio::test]
     async fn expiry_marks_ended_and_is_returned() {
-        let p = tmp_path("expire");
-        let _ = std::fs::remove_file(&p);
-        let store = OrderStore::load(p.clone()).await;
-        // already past deadline
-        let _o = store.create("w2".into(), target(), now_ms() - 1000, 0.0, 0.0).await;
-        let live_now = store.create("w3".into(), target(), now_ms() + 60_000, 0.0, 0.0).await;
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let _past = store.create("w2".into(), target(), now_ms() - 1000, 0.0, 0.0).await;
+        let _live = store.create("w3".into(), target(), now_ms() + 60_000, 0.0, 0.0).await;
         let expired = store.take_expired(now_ms()).await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].worker, "w2");
-        // not-yet-due order stays active + nothing returned a second time
         assert!(store.active_for_worker("w3", now_ms()).await.is_some());
         assert!(store.take_expired(now_ms()).await.is_empty());
-        let _ = live_now;
-        let _ = std::fs::remove_file(&p);
     }
 
     #[tokio::test]
     async fn funding_exhausted_ends_the_order() {
-        let p = tmp_path("budget");
-        let _ = std::fs::remove_file(&p);
-        let store = OrderStore::load(p.clone()).await;
+        let store = OrderStore::new(crate::db::test_pool().await);
         // price 1.0 per TH·day, prepaid budget 100, open-ended deadline.
         let o = store.create("w5".into(), target(), 0, 1.0, 100.0).await;
         assert!(store.take_expired(now_ms()).await.is_empty(), "fresh order is live");
 
-        // Credit work worth 100 TH·days ⇒ cost reaches the budget.
         let work_for_100_th_days = 100.0 * HASHES_PER_TH_DAY / DIFF1_HASHES;
         store.add_work(&o.id, work_for_100_th_days, 1).await;
 
@@ -318,19 +403,29 @@ mod tests {
         let ended = store.take_expired(now_ms()).await;
         assert_eq!(ended.len(), 1, "exhausted budget ends the rental");
         assert_eq!(ended[0].id, o.id);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[tokio::test]
-    async fn persists_across_reload() {
-        let p = tmp_path("persist");
-        let _ = std::fs::remove_file(&p);
+    async fn work_and_submitted_accumulate() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let o = store.create("w6".into(), target(), 0, 0.0, 0.0).await;
+        store.add_work(&o.id, 2.5, 2).await;
+        store.add_work(&o.id, 1.5, 1).await;
+        store.add_submitted(&o.id, 4).await;
+        let got = store.get(&o.id).await.unwrap();
+        assert!((got.delivered_work - 4.0).abs() < 1e-9);
+        assert_eq!(got.accepted_shares, 3);
+        assert_eq!(got.submitted_shares, 4);
+    }
+
+    #[tokio::test]
+    async fn persists_across_reconnect() {
+        let pool = crate::db::test_pool().await;
         let id = {
-            let store = OrderStore::load(p.clone()).await;
+            let store = OrderStore::new(pool.clone());
             store.create("w4".into(), target(), 0, 0.0, 0.0).await.id
         };
-        let reloaded = OrderStore::load(p.clone()).await;
+        let reloaded = OrderStore::new(pool);
         assert!(reloaded.get(&id).await.is_some());
-        let _ = std::fs::remove_file(&p);
     }
 }

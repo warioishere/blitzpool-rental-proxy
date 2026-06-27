@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO orders (id, worker, target_url, target_user, target_password, target_authority, created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget) VALUES (?,?,?,?,?,?,?,?,?,0,0,0,?,?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "3c6caabd876a5c1e9e3dab4de2c114c273533cb6b1f75691f696f7c73863bfd6"
+}

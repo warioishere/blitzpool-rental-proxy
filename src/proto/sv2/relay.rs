@@ -951,10 +951,6 @@ mod tests {
         }
     }
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("srp_sv2_{}_{}.json", std::process::id(), tag))
-    }
-
     /// A channel target (little-endian) of 2^224 ⇒ difficulty ≈ 1, so accepted
     /// shares carry real (non-zero) work. (`[0xff; 32]` is the max target =
     /// difficulty 0, which the accounting correctly ignores.)
@@ -1190,11 +1186,12 @@ mod tests {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let registry = crate::registry::Registry::new();
+        let pool = crate::db::test_pool().await;
         let ctx = ProxyContext {
             default_target: ext_target(&a_addr.to_string(), "acctA"),
             registry: registry.clone(),
-            sellers: crate::store::SellerStore::load(tmp("sellers")).await,
-            orders: crate::orders::OrderStore::load(tmp("orders")).await,
+            sellers: crate::store::SellerStore::new(pool.clone()),
+            orders: crate::orders::OrderStore::new(pool.clone()),
         };
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
@@ -1258,11 +1255,12 @@ mod tests {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let registry = crate::registry::Registry::new();
+        let pool = crate::db::test_pool().await;
         let ctx = ProxyContext {
             default_target: ext_target(&a_addr.to_string(), "acctA"),
             registry: registry.clone(),
-            sellers: crate::store::SellerStore::load(tmp("m_sellers")).await,
-            orders: crate::orders::OrderStore::load(tmp("m_orders")).await,
+            sellers: crate::store::SellerStore::new(pool.clone()),
+            orders: crate::orders::OrderStore::new(pool.clone()),
         };
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
@@ -1324,11 +1322,12 @@ mod tests {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let registry = crate::registry::Registry::new();
+        let pool = crate::db::test_pool().await;
         let ctx = ProxyContext {
             default_target: ext_target(&addr.to_string(), "acct"),
             registry: registry.clone(),
-            sellers: crate::store::SellerStore::load(tmp("vd_s")).await,
-            orders: crate::orders::OrderStore::load(tmp("vd_o")).await,
+            sellers: crate::store::SellerStore::new(pool.clone()),
+            orders: crate::orders::OrderStore::new(pool.clone()),
         };
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
@@ -1416,11 +1415,12 @@ mod tests {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let registry = crate::registry::Registry::new();
+        let pool = crate::db::test_pool().await;
         let ctx = ProxyContext {
             default_target: ext_target(&a_addr.to_string(), "acctA"),
             registry: registry.clone(),
-            sellers: crate::store::SellerStore::load(tmp("ab_s")).await,
-            orders: crate::orders::OrderStore::load(tmp("ab_o")).await,
+            sellers: crate::store::SellerStore::new(pool.clone()),
+            orders: crate::orders::OrderStore::new(pool.clone()),
         };
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
@@ -1467,11 +1467,12 @@ mod tests {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let registry = crate::registry::Registry::new();
-        let orders = crate::orders::OrderStore::load(tmp("acct_o")).await;
+        let pool = crate::db::test_pool().await;
+        let orders = crate::orders::OrderStore::new(pool.clone());
         let ctx = ProxyContext {
             default_target: ext_target(&a_addr.to_string(), "acctA"),
             registry: registry.clone(),
-            sellers: crate::store::SellerStore::load(tmp("acct_s")).await,
+            sellers: crate::store::SellerStore::new(pool.clone()),
             orders: orders.clone(),
         };
         let keys = NoiseKeys::generate();

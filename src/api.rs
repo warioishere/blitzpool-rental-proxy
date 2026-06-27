@@ -303,15 +303,11 @@ mod tests {
     use tower::ServiceExt;
 
     async fn app() -> Router {
-        let pid = std::process::id();
-        let sp = std::env::temp_dir().join(format!("srp_api_sellers_{pid}.json"));
-        let op = std::env::temp_dir().join(format!("srp_api_orders_{pid}.json"));
-        let _ = std::fs::remove_file(&sp);
-        let _ = std::fs::remove_file(&op);
+        let pool = crate::db::test_pool().await;
         router(AppState {
             registry: Registry::new(),
-            sellers: SellerStore::load(sp).await,
-            orders: crate::orders::OrderStore::load(op).await,
+            sellers: SellerStore::new(pool.clone()),
+            orders: crate::orders::OrderStore::new(pool),
         })
     }
 

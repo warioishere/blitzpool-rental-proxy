@@ -14,6 +14,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 axum = "0.8"
+# Persistent state (rigs + orders) in embedded SQLite — ACID, WAL, one file.
+# Typed compile-time-checked queries; the `.sqlx/` offline cache (committed)
+# lets the build run without a live DB (SQLX_OFFLINE).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 
 # Stratum V2 protocol + Noise transport, optional (only with `--features sv2`)
 # so the default SV1 build stays lean. Pulled from the upstream stratum-mining

@@ -1,3 +1,11 @@
 /target
-/sellers.json
-*.json.tmp
+
+# SQLite state DB (created at runtime) + WAL/shared-memory sidecars.
+# The `.sqlx/` offline cache IS committed so the build works without a live DB.
+*.db
+*.db-wal
+*.db-shm
+dev.db
+
+# Local env (DATABASE_URL etc.)
+.env

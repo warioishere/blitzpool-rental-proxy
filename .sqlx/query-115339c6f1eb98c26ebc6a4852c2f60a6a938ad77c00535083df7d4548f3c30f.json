@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM rigs WHERE worker = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "115339c6f1eb98c26ebc6a4852c2f60a6a938ad77c00535083df7d4548f3c30f"
+}

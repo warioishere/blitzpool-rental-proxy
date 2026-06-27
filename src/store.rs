@@ -1,5 +1,5 @@
-//! Persistent rig/seller store: each seller miner's worker name → its [`Rig`]
-//! (default pool + marketplace listing). JSON-file backed, atomic save.
+//! Persistent rig/seller store (SQLite, `rigs` table): each seller miner's
+//! worker name → its [`Rig`] (default pool + marketplace listing).
 //!
 //! Set via the API; the relay consults the default pool when a miner
 //! authorizes. A worker with no entry falls back to the process-wide default
@@ -7,11 +7,11 @@
 //! buyer sees and what billing uses together with measured delivered work.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use sqlx::SqlitePool;
+use tracing::warn;
 
 use crate::session::UpstreamTarget;
 
@@ -33,64 +33,118 @@ pub struct Rig {
     pub price_min_per_th_day: f64,
     #[serde(default)]
     pub price_max_per_th_day: f64,
-    /// Seller's payout address (e.g. BTC) for rental earnings.
+    /// Seller's payout address (e.g. BTC/LN) for rental earnings.
     #[serde(default)]
     pub payout_address: Option<String>,
 }
 
 pub struct SellerStore {
-    path: PathBuf,
-    inner: Mutex<HashMap<String, Rig>>,
+    pool: SqlitePool,
 }
 
 impl SellerStore {
-    /// Load from `path` (missing/corrupt file ⇒ empty store).
-    pub async fn load(path: PathBuf) -> Arc<Self> {
-        let map = match tokio::fs::read(&path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        };
-        Arc::new(Self {
-            path,
-            inner: Mutex::new(map),
-        })
+    pub fn new(pool: SqlitePool) -> Arc<Self> {
+        Arc::new(Self { pool })
     }
 
     pub async fn get(&self, worker: &str) -> Option<Rig> {
-        self.inner.lock().await.get(worker).cloned()
+        let row = sqlx::query!(
+            "SELECT pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
+             price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address \
+             FROM rigs WHERE worker = ?",
+            worker
+        )
+        .fetch_optional(&self.pool)
+        .await;
+        match row {
+            Ok(Some(r)) => Some(Rig {
+                default_pool: UpstreamTarget {
+                    url: r.pool_url,
+                    user: r.pool_user,
+                    password: r.pool_password,
+                    authority_pubkey: r.pool_authority,
+                },
+                advertised_ths: r.advertised_ths,
+                price_per_th_day: r.price_per_th_day,
+                price_min_per_th_day: r.price_min_per_th_day,
+                price_max_per_th_day: r.price_max_per_th_day,
+                payout_address: r.payout_address,
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(worker, error = %e, "rig lookup failed");
+                None
+            }
+        }
     }
 
     /// The rig's idle/default pool (what the relay routes to when not rented).
     pub async fn default_pool(&self, worker: &str) -> Option<UpstreamTarget> {
-        self.inner.lock().await.get(worker).map(|r| r.default_pool.clone())
+        self.get(worker).await.map(|r| r.default_pool)
     }
 
-    pub async fn set(&self, worker: String, rig: Rig) -> std::io::Result<()> {
-        self.inner.lock().await.insert(worker, rig);
-        self.save().await
+    pub async fn set(&self, worker: String, rig: Rig) -> sqlx::Result<()> {
+        sqlx::query!(
+            "INSERT INTO rigs (worker, pool_url, pool_user, pool_password, pool_authority, \
+             advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address) \
+             VALUES (?,?,?,?,?,?,?,?,?,?) \
+             ON CONFLICT(worker) DO UPDATE SET \
+               pool_url=excluded.pool_url, pool_user=excluded.pool_user, \
+               pool_password=excluded.pool_password, pool_authority=excluded.pool_authority, \
+               advertised_ths=excluded.advertised_ths, price_per_th_day=excluded.price_per_th_day, \
+               price_min_per_th_day=excluded.price_min_per_th_day, \
+               price_max_per_th_day=excluded.price_max_per_th_day, payout_address=excluded.payout_address",
+            worker,
+            rig.default_pool.url,
+            rig.default_pool.user,
+            rig.default_pool.password,
+            rig.default_pool.authority_pubkey,
+            rig.advertised_ths,
+            rig.price_per_th_day,
+            rig.price_min_per_th_day,
+            rig.price_max_per_th_day,
+            rig.payout_address,
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
     }
 
-    pub async fn remove(&self, worker: &str) -> std::io::Result<bool> {
-        let existed = self.inner.lock().await.remove(worker).is_some();
-        if existed {
-            self.save().await?;
-        }
-        Ok(existed)
+    pub async fn remove(&self, worker: &str) -> sqlx::Result<bool> {
+        let res = sqlx::query!("DELETE FROM rigs WHERE worker = ?", worker)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     pub async fn list(&self) -> HashMap<String, Rig> {
-        self.inner.lock().await.clone()
-    }
-
-    async fn save(&self) -> std::io::Result<()> {
-        let data = {
-            let map = self.inner.lock().await;
-            serde_json::to_vec_pretty(&*map).unwrap_or_else(|_| b"{}".to_vec())
-        };
-        // Atomic: write a sibling temp file then rename over the target.
-        let tmp = self.path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, &data).await?;
-        tokio::fs::rename(&tmp, &self.path).await
+        let rows = sqlx::query!(
+            "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
+             price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address FROM rigs"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.worker,
+                    Rig {
+                        default_pool: UpstreamTarget {
+                            url: r.pool_url,
+                            user: r.pool_user,
+                            password: r.pool_password,
+                            authority_pubkey: r.pool_authority,
+                        },
+                        advertised_ths: r.advertised_ths,
+                        price_per_th_day: r.price_per_th_day,
+                        price_min_per_th_day: r.price_min_per_th_day,
+                        price_max_per_th_day: r.price_max_per_th_day,
+                        payout_address: r.payout_address,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -98,9 +152,6 @@ impl SellerStore {
 mod tests {
     use super::*;
 
-    fn tmp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("srp_seller_{}_{}.json", std::process::id(), tag))
-    }
     fn rig(url: &str) -> Rig {
         Rig {
             default_pool: UpstreamTarget {
@@ -119,9 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_get_remove() {
-        let p = tmp_path("crud");
-        let _ = std::fs::remove_file(&p);
-        let store = SellerStore::load(p.clone()).await;
+        let store = SellerStore::new(crate::db::test_pool().await);
         assert!(store.get("w1").await.is_none());
         store.set("w1".into(), rig("poolA:3333")).await.unwrap();
         let got = store.get("w1").await.unwrap();
@@ -131,21 +180,18 @@ mod tests {
         assert!(store.remove("w1").await.unwrap());
         assert!(!store.remove("w1").await.unwrap());
         assert!(store.get("w1").await.is_none());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[tokio::test]
-    async fn persists_across_reload() {
-        let p = tmp_path("persist");
-        let _ = std::fs::remove_file(&p);
-        {
-            let store = SellerStore::load(p.clone()).await;
-            store.set("w2".into(), rig("poolB:3333")).await.unwrap();
-        }
-        let reloaded = SellerStore::load(p.clone()).await;
-        let got = reloaded.get("w2").await.unwrap();
-        assert_eq!(got.default_pool.url, "poolB:3333");
-        assert_eq!(got.price_per_th_day, 0.05);
-        let _ = std::fs::remove_file(&p);
+    async fn upsert_overwrites() {
+        let store = SellerStore::new(crate::db::test_pool().await);
+        store.set("w2".into(), rig("poolB:3333")).await.unwrap();
+        let mut updated = rig("poolC:3333");
+        updated.price_per_th_day = 0.09;
+        store.set("w2".into(), updated).await.unwrap();
+        let got = store.get("w2").await.unwrap();
+        assert_eq!(got.default_pool.url, "poolC:3333");
+        assert_eq!(got.price_per_th_day, 0.09);
+        assert_eq!(store.list().await.len(), 1);
     }
 }
