@@ -122,6 +122,9 @@ pub struct Session {
     /// `active` pointing at one upstream while `routing` describes another. Always
     /// taken before `inner`, never the reverse, so it can't deadlock.
     switch: Mutex<()>,
+    /// An upstream reader sends its generation here when its read loop ends on a
+    /// dropped pool; the supervisor task reconnects / fails over to the fallback.
+    died_tx: mpsc::UnboundedSender<u64>,
     /// For crediting measured delivered work to the active rental order.
     orders: Arc<crate::orders::OrderStore>,
 }
@@ -497,7 +500,53 @@ fn spawn_upstream_reader(
                 }
             }
         }
+        // The loop ended = the pool closed/errored (an intentional swap aborts
+        // this task first). Tell the supervisor so it can reconnect / fail over.
+        let _ = session.died_tx.send(generation);
     })
+}
+
+/// Per-session supervisor: when the active upstream drops, reconnect with capped
+/// backoff — to the order's pool (primary→fallback) while rented, or the
+/// seller's default while idle. Generation-guarded; stale signals (from an
+/// already-swapped reader) are ignored.
+async fn supervise_upstream(session: Arc<Session>, mut died_rx: mpsc::UnboundedReceiver<u64>) {
+    while let Some(gen) = died_rx.recv().await {
+        if session.inner.lock().await.active.generation != gen {
+            continue; // stale (already swapped away)
+        }
+        warn!(gen, "sv1 upstream dropped — reconnecting/failing over");
+        let mut backoff = Duration::from_millis(500);
+        loop {
+            let action = {
+                let i = session.inner.lock().await;
+                if i.active.generation != gen {
+                    None
+                } else {
+                    match &i.routing {
+                        Routing::Rented { order_id } => Some(Some(order_id.clone())),
+                        Routing::Idle => Some(None),
+                    }
+                }
+            };
+            let res = match action {
+                None => break,
+                Some(Some(oid)) => session.switch_to_order(oid).await,
+                Some(None) => session.revert().await,
+            };
+            match res {
+                Ok(()) => {
+                    info!(gen, "sv1 upstream re-established after drop");
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "sv1 reconnect failed; backing off");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    }
 }
 
 /// The Stratum V1 downstream adapter: a transparent full-proxy with a
@@ -567,9 +616,11 @@ pub async fn handle_seller_miner(
     let (to_up, up_rx) = mpsc::unbounded_channel::<String>();
     let up_writer = spawn_writer(conn.write, up_rx);
 
+    let (died_tx, died_rx) = mpsc::unbounded_channel::<u64>();
     let session = Arc::new(Session {
         to_miner: to_miner.clone(),
         switch: Mutex::new(()),
+        died_tx,
         orders: orders.clone(),
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
@@ -603,6 +654,8 @@ pub async fn handle_seller_miner(
         let old = std::mem::replace(&mut i.active.reader, reader);
         old.abort();
     }
+    // Supervisor: reconnect / fail over to the fallback if the upstream drops.
+    let supervisor = tokio::spawn(supervise_upstream(session.clone(), died_rx));
 
     info!(%peer, upstream = %handshake_target.url, "relay established (idle)");
 
@@ -823,6 +876,7 @@ pub async fn handle_seller_miner(
     // Teardown: deregister + abort upstream + writer.
     let worker = session.worker_label().await;
     registry.remove_if(&worker, &AnySession::Sv1(session.clone())).await;
+    supervisor.abort();
     {
         let i = session.inner.lock().await;
         i.active.reader.abort();
@@ -923,6 +977,7 @@ mod tests {
         let session = Arc::new(Session {
             to_miner,
             switch: Mutex::new(()),
+            died_tx: mpsc::unbounded_channel().0,
             orders: crate::orders::OrderStore::new(crate::db::test_pool().await),
             inner: Mutex::new(Inner {
                 active: ActiveUpstream {
