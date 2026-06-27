@@ -1724,7 +1724,8 @@ mod tests {
                 0.0,
                 0.0,
             )
-            .await;
+            .await
+            .unwrap();
         let sess = loop {
             if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
                 break s;
@@ -2092,7 +2093,8 @@ mod tests {
         // Rental already active for this worker, targeting buyer pool B.
         let order = orders
             .create("bc1qSELLER.rig1".into(), ext_target(&b_addr.to_string(), "acctB"), 0, 0.0, 0.0)
-            .await;
+            .await
+            .unwrap();
 
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {

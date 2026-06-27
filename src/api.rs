@@ -432,7 +432,7 @@ async fn create_order(
         password: req.pass,
         authority_pubkey: req.authority,
     };
-    let order = s
+    let order = match s
         .orders
         .create(
             req.worker.clone(),
@@ -441,7 +441,18 @@ async fn create_order(
             req.price_per_th_day,
             req.budget,
         )
-        .await;
+        .await
+    {
+        Ok(o) => o,
+        // The DB's one-active-per-worker guard fired — a concurrent request won
+        // the race between the check above and this insert.
+        Err(crate::orders::CreateOrderError::AlreadyActive) => {
+            return Err((StatusCode::CONFLICT, "rig is already rented".into()));
+        }
+        Err(crate::orders::CreateOrderError::Db(e)) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
     let sessions = s.registry.get_all(&req.worker).await;
     let switched = switch_all(&sessions, &order.id, &target).await;
     let applied = switched > 0;
@@ -700,7 +711,8 @@ mod tests {
         let (app, orders) = app_with_orders().await;
         orders
             .create("bc1qA.rig1".to_string(), buyer_target(), 0, 0.0, 0.0)
-            .await;
+            .await
+            .unwrap();
 
         let post = Request::post("/api/orders")
             .header("content-type", "application/json")

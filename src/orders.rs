@@ -163,6 +163,26 @@ impl OrderRow {
     }
 }
 
+/// Why [`OrderStore::create`] could not record an order.
+#[derive(Debug)]
+pub enum CreateOrderError {
+    /// The worker already has an active order (one-active-per-worker guard).
+    AlreadyActive,
+    /// A database error.
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for CreateOrderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreateOrderError::AlreadyActive => write!(f, "worker already has an active order"),
+            CreateOrderError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CreateOrderError {}
+
 pub struct OrderStore {
     pool: SqlitePool,
 }
@@ -172,6 +192,9 @@ impl OrderStore {
         Arc::new(Self { pool })
     }
 
+    /// Record a new active rental. Fails with [`CreateOrderError::AlreadyActive`]
+    /// if the worker already has an active order — the DB's one-active-per-worker
+    /// unique index is the authoritative guard against a double-rent race.
     pub async fn create(
         &self,
         worker: String,
@@ -179,11 +202,11 @@ impl OrderStore {
         until_ms: i64,
         price_per_th_day: f64,
         budget: f64,
-    ) -> Order {
+    ) -> Result<Order, CreateOrderError> {
         let now = now_ms();
         let id = format!("o{}-{}", now, SEQ.fetch_add(1, Ordering::Relaxed));
         let status = OrderStatus::Active;
-        let _ = sqlx::query!(
+        sqlx::query!(
             "INSERT INTO orders (id, worker, target_url, target_user, target_password, \
              target_authority, created_ms, until_ms, status, delivered_work, accepted_shares, \
              submitted_shares, price_per_th_day, budget) \
@@ -201,9 +224,16 @@ impl OrderStore {
             budget,
         )
         .execute(&self.pool)
-        .await;
+        .await
+        .map_err(|e| {
+            if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+                CreateOrderError::AlreadyActive
+            } else {
+                CreateOrderError::Db(e)
+            }
+        })?;
 
-        Order {
+        Ok(Order {
             id,
             worker,
             target,
@@ -215,7 +245,7 @@ impl OrderStore {
             submitted_shares: 0,
             price_per_th_day,
             budget,
-        }
+        })
     }
 
     pub async fn get(&self, id: &str) -> Option<Order> {
@@ -372,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn create_active_for_worker_and_cancel() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let o = store.create("w1".into(), target(), 0, 0.0, 0.0).await; // open-ended
+        let o = store.create("w1".into(), target(), 0, 0.0, 0.0).await.unwrap(); // open-ended
         assert!(store.active_for_worker("w1", now_ms()).await.is_some());
         let cancelled = store.cancel(&o.id).await.unwrap();
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
@@ -380,10 +410,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_active_order_per_worker() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let first = store.create("w7".into(), target(), 0, 0.0, 0.0).await.unwrap();
+        // A second active order for the same worker is rejected by the DB guard.
+        assert!(matches!(
+            store.create("w7".into(), target(), 0, 0.0, 0.0).await,
+            Err(CreateOrderError::AlreadyActive)
+        ));
+        // A different worker is unaffected.
+        assert!(store.create("w8".into(), target(), 0, 0.0, 0.0).await.is_ok());
+        // Once the first ends, the worker can be rented again.
+        store.cancel(&first.id).await.unwrap();
+        assert!(store.create("w7".into(), target(), 0, 0.0, 0.0).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn expiry_marks_ended_and_is_returned() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let _past = store.create("w2".into(), target(), now_ms() - 1000, 0.0, 0.0).await;
-        let _live = store.create("w3".into(), target(), now_ms() + 60_000, 0.0, 0.0).await;
+        let _past = store.create("w2".into(), target(), now_ms() - 1000, 0.0, 0.0).await.unwrap();
+        let _live = store.create("w3".into(), target(), now_ms() + 60_000, 0.0, 0.0).await.unwrap();
         let expired = store.take_expired(now_ms()).await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].worker, "w2");
@@ -395,7 +441,7 @@ mod tests {
     async fn funding_exhausted_ends_the_order() {
         let store = OrderStore::new(crate::db::test_pool().await);
         // price 1.0 per TH·day, prepaid budget 100, open-ended deadline.
-        let o = store.create("w5".into(), target(), 0, 1.0, 100.0).await;
+        let o = store.create("w5".into(), target(), 0, 1.0, 100.0).await.unwrap();
         assert!(store.take_expired(now_ms()).await.is_empty(), "fresh order is live");
 
         let work_for_100_th_days = 100.0 * HASHES_PER_TH_DAY / DIFF1_HASHES;
@@ -413,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn work_and_submitted_accumulate() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let o = store.create("w6".into(), target(), 0, 0.0, 0.0).await;
+        let o = store.create("w6".into(), target(), 0, 0.0, 0.0).await.unwrap();
         store.add_work(&o.id, 2.5, 2).await;
         store.add_work(&o.id, 1.5, 1).await;
         store.add_submitted(&o.id, 4).await;
@@ -428,7 +474,7 @@ mod tests {
         let pool = crate::db::test_pool().await;
         let id = {
             let store = OrderStore::new(pool.clone());
-            store.create("w4".into(), target(), 0, 0.0, 0.0).await.id
+            store.create("w4".into(), target(), 0, 0.0, 0.0).await.unwrap().id
         };
         let reloaded = OrderStore::new(pool);
         assert!(reloaded.get(&id).await.is_some());
