@@ -344,9 +344,12 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
         loop {
             tick.tick().await;
             for o in orders.take_expired(now_ms()).await {
-                if let Some(session) = registry.get(&o.worker).await {
-                    let _ = session.revert().await;
-                    info!(order = %o.id, worker = %o.worker, "rental finished → reverted to default");
+                let sessions = registry.get_all(&o.worker).await;
+                if !sessions.is_empty() {
+                    for session in &sessions {
+                        let _ = session.revert().await;
+                    }
+                    info!(order = %o.id, worker = %o.worker, sessions = sessions.len(), "rental finished → reverted to default");
                 }
             }
         }

@@ -1117,8 +1117,44 @@ mod tests {
             accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
                 .await
                 .map_err(|e| anyhow!("pool noise: {e:?}"))?;
-        let (mut read, mut write) = stream.into_split();
+        let (read, write) = stream.into_split();
+        serve_pool_conn(read, write, prefix, base_cid, submits).await
+    }
 
+    /// A pool that accepts MANY connections (several miners sharing one rig name,
+    /// each its own proxy→pool connection), serving each on its own task with a
+    /// distinct base channel id.
+    async fn mock_pool_multi(
+        listener: TcpListener,
+        prefix: Vec<u8>,
+        base_cid: u32,
+        keys: NoiseKeys,
+        submits: mpsc::UnboundedSender<u32>,
+    ) -> anyhow::Result<()> {
+        let mut n = 0u32;
+        loop {
+            let (sock, _) = listener.accept().await?;
+            let _ = sock.set_nodelay(true);
+            let stream =
+                accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+                    .await
+                    .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+            let (read, write) = stream.into_split();
+            let cid = base_cid + n * 10;
+            n += 1;
+            tokio::spawn(serve_pool_conn(read, write, prefix.clone(), cid, submits.clone()));
+        }
+    }
+
+    /// Serve one pool connection: setup handshake, then opens → success (distinct
+    /// cid), submits → report + success, UpdateChannel → SetTarget.
+    async fn serve_pool_conn(
+        mut read: Read,
+        mut write: Write,
+        prefix: Vec<u8>,
+        base_cid: u32,
+        submits: mpsc::UnboundedSender<u32>,
+    ) -> anyhow::Result<()> {
         // SetupConnection → success.
         loop {
             let f = read_one(&mut read).await?;
@@ -1385,7 +1421,7 @@ mod tests {
 
         // Rent: switch the session to pool B.
         let sess = loop {
-            if let Some(s) = registry.get("bc1qSELLER.rig1").await {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
                 break s;
             }
             tokio::task::yield_now().await;
@@ -1454,7 +1490,7 @@ mod tests {
 
         // Switch both channels to pool B.
         let sess = loop {
-            if let Some(s) = registry.get("bc1qSELLER.rig1").await {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
                 break s;
             }
             tokio::task::yield_now().await;
@@ -1613,7 +1649,7 @@ mod tests {
 
         // Switch to pool B: the in-flight open #2 must be abandoned with an error.
         let sess = loop {
-            if let Some(s) = registry.get("bc1qSELLER.rig1").await {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
                 break s;
             }
             tokio::task::yield_now().await;
@@ -1674,7 +1710,7 @@ mod tests {
             )
             .await;
         let sess = loop {
-            if let Some(s) = registry.get("bc1qSELLER.rig1").await {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
                 break s;
             }
             tokio::task::yield_now().await;
@@ -1776,7 +1812,7 @@ mod tests {
             miner.open("bc1qUNREGISTERED", 1).await.is_err(),
             "unregistered worker open must fail (connection closed)"
         );
-        assert!(registry.get("bc1qUNREGISTERED").await.is_none());
+        assert!(registry.get_all("bc1qUNREGISTERED").await.is_empty());
     }
 
     /// A mock pool that groups the Extended channel the way the real pool does:
@@ -1887,5 +1923,80 @@ mod tests {
             job_cid, down_group,
             "group-broadcast job remapped to the downstream group id"
         );
+    }
+
+    #[tokio::test]
+    async fn same_worker_miners_form_one_rig_switched_together() {
+        // MRR model: 2 miners under the SAME worker name = one rig. Each is its
+        // own session; renting switches BOTH and the rig status sums them.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = pool_b.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool_multi(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool_multi(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.farm", ext_target(&a_addr.to_string(), "acctA")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = proxy.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+                });
+            }
+        });
+
+        // Two miners, SAME worker name → both land on pool A.
+        let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+        m1.setup().await.unwrap();
+        let (cid1, p1) = m1.open("bc1qSELLER.farm", 1).await.unwrap();
+        assert_eq!(p1, vec![0xAA; 8], "miner 1 on seller default pool A");
+        let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+        m2.setup().await.unwrap();
+        let (_cid2, p2) = m2.open("bc1qSELLER.farm", 1).await.unwrap();
+        assert_eq!(p2, vec![0xAA; 8], "miner 2 on seller default pool A");
+
+        // Both registered as ONE rig (two sessions under the shared name).
+        let sessions = loop {
+            let s = registry.get_all("bc1qSELLER.farm").await;
+            if s.len() == 2 {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(sessions.len(), 2, "two miners → one rig, two sessions");
+
+        // Rent the whole rig: switch every session to pool B.
+        for sess in &sessions {
+            sess.switch_to("o1".to_string(), ext_target(&b_addr.to_string(), "acctB"))
+                .await
+                .unwrap();
+        }
+
+        // BOTH miners get re-pointed to pool B (new prefix), same channel id.
+        let (rc1, rp1) = m1.read_until_set_extranonce().await.unwrap();
+        assert_eq!(rp1, vec![0xBB; 8], "miner 1 switched to pool B");
+        assert_eq!(rc1, cid1, "miner 1 keeps its downstream channel id");
+        let (_rc2, rp2) = m2.read_until_set_extranonce().await.unwrap();
+        assert_eq!(rp2, vec![0xBB; 8], "miner 2 switched to pool B");
+
+        // The rig reads as rented (any session rented ⇒ rig rented).
+        let st = registry.aggregated_status("bc1qSELLER.farm").await.unwrap();
+        assert_eq!(st.routing, "rented", "the whole rig is rented");
     }
 }

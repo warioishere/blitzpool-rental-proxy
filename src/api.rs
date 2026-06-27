@@ -129,8 +129,8 @@ async fn get_session(
     State(s): State<AppState>,
     Path(worker): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    match s.registry.get(&worker).await {
-        Some(sess) => Ok(Json(json!(sess.status().await))),
+    match s.registry.aggregated_status(&worker).await {
+        Some(status) => Ok(Json(json!(status))),
         None => Err((StatusCode::NOT_FOUND, "worker not connected".into())),
     }
 }
@@ -155,11 +155,10 @@ async fn rent(
     Path(worker): Path<String>,
     Json(req): Json<RentReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let sess = s
-        .registry
-        .get(&worker)
-        .await
-        .ok_or((StatusCode::NOT_FOUND, "worker not connected".to_string()))?;
+    let sessions = s.registry.get_all(&worker).await;
+    if sessions.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "worker not connected".to_string()));
+    }
     let _ = req.until_unix_ms; // honored by the orders layer
     let target = UpstreamTarget {
         url: req.url,
@@ -167,25 +166,55 @@ async fn rent(
         password: req.pass,
         authority_pubkey: req.authority,
     };
-    sess.switch_to(req.order_id.unwrap_or_default(), target)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    Ok(Json(json!({"ok": true})))
+    let order_id = req.order_id.unwrap_or_default();
+    // Switch every miner of this rig to the buyer's target.
+    let switched = switch_all(&sessions, &order_id, &target).await;
+    if switched == 0 {
+        return Err((StatusCode::BAD_GATEWAY, "no session could be switched".into()));
+    }
+    Ok(Json(json!({"ok": true, "switched": switched, "of": sessions.len()})))
+}
+
+/// Switch all of a rig's sessions to `target`; returns how many succeeded.
+/// Tolerates partial failure (a dead session's reconnect resumes the order),
+/// but logs it.
+async fn switch_all(
+    sessions: &[crate::control::AnySession],
+    order_id: &str,
+    target: &UpstreamTarget,
+) -> usize {
+    let mut ok = 0;
+    for sess in sessions {
+        match sess.switch_to(order_id.to_string(), target.clone()).await {
+            Ok(()) => ok += 1,
+            Err(e) => tracing::warn!(error = %e, "rig session switch failed"),
+        }
+    }
+    ok
+}
+
+/// Revert all of a rig's sessions to their default pool; returns how many succeeded.
+async fn revert_all(sessions: &[crate::control::AnySession]) -> usize {
+    let mut ok = 0;
+    for sess in sessions {
+        match sess.revert().await {
+            Ok(()) => ok += 1,
+            Err(e) => tracing::warn!(error = %e, "rig session revert failed"),
+        }
+    }
+    ok
 }
 
 async fn release(
     State(s): State<AppState>,
     Path(worker): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let sess = s
-        .registry
-        .get(&worker)
-        .await
-        .ok_or((StatusCode::NOT_FOUND, "worker not connected".to_string()))?;
-    sess.revert()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    Ok(Json(json!({"ok": true})))
+    let sessions = s.registry.get_all(&worker).await;
+    if sessions.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "worker not connected".to_string()));
+    }
+    let reverted = revert_all(&sessions).await;
+    Ok(Json(json!({"ok": true, "reverted": reverted, "of": sessions.len()})))
 }
 
 #[derive(Deserialize)]
@@ -312,11 +341,11 @@ async fn set_seller(
         .set(worker.clone(), rig)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // If connected + idle, apply the default pool now.
-    if let Some(sess) = s.registry.get(&worker).await {
-        let routing = sess.status().await.routing;
-        if routing == "idle" {
-            let _ = sess.set_default(target).await;
+    // If connected + idle, apply the new default pool now — to every miner of
+    // the rig (a rented session keeps its buyer target).
+    for sess in s.registry.get_all(&worker).await {
+        if sess.status().await.routing == "idle" {
+            let _ = sess.set_default(target.clone()).await;
         }
     }
     Ok(Json(json!({"ok": true})))
@@ -417,11 +446,14 @@ async fn create_order(
     if s.orders.active_for_worker(&req.worker, now_ms()).await.is_some() {
         return Err((StatusCode::CONFLICT, "rig is already rented".into()));
     }
-    // Only rigs currently delivering hashrate can be rented.
-    let live_hashrate = match s.registry.get(&req.worker).await {
-        Some(sess) => sess.status().await.hashrate_hs,
-        None => 0.0,
-    };
+    // Only rigs currently delivering hashrate can be rented (summed across all
+    // of the rig's miners).
+    let live_hashrate = s
+        .registry
+        .aggregated_status(&req.worker)
+        .await
+        .map(|st| st.hashrate_hs)
+        .unwrap_or(0.0);
     if !is_delivering(live_hashrate) {
         return Err((StatusCode::CONFLICT, "rig is offline".into()));
     }
@@ -441,11 +473,16 @@ async fn create_order(
             req.budget,
         )
         .await;
-    let mut applied = false;
-    if let Some(sess) = s.registry.get(&req.worker).await {
-        applied = sess.switch_to(order.id.clone(), target).await.is_ok();
-    }
-    Ok(Json(json!({"ok": true, "order": order_json(&order), "applied": applied})))
+    let sessions = s.registry.get_all(&req.worker).await;
+    let switched = switch_all(&sessions, &order.id, &target).await;
+    let applied = switched > 0;
+    Ok(Json(json!({
+        "ok": true,
+        "order": order_json(&order),
+        "applied": applied,
+        "switched": switched,
+        "of": sessions.len(),
+    })))
 }
 
 /// Cancel an order; if the worker is connected, revert it to its default pool.
@@ -455,11 +492,9 @@ async fn cancel_order(State(s): State<AppState>, Path(id): Path<String>) -> Resu
         .cancel(&id)
         .await
         .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
-    let mut reverted = false;
-    if let Some(sess) = s.registry.get(&order.worker).await {
-        reverted = sess.revert().await.is_ok();
-    }
-    Ok(Json(json!({"ok": true, "reverted": reverted})))
+    let sessions = s.registry.get_all(&order.worker).await;
+    let reverted = revert_all(&sessions).await;
+    Ok(Json(json!({"ok": true, "reverted": reverted, "of": sessions.len()})))
 }
 
 #[cfg(test)]
