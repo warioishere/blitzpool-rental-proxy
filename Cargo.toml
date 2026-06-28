@@ -41,10 +41,13 @@ stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps", rev = "2798
 # for key generation.
 secp256k1 = { version = "0.28", features = ["rand", "alloc"], optional = true }
 rand = { version = "0.8", optional = true }
+# 256-bit integer division for the bdiff difficulty<->target conversion in the
+# translator (translate.rs). Already present transitively via the SV2 stack.
+primitive-types = { version = "0.13", default-features = false, optional = true }
 
 [features]
 # Build the SV2 downstream relay + foundation (Noise transport + protocol).
-sv2 = ["dep:stratum-core", "dep:stratum-apps", "dep:secp256k1", "dep:rand"]
+sv2 = ["dep:stratum-core", "dep:stratum-apps", "dep:secp256k1", "dep:rand", "dep:primitive-types"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

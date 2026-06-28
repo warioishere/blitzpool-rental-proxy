@@ -1677,9 +1677,8 @@ mod sv2_translate_tests {
     use stratum_core::parsers_sv2::{AnyMessage, CommonMessages};
 
     fn diff1_target() -> Vec<u8> {
-        let mut t = vec![0u8; 32];
-        t[28] = 1;
-        t
+        // The difficulty-1 target in the current (bdiff) convention.
+        crate::proto::translate::target_from_difficulty(1.0).to_vec()
     }
 
     /// A minimal legacy (non-witness) coinbase split into prefix/suffix — enough

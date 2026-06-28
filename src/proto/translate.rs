@@ -16,16 +16,17 @@
 //!
 //! Byte order follows the SV2 spec: targets are 32-byte little-endian; the SV1
 //! `mining.notify` prev-hash per-word swap is handled by the SV1 `PrevHash`
-//! newtype (so the SV2 `prev_hash` is its natural internal order). A difficulty-1
-//! share is 2^32 hashes, and the share difficulty implied by a target is computed
-//! with the same authoritative target math the relay uses for accounting, so the
-//! threshold the miner sees and the work the proxy credits agree.
+//! newtype (so the SV2 `prev_hash` is its natural internal order). Share
+//! difficulty uses the Bitcoin "bdiff" convention (difficulty 1 = the
+//! `0x00000000FFFF0000…0000` target), the same number pools and miners display —
+//! so a miner reads back exactly the difficulty the pool set (no off-by-one), and
+//! the threshold the miner sees agrees with the work the proxy credits.
 
 use anyhow::{anyhow, Result};
 
+use primitive_types::U256 as BigU256;
 use stratum_core::binary_sv2::{Seq0255, Sv2Option, U256};
 use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
-use stratum_core::channels_sv2::target::{hash_rate_from_target, hash_rate_to_target};
 use stratum_core::mining_sv2::{
     NewExtendedMiningJob, NewMiningJob, SetNewPrevHash, SubmitSharesExtended, SubmitSharesStandard,
 };
@@ -35,9 +36,6 @@ use stratum_core::sv1_api::{
     methods::{client_to_server, server_to_client},
     utils::{Extranonce, HexU32Be, MerkleNode, PrevHash},
 };
-
-/// Difficulty-1 share = 2^32 hashes.
-const DIFF1_HASHES: f64 = 4_294_967_296.0;
 
 /// How long to wait for a native-protocol upstream connect before concluding the
 /// pool speaks the *other* protocol and switching to translation. Detection is
@@ -51,34 +49,47 @@ pub const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
 
 // ── difficulty / target ─────────────────────────────────────────────
 
-/// Share difficulty (diff-1 units) implied by a 32-byte little-endian `target`.
-/// Uses the upstream stack's authoritative target math so the byte order +
-/// diff-1 convention match the pools. Returns 0.0 for a zero/invalid target.
+/// Share difficulty implied by a 32-byte little-endian `target`, in the Bitcoin
+/// "bdiff" convention — difficulty 1 is the `0x00000000FFFF0000…0000` target.
+/// This is the same number pools and miners report (it matches rust-bitcoin's
+/// `Target::difficulty_float`, hence a miner reads back exactly what the pool
+/// set). Returns 0.0 for a wrong-length, zero, or otherwise non-finite target.
 pub fn difficulty_from_target(target: &[u8]) -> f64 {
-    let Ok(u) = U256::try_from(target.to_vec()) else {
+    if target.len() != 32 {
         return 0.0;
-    };
-    // hash_rate_from_target(t, 1 share/min) = hashes_per_share / 60;
-    // difficulty = hashes_per_share / 2^32.
-    match hash_rate_from_target(u, 1.0) {
-        Ok(h1) => h1 * 60.0 / DIFF1_HASHES,
-        Err(_) => 0.0,
+    }
+    let mut le = [0u8; 32];
+    le.copy_from_slice(target);
+    let d = stratum_core::bitcoin::Target::from_le_bytes(le).difficulty_float();
+    if d.is_finite() {
+        d
+    } else {
+        0.0 // zero target → infinite difficulty; report 0.0 as the error sentinel
     }
 }
 
-/// The 32-byte little-endian target for a share `difficulty` (diff-1 units).
-/// Exact inverse of [`difficulty_from_target`]: a difficulty-`d` share needs
-/// `d * 2^32` hashes on average, so the target is the one the authoritative math
-/// assigns to that work at one share per the 60-second basis. A non-positive or
-/// non-finite difficulty yields the maximum target (no threshold).
+/// The 32-byte little-endian target for a share `difficulty`, in the Bitcoin
+/// bdiff convention: `target = floor(diff1 / difficulty)` where `diff1` is the
+/// difficulty-1 target `0x00000000FFFF0000…0000` (= rust-bitcoin `Target::MAX`).
+/// Exact inverse of [`difficulty_from_target`]. A non-positive / non-finite
+/// difficulty (or one rounding below the representable minimum) yields the
+/// maximum target (no threshold).
 pub fn target_from_difficulty(difficulty: f64) -> [u8; 32] {
     if !difficulty.is_finite() || difficulty <= 0.0 {
         return [0xff; 32];
     }
-    match hash_rate_to_target(difficulty * DIFF1_HASHES, 60.0) {
-        Ok(t) => t.to_le_bytes(),
-        Err(_) => [0xff; 32],
+    let diff1 = BigU256::from_big_endian(&stratum_core::bitcoin::Target::MAX.to_be_bytes());
+    // Scale the (possibly fractional) difficulty to an integer denominator so the
+    // division is exact-integer; SCALE = 2^16 gives ample sub-integer resolution
+    // and keeps diff1*SCALE (~2^240) comfortably within 256 bits.
+    const SCALE: u64 = 1 << 16;
+    let denom = (difficulty * SCALE as f64).round();
+    if denom < 1.0 {
+        return [0xff; 32]; // difficulty below ~1/SCALE → no real threshold
     }
+    let numerator = diff1 * BigU256::from(SCALE);
+    let target = numerator / BigU256::from(denom as u128);
+    target.to_little_endian()
 }
 
 // ── SV2 → SV1 (SV1 miner ↔ SV2 pool) ────────────────────────────────
@@ -475,6 +486,31 @@ mod tests {
         }
         // Non-positive difficulty → max target (no threshold).
         assert_eq!(target_from_difficulty(0.0), [0xff; 32]);
+    }
+
+    #[test]
+    fn uses_bitcoin_bdiff_convention() {
+        // diff 1 → the Bitcoin difficulty-1 target 0x00000000FFFF0000…0000
+        // (big-endian). This is the convention pools/miners display, so a miner
+        // reads back the pool's number exactly (no off-by-one).
+        let mut be = target_from_difficulty(1.0);
+        be.reverse();
+        let mut expected = [0u8; 32];
+        expected[4] = 0xff;
+        expected[5] = 0xff;
+        assert_eq!(
+            be, expected,
+            "diff-1 target must be the bdiff diff-1 target"
+        );
+        assert!((difficulty_from_target(&target_from_difficulty(1.0)) - 1.0).abs() < 1e-9);
+
+        // The motivating case: a pool difficulty of 10000 must round-trip to a
+        // target a miner reads back as 10000 (not 9999) — same bdiff base both ends.
+        let back = difficulty_from_target(&target_from_difficulty(10000.0));
+        assert!(
+            (back - 10000.0).abs() < 0.5,
+            "10000 round-tripped to {back}"
+        );
     }
 
     #[test]

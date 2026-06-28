@@ -365,19 +365,10 @@ pub(crate) fn parse_submit_error_seq(frame: &mut Sv2Frame) -> Option<u32> {
     }
 }
 
-/// Difficulty (in diff-1 share units) implied by a channel `target`. Reuses the
-/// upstream stack's authoritative target math so the byte order + diff-1
-/// convention match the pools. Returns 0.0 on a zero/invalid target.
+/// Difficulty implied by a channel `target` (Bitcoin bdiff convention). The
+/// single source of truth is [`crate::proto::translate::difficulty_from_target`].
 fn difficulty_from_target(target: &[u8]) -> f64 {
-    let Ok(u) = U256::try_from(target.to_vec()) else {
-        return 0.0;
-    };
-    // hash_rate_from_target(t, 1 share/min) = hashes_per_share / 60;
-    // difficulty = hashes_per_share / 2^32.
-    match stratum_core::channels_sv2::target::hash_rate_from_target(u, 1.0) {
-        Ok(h1) => h1 * 60.0 / 4_294_967_296.0,
-        Err(_) => 0.0,
-    }
+    crate::proto::translate::difficulty_from_target(target)
 }
 
 // ── transport helpers ───────────────────────────────────────────────
@@ -2002,9 +1993,8 @@ mod tests {
     /// shares carry real (non-zero) work. (`[0xff; 32]` is the max target =
     /// difficulty 0, which the accounting correctly ignores.)
     fn diff1_target() -> Vec<u8> {
-        let mut t = vec![0u8; 32];
-        t[28] = 1;
-        t
+        // The difficulty-1 target in the current (bdiff) convention.
+        translate::target_from_difficulty(1.0).to_vec()
     }
 
     /// A mock SV2 pool: one connection, tagging its `extranonce_prefix`. Assigns
