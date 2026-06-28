@@ -12,9 +12,14 @@ This is the inverse of a mining pool: a pool *generates* its own block
 templates; this proxy *forwards* a miner's work to an upstream of someone
 else's choosing and measures the delivered hashrate for billing/payout.
 
-**Protocol scope:** Stratum **V1 first**, Stratum **V2 planned**. The core
-(session, routing, control, accounting) is protocol-agnostic; SV1 and SV2 are
-pluggable transport/codec adapters (`src/proto/`).
+**Protocol scope:** Stratum **V1 and V2** are both supported (SV2 over the
+Noise-encrypted binary protocol, including Extended and Standard channels). On
+top of that the proxy has a **bidirectional SV1↔SV2 translator**: a seller's
+miner of *either* protocol can be rented onto a buyer pool of *either*
+protocol. All four combinations work — SV1→SV1 and SV2→SV2 passthrough, plus
+SV1 miner→SV2 pool and SV2 miner→SV1 pool translation. The core (session,
+routing, control, accounting) is protocol-agnostic; SV1, SV2 and the translator
+are pluggable transport/codec adapters (`src/proto/`).
 
 ## Why a proxy, not a pool
 
@@ -47,17 +52,22 @@ Pluggable protocol adapters (`src/proto/`):
 - **downstream** — Stratum server: accept seller miners.
 - **upstream** — Stratum client: one connection per session, **swappable at
   runtime**.
-- `sv1` now; `sv2` later (same session/router/accounting underneath).
+- `sv1` and `sv2` (same session/router/accounting underneath), plus a
+  `translate` adapter that bridges the two in both directions.
 
-### The one hard problem: switching upstream mid-session
+### The one hard problem: switching upstream
 
-A new upstream hands out a different extranonce + difficulty. To switch
-without dropping the miner:
-- **SV1:** if the miner negotiated `mining.extranonce.subscribe`, push
-  `mining.set_extranonce` + `mining.set_difficulty` + `mining.notify(clean)`;
-  otherwise fall back to `client.reconnect`.
-- **SV2 (later):** the channel/`SetExtranoncePrefix` + `SetTarget` machinery
-  makes this cleaner natively.
+A new upstream hands out a different extranonce + difficulty. Two cases:
+- **Operator-initiated change** (idle-pool edit, rent start, rent end) — the
+  proxy **forces the miner to reconnect** so it re-handshakes cleanly against
+  the new upstream (correct extranonce/difficulty from the first job). A live
+  re-point a miner might silently ignore would waste every share, so the
+  reconnect is the safe default here.
+- **Automatic failover** (the upstream pool *dies* mid-session) — the proxy
+  re-points in place: SV1 pushes `mining.set_extranonce` + `mining.set_difficulty`
+  + `mining.notify(clean)` (or `client.reconnect` if the miner can't take a live
+  extranonce); SV2 uses `SetExtranoncePrefix` + `SetTarget`. In-place keeps a
+  flapping pool from storming the miner with reconnects.
 
 ## Milestones
 
