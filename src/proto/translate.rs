@@ -22,8 +22,11 @@
 use anyhow::{anyhow, Result};
 
 use stratum_core::binary_sv2::{Seq0255, Sv2Option, U256};
+use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
 use stratum_core::channels_sv2::target::{hash_rate_from_target, hash_rate_to_target};
-use stratum_core::mining_sv2::{NewExtendedMiningJob, SetNewPrevHash, SubmitSharesExtended};
+use stratum_core::mining_sv2::{
+    NewExtendedMiningJob, NewMiningJob, SetNewPrevHash, SubmitSharesExtended, SubmitSharesStandard,
+};
 use stratum_core::stratum_translation::sv2_to_sv1;
 use stratum_core::sv1_api::{
     json_rpc,
@@ -192,6 +195,77 @@ pub fn sv1_notify_to_sv2_job(
         None
     };
     Ok((job, prev_hash))
+}
+
+/// Build an SV2 `NewMiningJob` (Standard channel) from an SV1 `mining.notify`.
+///
+/// A Standard channel is header-only: the miner can't build the coinbase, so the
+/// proxy assembles it (`coinb1 + extranonce1 + extranonce2 + coinb2`), folds the
+/// merkle path to a complete `merkle_root`, and hands that to the miner. The
+/// caller owns the `extranonce2` it chose for this job and replays it when the
+/// miner's `SubmitSharesStandard` is translated back to a `mining.submit`.
+pub fn sv1_notify_to_sv2_standard_job(
+    notify: &server_to_client::Notify<'_>,
+    channel_id: u32,
+    job_id: u32,
+    extranonce1: &[u8],
+    extranonce2: &[u8],
+    as_future: bool,
+) -> Result<(NewMiningJob<'static>, Option<SetNewPrevHash<'static>>)> {
+    let coinb1 = Vec::<u8>::from(notify.coin_base1.clone());
+    let coinb2 = Vec::<u8>::from(notify.coin_base2.clone());
+    let mut full_extranonce = extranonce1.to_vec();
+    full_extranonce.extend_from_slice(extranonce2);
+    let path: Vec<Vec<u8>> = notify
+        .merkle_branch
+        .iter()
+        .map(|m| m.0.inner_as_ref().to_vec())
+        .collect();
+    let root = merkle_root_from_path(&coinb1, &coinb2, &full_extranonce, &path)
+        .ok_or_else(|| anyhow!("coinbase did not deserialize as a transaction"))?;
+    let merkle_root = U256::try_from(root).map_err(|e| anyhow!("merkle root: {e:?}"))?;
+    let job = NewMiningJob {
+        channel_id,
+        job_id,
+        min_ntime: Sv2Option::new(if as_future { None } else { Some(notify.time.0) }),
+        version: notify.version.0,
+        merkle_root,
+    };
+    let prev_hash = if as_future {
+        Some(SetNewPrevHash {
+            channel_id,
+            job_id,
+            prev_hash: notify.prev_hash.0.clone().into_static(),
+            min_ntime: notify.time.0,
+            nbits: notify.bits.0,
+        })
+    } else {
+        None
+    };
+    Ok((job, prev_hash))
+}
+
+/// Convert an SV2 `SubmitSharesStandard` into an SV1 `mining.submit`. The
+/// `extranonce2` is the one the proxy chose when it built that job's coinbase
+/// (a Standard submit carries no extranonce — the miner never saw it).
+pub fn sv2_standard_submit_to_sv1(
+    submit: &SubmitSharesStandard,
+    user_name: String,
+    job_id: String,
+    extranonce2: Vec<u8>,
+    id: u64,
+    version_rolling_mask: Option<u32>,
+) -> Result<client_to_server::Submit<'static>> {
+    let extra_nonce2 = Extranonce::try_from(extranonce2).map_err(|e| anyhow!("extranonce: {e:?}"))?;
+    Ok(client_to_server::Submit {
+        user_name,
+        job_id,
+        extra_nonce2,
+        time: HexU32Be(submit.ntime),
+        nonce: HexU32Be(submit.nonce),
+        version_bits: version_rolling_mask.map(|mask| HexU32Be(submit.version & mask)),
+        id,
+    })
 }
 
 /// Convert an SV2 `SubmitSharesExtended` into an SV1 `mining.submit`.
@@ -458,5 +532,64 @@ mod tests {
         assert_eq!(params[0], "acct.rig");
         assert_eq!(params[1], "9");
         assert_eq!(params[2], "01020304"); // extranonce2 hex
+    }
+
+    #[test]
+    fn standard_job_builds_a_mineable_merkle_root() {
+        // A Standard channel job carries a complete merkle_root the proxy folds
+        // from coinb1 + extranonce1 + extranonce2 + coinb2. Confirm it matches an
+        // independent fold and that the resulting header can meet a target.
+        let notify = sample_notify(true, vec![]); // legacy_coinbase reserves 8 extranonce bytes
+        let en1 = [0xAA, 0xBB, 0xCC, 0xDD];
+        let en2 = [0x00, 0x00, 0x00, 0x01];
+        let (job, prev) = sv1_notify_to_sv2_standard_job(&notify, 1, 1, &en1, &en2, true).unwrap();
+        let prev = prev.expect("future job emits a prev-hash");
+
+        let coinb1 = Vec::<u8>::from(notify.coin_base1.clone());
+        let coinb2 = Vec::<u8>::from(notify.coin_base2.clone());
+        let mut full = en1.to_vec();
+        full.extend_from_slice(&en2);
+        let empty: Vec<Vec<u8>> = vec![];
+        let expected = merkle_root_from_path(&coinb1, &coinb2, &full, &empty).unwrap();
+        assert_eq!(job.merkle_root.inner_as_ref(), expected.as_slice(), "merkle root matches");
+
+        let mut header = Vec::with_capacity(80);
+        header.extend_from_slice(&job.version.to_le_bytes());
+        header.extend_from_slice(prev.prev_hash.inner_as_ref());
+        header.extend_from_slice(job.merkle_root.inner_as_ref());
+        header.extend_from_slice(&prev.min_ntime.to_le_bytes());
+        header.extend_from_slice(&prev.nbits.to_le_bytes());
+        let noff = header.len();
+        header.extend_from_slice(&0u32.to_le_bytes());
+        let mut target = [0xffu8; 32];
+        target[31] = 0x3f;
+        let mut found = false;
+        for nonce in 0u32..100_000 {
+            header[noff..noff + 4].copy_from_slice(&nonce.to_le_bytes());
+            if le_leq(&sha256d::Hash::hash(&header).to_byte_array(), &target) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "the standard-channel header must be mineable");
+    }
+
+    #[test]
+    fn standard_submit_translates_to_sv1_submit() {
+        let submit = SubmitSharesStandard {
+            channel_id: 2,
+            sequence_number: 7,
+            job_id: 3,
+            nonce: 0xabcd_1234,
+            ntime: 0x6500_0002,
+            version: 0x2000_2000,
+        };
+        let s = sv2_standard_submit_to_sv1(&submit, "w.rig".into(), "jid".into(), vec![9, 8, 7, 6], 4, Some(VERSION_ROLLING_MASK))
+            .unwrap();
+        assert_eq!(s.job_id, "jid");
+        assert_eq!(s.nonce.0, 0xabcd_1234);
+        assert_eq!(s.time.0, 0x6500_0002);
+        assert_eq!(s.extra_nonce2.0.inner_as_ref(), &[9, 8, 7, 6], "extranonce2 is the proxy-chosen one");
+        assert_eq!(s.version_bits.unwrap().0, 0x2000_2000 & VERSION_ROLLING_MASK);
     }
 }
