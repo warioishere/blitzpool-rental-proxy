@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Protocol adapters. The proxy core (session, routing, control, accounting)
 //! is protocol-agnostic; each adapter implements the downstream server +
 //! swappable upstream client for one Stratum protocol version, plugging into

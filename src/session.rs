@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Protocol-agnostic session model: where a seller's miner is currently
 //! routed, plus a rolling window for measuring delivered hashrate.
 

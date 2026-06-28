@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! First-byte protocol detection for the shared (`both`) listen port.
 //!
 //! When the proxy serves SV1 and SV2 on one port, each accepted connection is

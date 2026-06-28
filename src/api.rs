@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! HTTP/JSON control API — the proxy is fully steerable through this. The
 //! existing web UI calls these endpoints; no UI is built here.
 //!

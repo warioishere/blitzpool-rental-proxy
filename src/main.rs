@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! stratum-rental-proxy — entry point.
 //!
 //! Binds the downstream Stratum server (SV1, SV2, or auto-detect on one port),

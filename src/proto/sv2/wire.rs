@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SV2 frame plumbing for the relay: build typed messages into frames, pull the
 //! message type out of received frames, and rewrite the `channel_id` of a
 //! channel-scoped message in place.

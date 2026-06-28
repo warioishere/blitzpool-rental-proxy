@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SQLite connection pool + schema migrations for the proxy's persistent state
 //! (rigs + orders). Embedded, single-file, ACID; WAL for concurrent reads.
 

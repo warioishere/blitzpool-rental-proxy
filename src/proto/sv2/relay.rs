@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! SV2 downstream relay with a swappable upstream — the SV2 analogue of the
 //! SV1 [`crate::proto::relay`].
 //!

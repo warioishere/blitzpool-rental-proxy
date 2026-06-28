@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Static process configuration. Seller/buyer/order state is runtime (control
 //! API, milestone 3) — this only holds boot-time settings.
 //!

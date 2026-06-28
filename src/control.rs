@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Protocol-agnostic control surface over a live session.
 //!
 //! The registry and control API don't care whether a session speaks SV1 or

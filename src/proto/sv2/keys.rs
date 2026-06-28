@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The proxy's SV2 Noise authority keypair.
 //!
 //! The proxy is the Noise responder to the miner, so it needs a static

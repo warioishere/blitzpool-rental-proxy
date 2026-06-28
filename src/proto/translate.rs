@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Stratum V1 ↔ Stratum V2 job/share translation for the bidirectional upstream.
 //!
 //! The proxy is a fixed-protocol server to the seller's miner, but the buyer's

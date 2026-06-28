@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Live session registry: maps a seller's **rig** (worker name) to its active
 //! session(s), so the control layer can find a connected rig and switch where
 //! its hashrate goes. Sessions are held protocol-agnostically as [`AnySession`].

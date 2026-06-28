@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Stratum V1 protocol adapter: line codec + (later) downstream server and
 //! swappable upstream client. SV1 is JSON-RPC over newline-delimited TCP.
 //!

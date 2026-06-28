@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Protocol-agnostic adapter seam.
 //!
 //! The proxy core — session registry, routing, rental orders, seller config,

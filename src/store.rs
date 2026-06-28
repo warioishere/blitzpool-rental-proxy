@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Persistent rig/seller store (SQLite, `rigs` table): each seller miner's
 //! worker name → its [`Rig`] (default pool + marketplace listing).
 //!

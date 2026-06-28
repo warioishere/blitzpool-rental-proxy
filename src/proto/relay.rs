@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Per-connection SV1 relay with a **swappable upstream** (the M2 core).
 //!
 //! Full-proxy model: the proxy drives the upstream handshake itself

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Rental orders (SQLite, `orders` table): a buyer rents a worker's hashrate
 //! until a deadline and/or a prepaid budget.
 //!
