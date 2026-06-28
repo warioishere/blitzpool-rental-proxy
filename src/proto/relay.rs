@@ -38,6 +38,8 @@ use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 #[cfg(feature = "sv2")]
 use std::collections::VecDeque;
 #[cfg(feature = "sv2")]
+use stratum_core::bitcoin::hashes::hex::DisplayHex;
+#[cfg(feature = "sv2")]
 use stratum_core::mining_sv2 as mining;
 #[cfg(feature = "sv2")]
 use stratum_core::parsers_sv2::{AnyMessage, Mining};
@@ -470,7 +472,7 @@ async fn connect_sv2_translate(
         min_extranonce_size: SV2_UP_MIN_EXTRANONCE,
     };
     let info = open_on(&mut read, &mut write, &spec, user_identity).await?;
-    let extranonce1 = hex_encode(&info.extranonce_prefix);
+    let extranonce1 = info.extranonce_prefix.to_lower_hex_string();
     let initial_diff = translate::difficulty_from_target(&info.target);
     Ok(RawUpstream::Sv2(Box::new(Sv2RawUpstream {
         read,
@@ -480,22 +482,6 @@ async fn connect_sv2_translate(
         extranonce2_size: info.extranonce_size as u32,
         initial_diff,
     })))
-}
-
-#[cfg(feature = "sv2")]
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// An SV1 `mining.set_difficulty` notification line.
-#[cfg(feature = "sv2")]
-fn set_difficulty_line(diff: f64) -> String {
-    RpcMessage::request(Value::Null, "mining.set_difficulty", json!([diff])).to_line()
 }
 
 impl Session {
@@ -543,7 +529,7 @@ impl Session {
                     writer,
                     extranonce1,
                     extranonce2_size,
-                    vec![set_difficulty_line(initial_diff)],
+                    vec![translate::set_difficulty_to_line(initial_diff)],
                     true,
                     Some(initial_diff),
                 )
@@ -699,7 +685,7 @@ fn spawn_sv2_translate_reader(
                 if let Some(t) = parse_set_target(&mut f) {
                     let diff = translate::difficulty_from_target(&t);
                     if session.set_translate_difficulty(generation, diff).await {
-                        session.send_or_stash(generation, set_difficulty_line(diff)).await;
+                        session.send_or_stash(generation, translate::set_difficulty_to_line(diff)).await;
                     }
                 }
             } else if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {

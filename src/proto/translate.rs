@@ -100,6 +100,15 @@ pub fn notify_to_line(notify: server_to_client::Notify<'static>) -> String {
     s
 }
 
+/// Serialize an SV1 `mining.set_difficulty` to a wire line (newline-terminated),
+/// via the SV1 library's `SetDifficulty` message.
+pub fn set_difficulty_to_line(value: f64) -> String {
+    let msg: json_rpc::Message = server_to_client::SetDifficulty { value }.into();
+    let mut s = serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into());
+    s.push('\n');
+    s
+}
+
 // ── SV1 → SV2 (SV2 miner ↔ SV1 pool) ────────────────────────────────
 
 /// Parse an SV1 `mining.notify` line into a typed notify (the prev-hash word
@@ -352,6 +361,90 @@ mod tests {
         }
     }
 
+    /// A segwit (BIP141) coinbase split reserving 8 extranonce bytes: version +
+    /// marker/flag + 1 input (scriptSig: push3 height + 8-byte extranonce) + 2
+    /// outputs (reward + witness commitment) + a 34-byte witness + locktime. The
+    /// extranonce sits between the returned prefix and suffix.
+    fn witness_coinbase() -> (Vec<u8>, Vec<u8>) {
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&1u32.to_le_bytes()); // version
+        prefix.push(0x00); // segwit marker
+        prefix.push(0x01); // segwit flag
+        prefix.push(0x01); // input count
+        prefix.extend_from_slice(&[0u8; 32]); // prevout hash
+        prefix.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
+        prefix.push(0x0c); // scriptSig length = 12 (push3+3 height + 8 extranonce)
+        prefix.extend_from_slice(&[0x03, 0x33, 0x33, 0x33]); // OP_PUSH3 + height
+
+        let mut suffix = Vec::new();
+        suffix.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
+        suffix.push(0x02); // output count
+        suffix.extend_from_slice(&5_000_000_000u64.to_le_bytes()); // out0 value
+        suffix.push(0x00); // out0 empty scriptPubKey
+        suffix.extend_from_slice(&0u64.to_le_bytes()); // out1 value (commitment)
+        suffix.push(0x26); // out1 scriptPubKey length = 38
+        suffix.extend_from_slice(&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]); // OP_RETURN witness commitment header
+        suffix.extend_from_slice(&[0u8; 32]); // commitment
+        suffix.push(0x01); // witness item count
+        suffix.push(0x20); // witness item length (32)
+        suffix.extend_from_slice(&[0u8; 32]); // witness reserved value
+        suffix.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        (prefix, suffix)
+    }
+
+    fn merkle_fold_direct(coinbase: &[u8], branch: &[[u8; 32]]) -> Vec<u8> {
+        let mut root = sha256d::Hash::hash(coinbase).to_byte_array().to_vec();
+        for node in branch {
+            let mut buf = root.clone();
+            buf.extend_from_slice(node);
+            root = sha256d::Hash::hash(&buf).to_byte_array().to_vec();
+        }
+        root
+    }
+
+    #[test]
+    fn segwit_job_strips_to_a_consistent_sv1_coinbase() {
+        // A real SV2 pool sends a segwit (witness) coinbase. The SV2→SV1 builder
+        // must strip BIP141 so a *direct-hashing* SV1 miner (which never
+        // deserializes) folds the SAME merkle root the SV2 pool computes from the
+        // witness coinbase's txid. A wrong strip diverges the two → rejected share.
+        let (wprefix, wsuffix) = witness_coinbase();
+        let branch = [[0x07u8; 32], [0x5cu8; 32]]; // multi-branch merkle path
+        let job = NewExtendedMiningJob {
+            channel_id: 1,
+            job_id: 1,
+            min_ntime: Sv2Option::new(None),
+            version: 0x2000_0000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255::new(branch.iter().map(|b| U256::from(*b)).collect()).unwrap(),
+            coinbase_tx_prefix: wprefix.clone().try_into().unwrap(),
+            coinbase_tx_suffix: wsuffix.clone().try_into().unwrap(),
+        };
+        let prev = SetNewPrevHash {
+            channel_id: 1,
+            job_id: 1,
+            prev_hash: U256::from([0x11u8; 32]),
+            min_ntime: 0x6500_0000,
+            nbits: 0x207f_ffff,
+        };
+        let notify = sv2_job_to_sv1_notify(prev, job, true).unwrap();
+
+        // SV1 miner side: assemble the (stripped) legacy coinbase + direct fold.
+        let coinb1 = Vec::<u8>::from(notify.coin_base1.clone());
+        let coinb2 = Vec::<u8>::from(notify.coin_base2.clone());
+        let extranonce = [0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00, 0x00, 0x01];
+        let mut legacy = coinb1.clone();
+        legacy.extend_from_slice(&extranonce);
+        legacy.extend_from_slice(&coinb2);
+        let miner_root = merkle_fold_direct(&legacy, &branch);
+
+        // SV2 pool side: txid via deserialize(witness) + the same fold.
+        let path: Vec<Vec<u8>> = branch.iter().map(|b| b.to_vec()).collect();
+        let pool_root = merkle_root_from_path(&wprefix, &wsuffix, &extranonce, &path)
+            .expect("witness coinbase must deserialize");
+        assert_eq!(miner_root, pool_root, "stripped SV1 coinbase folds to the witness txid merkle root");
+    }
+
     #[test]
     fn target_and_difficulty_round_trip() {
         for d in [0.5_f64, 1.0, 100.0, 8192.0, 1_000_000.0] {
@@ -506,6 +599,10 @@ mod tests {
         let line = "{\"method\":\"mining.set_difficulty\",\"params\":[1024.0]}";
         assert_eq!(set_difficulty_from_line(line), Some(1024.0));
         assert_eq!(set_difficulty_from_line("{\"method\":\"mining.notify\",\"params\":[]}"), None);
+        // Round-trips through the library-built line.
+        let l = set_difficulty_to_line(2048.0);
+        assert!(l.ends_with('\n'));
+        assert_eq!(set_difficulty_from_line(&l), Some(2048.0));
     }
 
     #[test]
@@ -538,8 +635,9 @@ mod tests {
     fn standard_job_builds_a_mineable_merkle_root() {
         // A Standard channel job carries a complete merkle_root the proxy folds
         // from coinb1 + extranonce1 + extranonce2 + coinb2. Confirm it matches an
-        // independent fold and that the resulting header can meet a target.
-        let notify = sample_notify(true, vec![]); // legacy_coinbase reserves 8 extranonce bytes
+        // independent fold (multi-branch) and that the resulting header can mine.
+        let branch = vec![MerkleNode(U256::from([0x07u8; 32])), MerkleNode(U256::from([0x5cu8; 32]))];
+        let notify = sample_notify(true, branch); // legacy_coinbase reserves 8 extranonce bytes
         let en1 = [0xAA, 0xBB, 0xCC, 0xDD];
         let en2 = [0x00, 0x00, 0x00, 0x01];
         let (job, prev) = sv1_notify_to_sv2_standard_job(&notify, 1, 1, &en1, &en2, true).unwrap();
@@ -549,8 +647,8 @@ mod tests {
         let coinb2 = Vec::<u8>::from(notify.coin_base2.clone());
         let mut full = en1.to_vec();
         full.extend_from_slice(&en2);
-        let empty: Vec<Vec<u8>> = vec![];
-        let expected = merkle_root_from_path(&coinb1, &coinb2, &full, &empty).unwrap();
+        let path: Vec<Vec<u8>> = notify.merkle_branch.iter().map(|m| m.0.inner_as_ref().to_vec()).collect();
+        let expected = merkle_root_from_path(&coinb1, &coinb2, &full, &path).unwrap();
         assert_eq!(job.merkle_root.inner_as_ref(), expected.as_slice(), "merkle root matches");
 
         let mut header = Vec::with_capacity(80);

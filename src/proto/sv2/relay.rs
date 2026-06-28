@@ -34,6 +34,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use stratum_core::bitcoin::hashes::hex::FromHex;
+
 use crate::proto::sv1::RpcMessage;
 use crate::proto::translate;
 
@@ -1017,15 +1019,6 @@ struct Sv1UpState {
     first_job_sent: bool,
 }
 
-fn hex_decode(s: &str) -> anyhow::Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        bail!("odd-length hex");
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
-        .collect()
-}
 
 /// Connect an SV1 pool and run `configure`(version-rolling) → `subscribe` →
 /// `authorize`, capturing the extranonce, the negotiated version mask, and the
@@ -1066,7 +1059,7 @@ async fn connect_sv1_upstream(target: &UpstreamTarget) -> anyhow::Result<Sv1UpCo
     Ok(Sv1UpConn {
         read,
         write: w,
-        extranonce1: hex_decode(&en1_hex)?,
+        extranonce1: Vec::<u8>::from_hex(&en1_hex).map_err(|e| anyhow!("bad extranonce hex: {e}"))?,
         extranonce2_size,
         version_mask,
         initial_diff,
