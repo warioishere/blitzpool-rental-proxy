@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-rental-proxy"
-version = "0.1.0-alpha"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
