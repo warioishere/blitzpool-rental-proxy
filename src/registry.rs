@@ -34,7 +34,12 @@ impl Registry {
     /// Add a session under its worker name (does not evict siblings sharing the
     /// name — they sum into one rig).
     pub async fn insert(&self, worker: String, session: AnySession) {
-        self.inner.lock().await.entry(worker).or_default().push(session);
+        self.inner
+            .lock()
+            .await
+            .entry(worker)
+            .or_default()
+            .push(session);
     }
 
     /// Remove only this exact session instance (a late disconnect must not evict
@@ -78,8 +83,7 @@ impl Registry {
     /// Status snapshot of every connected rig (one entry per worker name, summed
     /// across that rig's sessions).
     pub async fn snapshot(&self) -> Vec<SessionStatus> {
-        let groups: Vec<Vec<AnySession>> =
-            self.inner.lock().await.values().cloned().collect();
+        let groups: Vec<Vec<AnySession>> = self.inner.lock().await.values().cloned().collect();
         let mut out = Vec::with_capacity(groups.len());
         for sessions in groups {
             let mut parts = Vec::with_capacity(sessions.len());

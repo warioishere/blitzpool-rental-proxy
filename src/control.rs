@@ -31,7 +31,8 @@ pub fn accept_ratio(accepted: u64, submitted: u64) -> f64 {
 
 /// Whether the accept-ratio is low enough to flag (with a meaningful sample).
 pub fn accept_ratio_low(accepted: u64, submitted: u64) -> bool {
-    submitted >= ACCEPT_RATIO_MIN_SAMPLE && accept_ratio(accepted, submitted) < ACCEPT_RATIO_THRESHOLD
+    submitted >= ACCEPT_RATIO_MIN_SAMPLE
+        && accept_ratio(accepted, submitted) < ACCEPT_RATIO_THRESHOLD
 }
 
 /// API-facing snapshot of a live session.

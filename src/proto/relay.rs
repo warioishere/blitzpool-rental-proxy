@@ -36,6 +36,10 @@ use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 // Translation path (combo 3: SV1 miner ↔ SV2 buyer pool). Only compiled with the
 // SV2 stack; without it the relay is SV1 passthrough only.
 #[cfg(feature = "sv2")]
+use crate::proto::sv2::wire;
+#[cfg(feature = "sv2")]
+use crate::proto::translate;
+#[cfg(feature = "sv2")]
 use std::collections::VecDeque;
 #[cfg(feature = "sv2")]
 use stratum_core::bitcoin::hashes::hex::DisplayHex;
@@ -45,10 +49,6 @@ use stratum_core::mining_sv2 as mining;
 use stratum_core::parsers_sv2::{AnyMessage, Mining};
 #[cfg(feature = "sv2")]
 use stratum_core::sv1_api::{json_rpc as sv1_json, methods::client_to_server, utils::HexU32Be};
-#[cfg(feature = "sv2")]
-use crate::proto::sv2::wire;
-#[cfg(feature = "sv2")]
-use crate::proto::translate;
 
 /// Standard BIP320 version-rolling mask we advertise to the miner.
 const VERSION_ROLLING_MASK: &str = "1fffe000";
@@ -82,7 +82,9 @@ fn reconnect_hints() -> &'static Mutex<HashMap<String, (UpstreamTarget, Instant)
 
 /// Source IP (no port) of a `host:port` peer string — the reconnect-hint key.
 fn peer_ip(peer: &str) -> String {
-    peer.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_else(|| peer.to_string())
+    peer.rsplit_once(':')
+        .map(|(ip, _)| ip.to_string())
+        .unwrap_or_else(|| peer.to_string())
 }
 
 /// Worker name to send upstream: the upstream account (pool user / buyer) plus
@@ -90,7 +92,11 @@ fn peer_ip(peer: &str) -> String {
 /// hashrate is coming through the rental proxy. The account part (before the
 /// first `.`) stays a valid payout address; the tag rides on the worker suffix.
 pub(crate) fn upstream_worker(account: &str, miner_label: &str) -> String {
-    match miner_label.split_once('.').map(|(_, s)| s).filter(|s| !s.is_empty()) {
+    match miner_label
+        .split_once('.')
+        .map(|(_, s)| s)
+        .filter(|s| !s.is_empty())
+    {
         Some(suffix) => format!("{account}.{suffix}-bp-proxy"),
         None => format!("{account}.bp-proxy"),
     }
@@ -166,8 +172,13 @@ pub struct Session {
 
 impl Session {
     /// Switch this session's hashrate to `target` (a rental starts).
-    pub async fn switch_to(self: &Arc<Self>, order_id: String, target: UpstreamTarget) -> anyhow::Result<()> {
-        self.swap_upstream(target, Routing::Rented { order_id }).await
+    pub async fn switch_to(
+        self: &Arc<Self>,
+        order_id: String,
+        target: UpstreamTarget,
+    ) -> anyhow::Result<()> {
+        self.swap_upstream(target, Routing::Rented { order_id })
+            .await
     }
 
     /// Switch onto a rental order's pool with failover: try the order's primary
@@ -228,7 +239,11 @@ impl Session {
         self.inner.lock().await.routing = Routing::Rented { order_id };
     }
 
-    async fn swap_upstream(self: &Arc<Self>, target: UpstreamTarget, routing: Routing) -> anyhow::Result<()> {
+    async fn swap_upstream(
+        self: &Arc<Self>,
+        target: UpstreamTarget,
+        routing: Routing,
+    ) -> anyhow::Result<()> {
         // Hold the switch lock for the whole swap so concurrent switches run
         // strictly one after another (the last to acquire wins). Released on return.
         let _switch = self.switch.lock().await;
@@ -236,7 +251,12 @@ impl Session {
         let (configure, capable, generation, label) = {
             let mut i = self.inner.lock().await;
             i.generation_counter += 1;
-            (i.configure.clone(), i.extranonce_capable, i.generation_counter, i.label.clone())
+            (
+                i.configure.clone(),
+                i.extranonce_capable,
+                i.generation_counter,
+                i.label.clone(),
+            )
         };
         let user_identity = upstream_worker(&target.user, &label);
 
@@ -249,14 +269,18 @@ impl Session {
 
         // Swap atomically (the reader is spawned inside the lock so the new
         // generation is visible before it can forward — no first-job drop).
-        let (en1, en2) = self.install_raw(raw, generation, target.clone(), routing).await;
+        let (en1, en2) = self
+            .install_raw(raw, generation, target.clone(), routing)
+            .await;
 
         // Re-point the miner: new extranonce + the new upstream's initial
         // set_difficulty/notify (else it keeps the old target → every share
         // rejected as "Difficulty too low"). Modern ASICs honor set_extranonce
         // live; non-capable miners take the reconnect path at authorize instead.
         if capable {
-            let _ = self.to_miner.send(RpcMessage::set_extranonce(&en1, en2).to_line());
+            let _ = self
+                .to_miner
+                .send(RpcMessage::set_extranonce(&en1, en2).to_line());
         } else {
             warn!(upstream = %target.url, "miner not extranonce-capable; live switch may need a reconnect");
         }
@@ -396,14 +420,19 @@ impl Session {
             accepted_shares: i.accepted_shares,
             submitted_shares: i.submitted_shares,
             accept_ratio: crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
-            accept_ratio_low: crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares),
+            accept_ratio_low: crate::control::accept_ratio_low(
+                i.accepted_shares,
+                i.submitted_shares,
+            ),
             protocol: "sv1",
         }
     }
 }
 
 fn id_key(id: &Option<Value>) -> String {
-    id.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+    id.as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".into())
 }
 
 // ── upstream establishment (passthrough SV1 or translated SV2) ───────
@@ -451,13 +480,18 @@ async fn connect_raw(
 ) -> anyhow::Result<RawUpstream> {
     #[cfg(not(feature = "sv2"))]
     {
-        return Ok(RawUpstream::Sv1(connect_upstream(target, configure, user_identity).await?));
+        return Ok(RawUpstream::Sv1(
+            connect_upstream(target, configure, user_identity).await?,
+        ));
     }
     // Native first: try SV1 (reusing its socket on success); if the pool doesn't
     // answer as SV1, it's an SV2 buyer pool → open an Extended channel + translate.
     #[cfg(feature = "sv2")]
-    match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_upstream(target, configure, user_identity))
-        .await
+    match tokio::time::timeout(
+        translate::UPSTREAM_PROBE_TIMEOUT,
+        connect_upstream(target, configure, user_identity),
+    )
+    .await
     {
         Ok(Ok(conn)) => Ok(RawUpstream::Sv1(conn)),
         res => {
@@ -519,7 +553,16 @@ impl Session {
                 let (to_up, rx) = mpsc::unbounded_channel::<String>();
                 let writer = spawn_writer(conn.write, rx);
                 let reader = spawn_upstream_reader(self.clone(), generation, conn.reader);
-                (to_up, reader, writer, conn.extranonce1, conn.extranonce2_size, conn.prelude, false, None)
+                (
+                    to_up,
+                    reader,
+                    writer,
+                    conn.extranonce1,
+                    conn.extranonce2_size,
+                    conn.prelude,
+                    false,
+                    None,
+                )
             }
             #[cfg(feature = "sv2")]
             RawUpstream::Sv2(b) => {
@@ -637,7 +680,8 @@ fn spawn_sv2_translate_writer(
                     continue;
                 }
             };
-            let frame = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesExtended(sv2_submit)));
+            let frame =
+                wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesExtended(sv2_submit)));
             if write.write_frame(frame).await.is_err() {
                 break;
             }
@@ -700,7 +744,9 @@ fn spawn_sv2_translate_reader(
                 if let Some(t) = parse_set_target(&mut f) {
                     let diff = translate::difficulty_from_target(&t);
                     if session.set_translate_difficulty(generation, diff).await {
-                        session.send_or_stash(generation, translate::set_difficulty_to_line(diff)).await;
+                        session
+                            .send_or_stash(generation, translate::set_difficulty_to_line(diff))
+                            .await;
                     }
                 }
             } else if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {
@@ -741,7 +787,11 @@ async fn emit_translate_notify(
     clean: bool,
 ) {
     match translate::sv2_job_to_sv1_notify(prev, job, clean) {
-        Ok(notify) => session.send_or_stash(generation, translate::notify_to_line(notify)).await,
+        Ok(notify) => {
+            session
+                .send_or_stash(generation, translate::notify_to_line(notify))
+                .await
+        }
         Err(e) => warn!(error = %e, "sv2→sv1 notify translation failed"),
     }
 }
@@ -887,7 +937,11 @@ async fn connect_upstream(
         let _ = read_response(&mut reader, &mut prelude).await?; // discard upstream configure reply
     }
 
-    let sub = RpcMessage::request(json!(1), "mining.subscribe", json!(["stratum-rental-proxy/0.1"]));
+    let sub = RpcMessage::request(
+        json!(1),
+        "mining.subscribe",
+        json!(["stratum-rental-proxy/0.1"]),
+    );
     w.write_all(sub.to_line().as_bytes()).await?;
     let sub_resp = read_response(&mut reader, &mut prelude).await?;
     let (extranonce1, extranonce2_size) =
@@ -895,7 +949,11 @@ async fn connect_upstream(
 
     // Authorize with the worker we submit under (matches the submit's worker so
     // strict pools don't reject every share as "Worker mismatch").
-    let auth = RpcMessage::request(json!(2), "mining.authorize", json!([user_identity, target.password]));
+    let auth = RpcMessage::request(
+        json!(2),
+        "mining.authorize",
+        json!([user_identity, target.password]),
+    );
     w.write_all(auth.to_line().as_bytes()).await?;
     let _ = read_response(&mut reader, &mut prelude).await?; // authorize reply (value ignored for now)
 
@@ -952,7 +1010,10 @@ fn parse_subscribe_result(msg: &RpcMessage) -> Option<(String, u32)> {
     Some((en1, en2))
 }
 
-fn spawn_writer(mut half: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<String>) -> JoinHandle<()> {
+fn spawn_writer(
+    mut half: OwnedWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<String>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
             if half.write_all(line.as_bytes()).await.is_err() {
@@ -1389,7 +1450,9 @@ pub async fn handle_seller_miner(
 
     // Teardown: deregister + abort upstream + writer.
     let worker = session.worker_label().await;
-    registry.remove_if(&worker, &AnySession::Sv1(session.clone())).await;
+    registry
+        .remove_if(&worker, &AnySession::Sv1(session.clone()))
+        .await;
     supervisor.abort();
     {
         let i = session.inner.lock().await;
@@ -1490,7 +1553,9 @@ mod tests {
             password: "x".into(),
             authority_pubkey: None,
         };
-        let conn = connect_upstream(&target_a, None, &target_a.user).await.unwrap();
+        let conn = connect_upstream(&target_a, None, &target_a.user)
+            .await
+            .unwrap();
         let (to_miner, _to_miner_rx) = mpsc::unbounded_channel::<String>();
         let (to_up, up_rx) = mpsc::unbounded_channel::<String>();
         let up_writer = spawn_writer(conn.write, up_rx);
@@ -1564,7 +1629,9 @@ mod tests {
             s.write_all(b"{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"job1\"]}\n")
                 .await
                 .unwrap();
-            s.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n").await.unwrap();
+            s.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n")
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
 
@@ -1632,7 +1699,10 @@ mod sv2_translate_tests {
     }
 
     async fn pool_read_one(read: &mut PoolRead) -> anyhow::Result<wire::Sv2Frame> {
-        let frame = read.read_frame().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let frame = read
+            .read_frame()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         wire::into_sv2(frame).ok_or_else(|| anyhow::anyhow!("handshake frame"))
     }
 
@@ -1656,7 +1726,8 @@ mod sv2_translate_tests {
             let submits = submits.clone();
             tokio::spawn(async move {
                 let Ok(stream) =
-                    accept_noise_connection::<wire::Msg>(sock, keys.public(), keys.secret(), 3600).await
+                    accept_noise_connection::<wire::Msg>(sock, keys.public(), keys.secret(), 3600)
+                        .await
                 else {
                     return; // detection probe / plaintext → handshake fails
                 };
@@ -1680,14 +1751,21 @@ mod sv2_translate_tests {
                 break;
             }
         }
-        let ack = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(SetupConnectionSuccess {
-            used_version: 2,
-            flags: 0,
-        }));
-        write.write_frame(wire::frame_from(ack)).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let ack = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
+            SetupConnectionSuccess {
+                used_version: 2,
+                flags: 0,
+            },
+        ));
+        write
+            .write_frame(wire::frame_from(ack))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         while let Ok(mut f) = pool_read_one(read).await {
-            let Some(mt) = wire::msg_type(&f) else { continue };
+            let Some(mt) = wire::msg_type(&f) else {
+                continue;
+            };
             if mt == mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL {
                 let payload = f.payload();
                 let request_id = match Mining::try_from((mt, payload)) {
@@ -1721,7 +1799,9 @@ mod sv2_translate_tests {
                     coinbase_tx_suffix: B064K::try_from(cb_suffix).unwrap(),
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(Mining::NewExtendedMiningJob(job))))
+                    .write_frame(wire::frame_from(AnyMessage::Mining(
+                        Mining::NewExtendedMiningJob(job),
+                    )))
                     .await
                     .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 let prev = SetNewPrevHash {
@@ -1732,7 +1812,9 @@ mod sv2_translate_tests {
                     nbits: 0x1707_2cf6,
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(Mining::SetNewPrevHash(prev))))
+                    .write_frame(wire::frame_from(AnyMessage::Mining(
+                        Mining::SetNewPrevHash(prev),
+                    )))
                     .await
                     .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             } else if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED {
@@ -1746,7 +1828,9 @@ mod sv2_translate_tests {
                         new_shares_sum: 1,
                     };
                     write
-                        .write_frame(wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesSuccess(ok))))
+                        .write_frame(wire::frame_from(AnyMessage::Mining(
+                            Mining::SubmitSharesSuccess(ok),
+                        )))
                         .await
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 }
@@ -1778,7 +1862,12 @@ mod sv2_translate_tests {
         /// Read until a request/notification with `method`; return its params.
         async fn read_method(&mut self, method: &str) -> Value {
             loop {
-                let line = self.lines.next_line().await.unwrap().expect("miner stream open");
+                let line = self
+                    .lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("miner stream open");
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -1791,7 +1880,12 @@ mod sv2_translate_tests {
         /// Read until a response with `id`; return its `result`.
         async fn read_response(&mut self, id: i64) -> Value {
             loop {
-                let line = self.lines.next_line().await.unwrap().expect("miner stream open");
+                let line = self
+                    .lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("miner stream open");
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -1850,10 +1944,18 @@ mod sv2_translate_tests {
             .send(r#"{"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000"}]}"#)
             .await;
         let _ = miner.read_response(1).await;
-        miner.send(r#"{"id":2,"method":"mining.subscribe","params":["miner/1"]}"#).await;
+        miner
+            .send(r#"{"id":2,"method":"mining.subscribe","params":["miner/1"]}"#)
+            .await;
         let _ = miner.read_response(2).await;
-        miner.send(r#"{"id":4,"method":"mining.authorize","params":["bc1qSELLER.rig1","x"]}"#).await;
-        assert_eq!(miner.read_response(4).await, json!(true), "authorize accepted");
+        miner
+            .send(r#"{"id":4,"method":"mining.authorize","params":["bc1qSELLER.rig1","x"]}"#)
+            .await;
+        assert_eq!(
+            miner.read_response(4).await,
+            json!(true),
+            "authorize accepted"
+        );
 
         // Grab the live session and force a reconnect.
         let sess = loop {
@@ -1903,7 +2005,13 @@ mod sv2_translate_tests {
         let sv2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sv2_addr = sv2.local_addr().unwrap();
         let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<(u32, u32)>();
-        tokio::spawn(mock_sv2_pool(sv2, NoiseKeys::generate(), vec![0xCC; 4], 50, sub_tx));
+        tokio::spawn(mock_sv2_pool(
+            sv2,
+            NoiseKeys::generate(),
+            vec![0xCC; 4],
+            50,
+            sub_tx,
+        ));
 
         let registry = crate::registry::Registry::new();
         let db = crate::db::test_pool().await;
@@ -1947,12 +2055,22 @@ mod sv2_translate_tests {
             .send(r#"{"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000"}]}"#)
             .await;
         let _ = miner.read_response(1).await;
-        miner.send(r#"{"id":2,"method":"mining.subscribe","params":["miner/1"]}"#).await;
+        miner
+            .send(r#"{"id":2,"method":"mining.subscribe","params":["miner/1"]}"#)
+            .await;
         let _ = miner.read_response(2).await;
-        miner.send(r#"{"id":3,"method":"mining.extranonce.subscribe","params":[]}"#).await;
+        miner
+            .send(r#"{"id":3,"method":"mining.extranonce.subscribe","params":[]}"#)
+            .await;
         let _ = miner.read_response(3).await;
-        miner.send(r#"{"id":4,"method":"mining.authorize","params":["bc1qSELLER.rig1","x"]}"#).await;
-        assert_eq!(miner.read_response(4).await, json!(true), "authorize accepted");
+        miner
+            .send(r#"{"id":4,"method":"mining.authorize","params":["bc1qSELLER.rig1","x"]}"#)
+            .await;
+        assert_eq!(
+            miner.read_response(4).await,
+            json!(true),
+            "authorize accepted"
+        );
 
         // Rent: switch the session onto the SV2 buyer pool (translation).
         let sess = loop {
@@ -1968,22 +2086,36 @@ mod sv2_translate_tests {
             authority_pubkey: None,
         };
         let order = orders
-            .create("bc1qSELLER.rig1".into(), sv2_target.clone(), None, 0, 0.0, 0.0)
+            .create(
+                "bc1qSELLER.rig1".into(),
+                sv2_target.clone(),
+                None,
+                0,
+                0.0,
+                0.0,
+            )
             .await
             .unwrap();
         sess.switch_to(order.id.clone(), sv2_target).await.unwrap();
 
         // The miner is re-pointed: new extranonce (the SV2 channel prefix) + a
         // translated job built from the SV2 future job + prev-hash.
-        let set_en = tokio::time::timeout(Duration::from_secs(5), miner.read_method("mining.set_extranonce"))
-            .await
-            .expect("miner gets set_extranonce after the rental switch");
+        let set_en = tokio::time::timeout(
+            Duration::from_secs(5),
+            miner.read_method("mining.set_extranonce"),
+        )
+        .await
+        .expect("miner gets set_extranonce after the rental switch");
         let en1 = set_en.as_array().unwrap()[0].as_str().unwrap().to_string();
-        assert_eq!(en1, "cccccccc", "miner extranonce1 = the SV2 channel prefix");
+        assert_eq!(
+            en1, "cccccccc",
+            "miner extranonce1 = the SV2 channel prefix"
+        );
 
-        let notify = tokio::time::timeout(Duration::from_secs(5), miner.read_method("mining.notify"))
-            .await
-            .expect("miner receives a translated mining.notify");
+        let notify =
+            tokio::time::timeout(Duration::from_secs(5), miner.read_method("mining.notify"))
+                .await
+                .expect("miner receives a translated mining.notify");
         let job_id = notify.as_array().unwrap()[0].as_str().unwrap().to_string();
 
         // Submit a share: the proxy translates it to SubmitSharesExtended.

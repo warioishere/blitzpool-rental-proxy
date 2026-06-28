@@ -41,7 +41,7 @@ use crate::proto::translate;
 
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
 use stratum_apps::network_helpers::{accept_noise_connection, connect_with_noise};
-use stratum_core::binary_sv2::{Str0255, B032, U256, U32AsRef};
+use stratum_core::binary_sv2::{Str0255, U32AsRef, B032, U256};
 use stratum_core::common_messages_sv2 as common;
 use stratum_core::common_messages_sv2::{Protocol, SetupConnection, SetupConnectionSuccess};
 use stratum_core::mining_sv2 as mining;
@@ -53,9 +53,9 @@ use stratum_core::parsers_sv2::{AnyMessage, CommonMessages, Mining};
 
 use super::keys::NoiseKeys;
 use super::wire::{self, EitherFrame, Msg, Sv2Frame};
-use crate::proto::adapter::{DownstreamAdapter, ProxyContext};
 use crate::control::{AnySession, SessionStatus};
 use crate::orders::OrderStore;
+use crate::proto::adapter::{DownstreamAdapter, ProxyContext};
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 
 /// How long the proxy's Noise certificate (responder side) is valid, seconds.
@@ -141,7 +141,9 @@ fn setup_success(flags: u32) -> EitherFrame {
         used_version: SV2_VERSION,
         flags,
     };
-    wire::frame_from(AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s)))
+    wire::frame_from(AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
+        s,
+    )))
 }
 
 fn open_channel_upstream(spec: &OpenSpec, account: &str) -> anyhow::Result<EitherFrame> {
@@ -156,7 +158,8 @@ fn open_channel_upstream(spec: &OpenSpec, account: &str) -> anyhow::Result<Eithe
             request_id: *request_id,
             user_identity: user,
             nominal_hash_rate: *nominal_hash_rate,
-            max_target: U256::try_from(max_target.clone()).map_err(|_| anyhow!("bad max_target"))?,
+            max_target: U256::try_from(max_target.clone())
+                .map_err(|_| anyhow!("bad max_target"))?,
             min_extranonce_size: *min_extranonce_size,
         }),
         OpenSpec::Standard {
@@ -167,7 +170,8 @@ fn open_channel_upstream(spec: &OpenSpec, account: &str) -> anyhow::Result<Eithe
             request_id: U32AsRef::from(*request_id),
             user_identity: user,
             nominal_hash_rate: *nominal_hash_rate,
-            max_target: U256::try_from(max_target.clone()).map_err(|_| anyhow!("bad max_target"))?,
+            max_target: U256::try_from(max_target.clone())
+                .map_err(|_| anyhow!("bad max_target"))?,
         }),
     };
     Ok(wire::frame_from(AnyMessage::Mining(msg)))
@@ -227,7 +231,8 @@ fn set_target(channel_id: u32, target: Vec<u8>) -> anyhow::Result<EitherFrame> {
 fn open_channel_error(request_id: u32, reason: &str) -> anyhow::Result<EitherFrame> {
     let m = OpenMiningChannelError {
         request_id,
-        error_code: Str0255::try_from(reason.to_string()).map_err(|_| anyhow!("reason too long"))?,
+        error_code: Str0255::try_from(reason.to_string())
+            .map_err(|_| anyhow!("reason too long"))?,
     };
     Ok(wire::frame_from(AnyMessage::Mining(
         Mining::OpenMiningChannelError(m),
@@ -308,7 +313,9 @@ pub(crate) fn parse_submit_success(frame: &mut Sv2Frame) -> Option<(u32, u32)> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
-        Mining::SubmitSharesSuccess(s) => Some((s.last_sequence_number, s.new_submits_accepted_count)),
+        Mining::SubmitSharesSuccess(s) => {
+            Some((s.last_sequence_number, s.new_submits_accepted_count))
+        }
         _ => None,
     }
 }
@@ -323,7 +330,9 @@ pub(crate) fn parse_set_target(frame: &mut Sv2Frame) -> Option<Vec<u8>> {
 }
 
 /// Parse a `NewExtendedMiningJob` out of a frame (owned/`'static`).
-pub(crate) fn parse_new_extended_job(frame: &mut Sv2Frame) -> Option<mining::NewExtendedMiningJob<'static>> {
+pub(crate) fn parse_new_extended_job(
+    frame: &mut Sv2Frame,
+) -> Option<mining::NewExtendedMiningJob<'static>> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
@@ -333,7 +342,9 @@ pub(crate) fn parse_new_extended_job(frame: &mut Sv2Frame) -> Option<mining::New
 }
 
 /// Parse a `SetNewPrevHash` out of a frame (owned/`'static`).
-pub(crate) fn parse_set_new_prev_hash(frame: &mut Sv2Frame) -> Option<mining::SetNewPrevHash<'static>> {
+pub(crate) fn parse_set_new_prev_hash(
+    frame: &mut Sv2Frame,
+) -> Option<mining::SetNewPrevHash<'static>> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
@@ -370,7 +381,10 @@ fn difficulty_from_target(target: &[u8]) -> f64 {
 // ── transport helpers ───────────────────────────────────────────────
 
 async fn read_one(read: &mut Read) -> anyhow::Result<Sv2Frame> {
-    let frame = read.read_frame().await.map_err(|e| anyhow!("read frame: {e:?}"))?;
+    let frame = read
+        .read_frame()
+        .await
+        .map_err(|e| anyhow!("read frame: {e:?}"))?;
     wire::into_sv2(frame).ok_or_else(|| anyhow!("unexpected handshake frame post-handshake"))
 }
 
@@ -456,7 +470,11 @@ fn spawn_writer(mut half: Write, mut rx: mpsc::UnboundedReceiver<EitherFrame>) -
     })
 }
 
-fn spawn_upstream_reader(session: Arc<Sv2Session>, generation: u64, mut read: Read) -> JoinHandle<()> {
+fn spawn_upstream_reader(
+    session: Arc<Sv2Session>,
+    generation: u64,
+    mut read: Read,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok(frame) = read.read_frame().await {
             if let Some(sv2) = wire::into_sv2(frame) {
@@ -644,7 +662,8 @@ impl Sv2Session {
         order_id: String,
         target: UpstreamTarget,
     ) -> anyhow::Result<()> {
-        self.swap_upstream(target, Routing::Rented { order_id }).await
+        self.swap_upstream(target, Routing::Rented { order_id })
+            .await
     }
 
     /// Switch onto a rental order's pool with failover: try the order's primary
@@ -706,7 +725,12 @@ impl Sv2Session {
                 .iter()
                 .map(|c| (c.down_channel_id, c.spec.clone()))
                 .collect();
-            (specs, i.generation_counter, i.label.clone(), i.group_down_id)
+            (
+                specs,
+                i.generation_counter,
+                i.label.clone(),
+                i.group_down_id,
+            )
         };
         // user_identity on the new pool: its account + the miner's worker, tagged.
         let up_ident = crate::proto::relay::upstream_worker(&target.user, &label);
@@ -716,16 +740,22 @@ impl Sv2Session {
 
         // Native first: re-open on SV2; if the new pool doesn't answer as SV2,
         // it's an SV1 buyer pool → translate the switch onto it.
-        let (mut read, mut write, _flags) =
-            match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_setup(&target)).await {
-                Ok(Ok(c)) => c,
-                res => {
-                    if let Ok(Err(e)) = &res {
-                        debug!(url = %target.url, error = %e, "upstream not SV2; switching via SV1 translation");
-                    }
-                    return self.swap_to_sv1_translate(target, routing, generation, up_ident).await;
+        let (mut read, mut write, _flags) = match tokio::time::timeout(
+            translate::UPSTREAM_PROBE_TIMEOUT,
+            connect_setup(&target),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            res => {
+                if let Ok(Err(e)) = &res {
+                    debug!(url = %target.url, error = %e, "upstream not SV2; switching via SV1 translation");
                 }
-            };
+                return self
+                    .swap_to_sv1_translate(target, routing, generation, up_ident)
+                    .await;
+            }
+        };
         let mut new_channels = Vec::with_capacity(specs.len());
         let mut up_to_down = std::collections::HashMap::new();
         let mut repoint = Vec::with_capacity(specs.len());
@@ -852,7 +882,10 @@ impl Sv2Session {
         }
 
         let Some(up_cid) = wire::read_channel_id(&mut frame) else {
-            debug!(mt, "channel-scoped upstream frame too short for a channel_id; dropping");
+            debug!(
+                mt,
+                "channel-scoped upstream frame too short for a channel_id; dropping"
+            );
             return;
         };
 
@@ -967,7 +1000,10 @@ impl Sv2Session {
             accepted_shares: i.accepted_shares,
             submitted_shares: i.submitted_shares,
             accept_ratio: crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
-            accept_ratio_low: crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares),
+            accept_ratio_low: crate::control::accept_ratio_low(
+                i.accepted_shares,
+                i.submitted_shares,
+            ),
             protocol: "sv2",
         }
     }
@@ -1031,11 +1067,13 @@ struct Sv1UpState {
     first_job_sent: bool,
 }
 
-
 /// Connect an SV1 pool and run `configure`(version-rolling) → `subscribe` →
 /// `authorize`, capturing the extranonce, the negotiated version mask, and the
 /// handshake notifications (initial difficulty + first job).
-async fn connect_sv1_upstream(target: &UpstreamTarget, user_identity: &str) -> anyhow::Result<Sv1UpConn> {
+async fn connect_sv1_upstream(
+    target: &UpstreamTarget,
+    user_identity: &str,
+) -> anyhow::Result<Sv1UpConn> {
     let tcp = TcpStream::connect(&target.url)
         .await
         .with_context(|| format!("connect sv1 upstream {}", target.url))?;
@@ -1053,7 +1091,11 @@ async fn connect_sv1_upstream(target: &UpstreamTarget, user_identity: &str) -> a
     let cfg_resp = sv1_read_response(&mut read, &mut prelude).await?;
     let version_mask = parse_version_mask(&cfg_resp);
 
-    let sub = RpcMessage::request(json!(2), "mining.subscribe", json!(["stratum-rental-proxy/0.1"]));
+    let sub = RpcMessage::request(
+        json!(2),
+        "mining.subscribe",
+        json!(["stratum-rental-proxy/0.1"]),
+    );
     w.write_all(sub.to_line().as_bytes()).await?;
     let sub_resp = sv1_read_response(&mut read, &mut prelude).await?;
     let (en1_hex, extranonce2_size) =
@@ -1063,7 +1105,11 @@ async fn connect_sv1_upstream(target: &UpstreamTarget, user_identity: &str) -> a
     // `upstream_worker`). Strict pools (e.g. ckpool) reject submits whose worker
     // differs from the authorized one ("Worker mismatch"); the payout address is
     // the part before the first '.', so this keeps the payout correct.
-    let auth = RpcMessage::request(json!(3), "mining.authorize", json!([user_identity, target.password]));
+    let auth = RpcMessage::request(
+        json!(3),
+        "mining.authorize",
+        json!([user_identity, target.password]),
+    );
     w.write_all(auth.to_line().as_bytes()).await?;
     let _ = sv1_read_response(&mut read, &mut prelude).await?;
 
@@ -1075,7 +1121,8 @@ async fn connect_sv1_upstream(target: &UpstreamTarget, user_identity: &str) -> a
     Ok(Sv1UpConn {
         read,
         write: w,
-        extranonce1: Vec::<u8>::from_hex(&en1_hex).map_err(|e| anyhow!("bad extranonce hex: {e}"))?,
+        extranonce1: Vec::<u8>::from_hex(&en1_hex)
+            .map_err(|e| anyhow!("bad extranonce hex: {e}"))?,
         extranonce2_size,
         version_mask,
         initial_diff,
@@ -1172,7 +1219,14 @@ fn spawn_sv1_translate_writer(
                     s.submit_seq.insert(id, submit.sequence_number);
                     let (mask, user) = (s.version_mask, s.user_name.clone());
                     drop(s);
-                    translate::sv2_standard_submit_to_sv1(&submit, user, info.sv1_job_id, extranonce2, id, mask)
+                    translate::sv2_standard_submit_to_sv1(
+                        &submit,
+                        user,
+                        info.sv1_job_id,
+                        extranonce2,
+                        id,
+                        mask,
+                    )
                 }
                 _ => continue, // only shares cross to the SV1 pool
             };
@@ -1183,7 +1237,11 @@ fn spawn_sv1_translate_writer(
                     continue;
                 }
             };
-            if write.write_all(translate::submit_to_line(sv1).as_bytes()).await.is_err() {
+            if write
+                .write_all(translate::submit_to_line(sv1).as_bytes())
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -1245,7 +1303,13 @@ async fn handle_sv1_line(
             s.first_job_sent = true;
             let vra = s.version_mask.is_some();
             if s.extended {
-                s.job_map.insert(jid, Sv1JobInfo { sv1_job_id: notify.job_id.clone(), extranonce2: None });
+                s.job_map.insert(
+                    jid,
+                    Sv1JobInfo {
+                        sv1_job_id: notify.job_id.clone(),
+                        extranonce2: None,
+                    },
+                );
                 (jid, as_future, vra, true, Vec::new(), Vec::new())
             } else {
                 let mut e2 = vec![0u8; s.extranonce2_size as usize];
@@ -1254,22 +1318,42 @@ async fn handle_sv1_line(
                 let n = e2.len().min(counter.len());
                 e2[..n].copy_from_slice(&counter[..n]);
                 let en1 = s.extranonce1.clone();
-                s.job_map.insert(jid, Sv1JobInfo { sv1_job_id: notify.job_id.clone(), extranonce2: Some(e2.clone()) });
+                s.job_map.insert(
+                    jid,
+                    Sv1JobInfo {
+                        sv1_job_id: notify.job_id.clone(),
+                        extranonce2: Some(e2.clone()),
+                    },
+                );
                 (jid, as_future, vra, false, en1, e2)
             }
         };
         let built = if extended {
-            translate::sv1_notify_to_sv2_job(&notify, down_cid, sv2_job_id, as_future, vra)
-                .map(|(j, p)| (wire::frame_from(AnyMessage::Mining(Mining::NewExtendedMiningJob(j))), p))
+            translate::sv1_notify_to_sv2_job(&notify, down_cid, sv2_job_id, as_future, vra).map(
+                |(j, p)| {
+                    (
+                        wire::frame_from(AnyMessage::Mining(Mining::NewExtendedMiningJob(j))),
+                        p,
+                    )
+                },
+            )
         } else {
-            translate::sv1_notify_to_sv2_standard_job(&notify, down_cid, sv2_job_id, &en1, &en2, as_future)
-                .map(|(j, p)| (wire::frame_from(AnyMessage::Mining(Mining::NewMiningJob(j))), p))
+            translate::sv1_notify_to_sv2_standard_job(
+                &notify, down_cid, sv2_job_id, &en1, &en2, as_future,
+            )
+            .map(|(j, p)| {
+                (
+                    wire::frame_from(AnyMessage::Mining(Mining::NewMiningJob(j))),
+                    p,
+                )
+            })
         };
         match built {
             Ok((job_frame, prev)) => {
                 session.send_translate_frame(generation, job_frame).await;
                 if let Some(p) = prev {
-                    let prev_frame = wire::frame_from(AnyMessage::Mining(Mining::SetNewPrevHash(p)));
+                    let prev_frame =
+                        wire::frame_from(AnyMessage::Mining(Mining::SetNewPrevHash(p)));
                     session.send_translate_frame(generation, prev_frame).await;
                 }
             }
@@ -1335,7 +1419,11 @@ impl Sv2Session {
         if generation != i.active.generation {
             return;
         }
-        if let Some(c) = i.channels.iter_mut().find(|c| c.down_channel_id == down_cid) {
+        if let Some(c) = i
+            .channels
+            .iter_mut()
+            .find(|c| c.down_channel_id == down_cid)
+        {
             c.difficulty = diff;
         }
     }
@@ -1394,16 +1482,19 @@ impl Sv2Session {
         let up_ident = crate::proto::relay::upstream_worker(&target.user, worker);
         // Native first: try SV2 (reusing its socket on success); if the pool
         // doesn't answer as SV2, it's an SV1 buyer pool → translate.
-        match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_setup(&target)).await {
+        match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_setup(&target)).await
+        {
             Ok(Ok((read, write, _flags))) => {
-                self.install_sv2_initial(read, write, spec, up_ident, target, routing).await
+                self.install_sv2_initial(read, write, spec, up_ident, target, routing)
+                    .await
             }
             res => {
                 if let Ok(Err(e)) = &res {
                     debug!(url = %target.url, error = %e, "upstream not SV2; trying SV1 translation");
                 }
                 let conn = connect_sv1_upstream(&target, &up_ident).await?;
-                self.install_sv1_translate_initial(conn, spec, up_ident, target, routing).await
+                self.install_sv1_translate_initial(conn, spec, up_ident, target, routing)
+                    .await
             }
         }
     }
@@ -1557,8 +1648,14 @@ impl Sv2Session {
         let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
         let abandoned: Vec<u32> = {
             let mut i = self.inner.lock().await;
-            let reader =
-                spawn_sv1_translate_reader(self.clone(), generation, conn.read, state, down_cid, conn.prelude);
+            let reader = spawn_sv1_translate_reader(
+                self.clone(),
+                generation,
+                conn.read,
+                state,
+                down_cid,
+                conn.prelude,
+            );
             i.active.reader.abort();
             i.active.writer.abort();
             i.active = ActiveUpstream {
@@ -1583,7 +1680,9 @@ impl Sv2Session {
         };
         // Re-point the miner: new extranonce prefix + target; the reader streams
         // the new pool's first job after.
-        let _ = self.to_miner.send(set_extranonce_prefix(down_cid, extranonce1)?);
+        let _ = self
+            .to_miner
+            .send(set_extranonce_prefix(down_cid, extranonce1)?);
         let _ = self.to_miner.send(set_target(down_cid, initial_target)?);
         for request_id in abandoned {
             if let Ok(f) = open_channel_error(request_id, "upstream switched; please reopen") {
@@ -1605,10 +1704,9 @@ pub async fn handle_seller_miner_sv2(
     keys: NoiseKeys,
 ) -> anyhow::Result<()> {
     let _ = miner.set_nodelay(true);
-    let stream =
-        accept_noise_connection::<Msg>(miner, keys.public(), keys.secret(), CERT_VALIDITY)
-            .await
-            .map_err(|e| anyhow!("downstream noise accept: {e:?}"))?;
+    let stream = accept_noise_connection::<Msg>(miner, keys.public(), keys.secret(), CERT_VALIDITY)
+        .await
+        .map_err(|e| anyhow!("downstream noise accept: {e:?}"))?;
     let (mut down_read, down_write) = stream.into_split();
 
     // 1. Miner SetupConnection.
@@ -1718,7 +1816,9 @@ pub async fn handle_seller_miner_sv2(
     // Supervisor: reconnect / fail over to the fallback if the upstream drops.
     let supervisor = tokio::spawn(supervise_upstream(session.clone(), died_rx));
     match &active_order {
-        Some(o) => info!(%peer, %worker, upstream = %open_target.url, order = %o.id, "sv2 relay established (rented)"),
+        Some(o) => {
+            info!(%peer, %worker, upstream = %open_target.url, order = %o.id, "sv2 relay established (rented)")
+        }
         None => info!(%peer, %worker, upstream = %open_target.url, "sv2 relay established (idle)"),
     }
 
@@ -1784,7 +1884,9 @@ pub async fn handle_seller_miner_sv2(
                 {
                     let mut i = session.inner.lock().await;
                     let Some(down_cid) = wire::read_channel_id(&mut frame) else {
-                        debug!("channel-scoped downstream frame too short for a channel_id; dropping");
+                        debug!(
+                            "channel-scoped downstream frame too short for a channel_id; dropping"
+                        );
                         continue;
                     };
                     if let Some(up_cid) = i.up_for_down(down_cid) {
@@ -1797,7 +1899,10 @@ pub async fn handle_seller_miner_sv2(
                         wire::rewrite_channel_id(&mut frame, up_cid);
                         let _ = i.active.to_up.send(frame.into());
                     } else {
-                        debug!(down_cid, "no channel mapping for downstream frame; dropping");
+                        debug!(
+                            down_cid,
+                            "no channel mapping for downstream frame; dropping"
+                        );
                     }
                 }
                 if let Some(order_id) = submit_order {
@@ -1943,7 +2048,13 @@ mod tests {
             let (read, write) = stream.into_split();
             let cid = base_cid + n * 10;
             n += 1;
-            tokio::spawn(serve_pool_conn(read, write, prefix.clone(), cid, submits.clone()));
+            tokio::spawn(serve_pool_conn(
+                read,
+                write,
+                prefix.clone(),
+                cid,
+                submits.clone(),
+            ));
         }
     }
 
@@ -1963,7 +2074,10 @@ mod tests {
                 break;
             }
         }
-        write.write_frame(setup_success(0)).await.map_err(|e| anyhow!("{e:?}"))?;
+        write
+            .write_frame(setup_success(0))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
 
         // Steady loop: opens → success (distinct cid), submits → report + success.
         let mut next_cid = base_cid;
@@ -2049,7 +2163,10 @@ mod tests {
         }
 
         async fn setup(&mut self) -> anyhow::Result<()> {
-            self.write.write_frame(setup_connection()).await.map_err(|e| anyhow!("{e:?}"))?;
+            self.write
+                .write_frame(setup_connection())
+                .await
+                .map_err(|e| anyhow!("{e:?}"))?;
             loop {
                 let f = read_one(&mut self.read).await?;
                 if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS) {
@@ -2093,7 +2210,9 @@ mod tests {
                 maximum_target: U256::from([0xffu8; 32]),
             };
             self.write
-                .write_frame(wire::frame_from(AnyMessage::Mining(Mining::UpdateChannel(m))))
+                .write_frame(wire::frame_from(AnyMessage::Mining(Mining::UpdateChannel(
+                    m,
+                ))))
                 .await
                 .map_err(|e| anyhow!("{e:?}"))
         }
@@ -2190,8 +2309,20 @@ mod tests {
         let b_addr = pool_b.local_addr().unwrap();
         let (a_tx, mut a_rx) = mpsc::unbounded_channel::<u32>();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
-        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+        tokio::spawn(mock_pool(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+        tokio::spawn(mock_pool(
+            pool_b,
+            vec![0xBB; 8],
+            99,
+            NoiseKeys::generate(),
+            b_tx,
+        ));
 
         // Proxy: default upstream = pool A.
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2204,7 +2335,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -2224,7 +2360,10 @@ mod tests {
             .read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS)
             .await
             .unwrap();
-        assert_eq!(ok_cid, down_cid, "success remapped to downstream channel id");
+        assert_eq!(
+            ok_cid, down_cid,
+            "success remapped to downstream channel id"
+        );
 
         // Rent: switch the session to pool B.
         let sess = loop {
@@ -2244,12 +2383,19 @@ mod tests {
 
         // Submit again → now reaches pool B; the proxy rewrote down cid → pool B's 99.
         miner.submit(down_cid, 1).await.unwrap();
-        assert_eq!(b_rx.recv().await.unwrap(), 99, "submit reached pool B (cid remapped)");
+        assert_eq!(
+            b_rx.recv().await.unwrap(),
+            99,
+            "submit reached pool B (cid remapped)"
+        );
         let ok_cid2 = miner
             .read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS)
             .await
             .unwrap();
-        assert_eq!(ok_cid2, down_cid, "success still on stable downstream channel id");
+        assert_eq!(
+            ok_cid2, down_cid,
+            "success still on stable downstream channel id"
+        );
     }
 
     #[tokio::test]
@@ -2261,8 +2407,20 @@ mod tests {
         let b_addr = pool_b.local_addr().unwrap();
         let (a_tx, mut a_rx) = mpsc::unbounded_channel::<u32>();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
-        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+        tokio::spawn(mock_pool(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+        tokio::spawn(mock_pool(
+            pool_b,
+            vec![0xBB; 8],
+            99,
+            NoiseKeys::generate(),
+            b_tx,
+        ));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2274,7 +2432,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -2320,7 +2483,11 @@ mod tests {
         miner.submit(cid2, 1).await.unwrap();
         let mut seen_b = vec![b_rx.recv().await.unwrap(), b_rx.recv().await.unwrap()];
         seen_b.sort_unstable();
-        assert_eq!(seen_b, vec![99, 100], "both channels' submits reached pool B");
+        assert_eq!(
+            seen_b,
+            vec![99, 100],
+            "both channels' submits reached pool B"
+        );
     }
 
     #[tokio::test]
@@ -2342,7 +2509,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&addr.to_string(), "acct")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&addr.to_string(), "acct"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -2356,7 +2528,11 @@ mod tests {
         miner.update_channel(down_cid).await.unwrap();
         let (cid, target) = miner.read_until_set_target().await.unwrap();
         assert_eq!(cid, down_cid, "SetTarget remapped to downstream channel id");
-        assert_eq!(target, vec![0x33u8; 32], "pool's new target reached the miner");
+        assert_eq!(
+            target,
+            vec![0x33u8; 32],
+            "pool's new target reached the miner"
+        );
     }
 
     /// A pool that completes the first channel open, then signals + ignores any
@@ -2379,7 +2555,10 @@ mod tests {
                 break;
             }
         }
-        write.write_frame(setup_success(0)).await.map_err(|e| anyhow!("{e:?}"))?;
+        write
+            .write_frame(setup_success(0))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
         let mut opened = 0;
         while let Ok(mut f) = read_one(&mut read).await {
             let is_open = matches!(
@@ -2429,7 +2608,13 @@ mod tests {
         let (ign_tx, mut ign_rx) = mpsc::unbounded_channel::<u32>();
         let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
         tokio::spawn(mock_pool_stall(pool_a, NoiseKeys::generate(), ign_tx));
-        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+        tokio::spawn(mock_pool(
+            pool_b,
+            vec![0xBB; 8],
+            99,
+            NoiseKeys::generate(),
+            b_tx,
+        ));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2441,7 +2626,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -2452,7 +2642,11 @@ mod tests {
         miner.setup().await.unwrap();
         let _ = miner.open("bc1qSELLER.rig1", 1).await.unwrap(); // first channel ok
         miner.send_open("bc1qSELLER.rig1", 2).await.unwrap(); // second → stalls upstream
-        assert_eq!(ign_rx.recv().await.unwrap(), 2, "pool A received + stalled open #2");
+        assert_eq!(
+            ign_rx.recv().await.unwrap(),
+            2,
+            "pool A received + stalled open #2"
+        );
 
         // Switch to pool B: the in-flight open #2 must be abandoned with an error.
         let sess = loop {
@@ -2481,8 +2675,20 @@ mod tests {
         let b_addr = pool_b.local_addr().unwrap();
         let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
-        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+        tokio::spawn(mock_pool(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+        tokio::spawn(mock_pool(
+            pool_b,
+            vec![0xBB; 8],
+            99,
+            NoiseKeys::generate(),
+            b_tx,
+        ));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2495,7 +2701,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: orders.clone(),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -2547,8 +2758,14 @@ mod tests {
             orders.flush().await;
             credited = orders.get(&order.id).await.unwrap();
         }
-        assert_eq!(credited.accepted_shares, k, "accepted shares credited to order");
-        assert_eq!(credited.submitted_shares, k, "submitted shares tracked on order");
+        assert_eq!(
+            credited.accepted_shares, k,
+            "accepted shares credited to order"
+        );
+        assert_eq!(
+            credited.submitted_shares, k,
+            "submitted shares tracked on order"
+        );
         let expected = difficulty_from_target(&diff1_target()) * k as f64;
         assert!(credited.delivered_work > 0.0, "delivered work measured");
         assert!(
@@ -2643,7 +2860,10 @@ mod tests {
                 break;
             }
         }
-        write.write_frame(setup_success(0)).await.map_err(|e| anyhow!("{e:?}"))?;
+        write
+            .write_frame(setup_success(0))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
         while let Ok(mut f) = read_one(&mut read).await {
             if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
                 let Some(open) = parse_miner_open(&mut f) else {
@@ -2706,7 +2926,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&addr.to_string(), "acct")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&addr.to_string(), "acct"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -2716,9 +2941,19 @@ mod tests {
         let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
         miner.setup().await.unwrap();
         let (down_cid, down_group, prefix) = miner.open_full("bc1qSELLER.rig1", 1).await.unwrap();
-        assert_eq!(prefix, vec![0xCC; 8], "miner sees the pool's extranonce prefix");
-        assert_ne!(down_group, 0, "Extended OpenSuccess carries a remapped group id");
-        assert_ne!(down_group, down_cid, "group id is distinct from the channel id");
+        assert_eq!(
+            prefix,
+            vec![0xCC; 8],
+            "miner sees the pool's extranonce prefix"
+        );
+        assert_ne!(
+            down_group, 0,
+            "Extended OpenSuccess carries a remapped group id"
+        );
+        assert_ne!(
+            down_group, down_cid,
+            "group id is distinct from the channel id"
+        );
 
         // The group-broadcast job must reach the miner, remapped to the
         // downstream group id (before the fix it was dropped as unmapped).
@@ -2738,7 +2973,10 @@ mod tests {
     /// A pool that completes the channel open (cid 99) and then *immediately*
     /// broadcasts a `NewExtendedMiningJob` addressed to that channel — like a real
     /// pool bootstrapping a freshly opened channel right after its OpenSuccess.
-    async fn mock_pool_job_after_open(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
+    async fn mock_pool_job_after_open(
+        listener: TcpListener,
+        keys: NoiseKeys,
+    ) -> anyhow::Result<()> {
         let (sock, _) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
         let stream =
@@ -2752,7 +2990,10 @@ mod tests {
                 break;
             }
         }
-        write.write_frame(setup_success(0)).await.map_err(|e| anyhow!("{e:?}"))?;
+        write
+            .write_frame(setup_success(0))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
         while let Ok(mut f) = read_one(&mut read).await {
             if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
                 let Some(open) = parse_miner_open(&mut f) else {
@@ -2806,7 +3047,13 @@ mod tests {
         let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let b_addr = pool_b.local_addr().unwrap();
         let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
         tokio::spawn(mock_pool_job_after_open(pool_b, NoiseKeys::generate()));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2819,7 +3066,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -2873,7 +3125,10 @@ mod tests {
                 break;
             }
         }
-        write.write_frame(setup_success(0)).await.map_err(|e| anyhow!("{e:?}"))?;
+        write
+            .write_frame(setup_success(0))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
         while let Ok(mut f) = read_one(&mut read).await {
             if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
                 let Some(open) = parse_miner_open(&mut f) else {
@@ -2911,9 +3166,21 @@ mod tests {
         let fb_addr = pool_fb.local_addr().unwrap();
         let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
         let (fb_tx, _fb_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
+        tokio::spawn(mock_pool(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
         tokio::spawn(mock_pool_drop_once(primary, NoiseKeys::generate()));
-        tokio::spawn(mock_pool(pool_fb, vec![0xCC; 8], 55, NoiseKeys::generate(), fb_tx));
+        tokio::spawn(mock_pool(
+            pool_fb,
+            vec![0xCC; 8],
+            55,
+            NoiseKeys::generate(),
+            fb_tx,
+        ));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2926,7 +3193,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -2960,14 +3232,19 @@ mod tests {
         // The miner is eventually re-pointed to the fallback (0xCC) by the supervisor.
         let mut got_fb = false;
         for _ in 0..50 {
-            let res = tokio::time::timeout(Duration::from_secs(5), miner.read_until_set_extranonce()).await;
+            let res =
+                tokio::time::timeout(Duration::from_secs(5), miner.read_until_set_extranonce())
+                    .await;
             let Ok(Ok((_, prefix))) = res else { break };
             if prefix == vec![0xCC; 8] {
                 got_fb = true;
                 break;
             }
         }
-        assert!(got_fb, "supervisor failed the dropped primary over to the fallback pool");
+        assert!(
+            got_fb,
+            "supervisor failed the dropped primary over to the fallback pool"
+        );
     }
 
     #[tokio::test]
@@ -2983,8 +3260,20 @@ mod tests {
         let fb_addr = pool_fb.local_addr().unwrap();
         let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
         let (fb_tx, _fb_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
-        tokio::spawn(mock_pool(pool_fb, vec![0xCC; 8], 55, NoiseKeys::generate(), fb_tx));
+        tokio::spawn(mock_pool(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+        tokio::spawn(mock_pool(
+            pool_fb,
+            vec![0xCC; 8],
+            55,
+            NoiseKeys::generate(),
+            fb_tx,
+        ));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -2997,7 +3286,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -3030,7 +3324,11 @@ mod tests {
 
         // Landed on the fallback: the miner is re-pointed to FB's extranonce prefix.
         let (re_cid, prefix) = miner.read_until_set_extranonce().await.unwrap();
-        assert_eq!(prefix, vec![0xCC; 8], "primary down → switched to fallback pool");
+        assert_eq!(
+            prefix,
+            vec![0xCC; 8],
+            "primary down → switched to fallback pool"
+        );
         assert_eq!(re_cid, down_cid);
         assert_eq!(sess.status().await.routing, "rented");
     }
@@ -3057,7 +3355,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&pool_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&pool_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -3113,8 +3416,20 @@ mod tests {
         let b_addr = pool_b.local_addr().unwrap();
         let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
         let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
-        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+        tokio::spawn(mock_pool(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+        tokio::spawn(mock_pool(
+            pool_b,
+            vec![0xBB; 8],
+            99,
+            NoiseKeys::generate(),
+            b_tx,
+        ));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3127,10 +3442,22 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         // Rental already active for this worker, targeting buyer pool B.
         let order = orders
-            .create("bc1qSELLER.rig1".into(), ext_target(&b_addr.to_string(), "acctB"), None, 0, 0.0, 0.0)
+            .create(
+                "bc1qSELLER.rig1".into(),
+                ext_target(&b_addr.to_string(), "acctB"),
+                None,
+                0,
+                0.0,
+                0.0,
+            )
             .await
             .unwrap();
 
@@ -3143,7 +3470,11 @@ mod tests {
         let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
         miner.setup().await.unwrap();
         let (_down_cid, prefix) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
-        assert_eq!(prefix, vec![0xBB; 8], "first channel opened directly on the buyer pool");
+        assert_eq!(
+            prefix,
+            vec![0xBB; 8],
+            "first channel opened directly on the buyer pool"
+        );
 
         let st = loop {
             if let Some(s) = registry.aggregated_status("bc1qSELLER.rig1").await {
@@ -3169,9 +3500,27 @@ mod tests {
         let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel::<u32>();
         let (c_tx, mut c_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
-        tokio::spawn(mock_pool(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
-        tokio::spawn(mock_pool(pool_c, vec![0xCC; 8], 199, NoiseKeys::generate(), c_tx));
+        tokio::spawn(mock_pool(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+        tokio::spawn(mock_pool(
+            pool_b,
+            vec![0xBB; 8],
+            99,
+            NoiseKeys::generate(),
+            b_tx,
+        ));
+        tokio::spawn(mock_pool(
+            pool_c,
+            vec![0xCC; 8],
+            199,
+            NoiseKeys::generate(),
+            c_tx,
+        ));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3183,7 +3532,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -3218,11 +3572,17 @@ mod tests {
         miner.submit(down_cid, 0).await.unwrap();
         match st.order_id.as_deref() {
             Some("oB") => {
-                assert_eq!(st.upstream_url, b_url, "active matches the winning order (B)");
+                assert_eq!(
+                    st.upstream_url, b_url,
+                    "active matches the winning order (B)"
+                );
                 assert_eq!(b_rx.recv().await.unwrap(), 99, "submit reached pool B");
             }
             Some("oC") => {
-                assert_eq!(st.upstream_url, c_url, "active matches the winning order (C)");
+                assert_eq!(
+                    st.upstream_url, c_url,
+                    "active matches the winning order (C)"
+                );
                 assert_eq!(c_rx.recv().await.unwrap(), 199, "submit reached pool C");
             }
             other => panic!("unexpected winning order {other:?}"),
@@ -3239,8 +3599,20 @@ mod tests {
         let b_addr = pool_b.local_addr().unwrap();
         let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
         let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool_multi(pool_a, vec![0xAA; 8], 7, NoiseKeys::generate(), a_tx));
-        tokio::spawn(mock_pool_multi(pool_b, vec![0xBB; 8], 99, NoiseKeys::generate(), b_tx));
+        tokio::spawn(mock_pool_multi(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+        tokio::spawn(mock_pool_multi(
+            pool_b,
+            vec![0xBB; 8],
+            99,
+            NoiseKeys::generate(),
+            b_tx,
+        ));
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
@@ -3252,7 +3624,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.farm", ext_target(&a_addr.to_string(), "acctA")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.farm",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             loop {
@@ -3369,7 +3746,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&sv1_addr.to_string(), "acctSV1")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&sv1_addr.to_string(), "acctSV1"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -3380,10 +3762,11 @@ mod tests {
         miner.setup().await.unwrap();
         // The SV2-native connect probe to the SV1 pool must time out before the
         // proxy falls back to SV1 translation, so allow generous time for open().
-        let (down_cid, prefix) = tokio::time::timeout(Duration::from_secs(15), miner.open("bc1qSELLER.rig1", 1))
-            .await
-            .expect("open did not complete")
-            .unwrap();
+        let (down_cid, prefix) =
+            tokio::time::timeout(Duration::from_secs(15), miner.open("bc1qSELLER.rig1", 1))
+                .await
+                .expect("open did not complete")
+                .unwrap();
         assert_eq!(
             prefix,
             vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe],
@@ -3418,7 +3801,12 @@ mod tests {
         assert_eq!(ok_cid, down_cid, "translated share accepted end to end");
 
         // Accounting credited the delivered work.
-        let sess = registry.get_all("bc1qSELLER.rig1").await.into_iter().next().unwrap();
+        let sess = registry
+            .get_all("bc1qSELLER.rig1")
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
         let st = sess.status().await;
         assert!(st.accepted_shares >= 1, "accepted share counted");
         assert!(st.delivered_work > 0.0, "delivered work credited");
@@ -3431,7 +3819,13 @@ mod tests {
         let sv2_idle = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let idle_addr = sv2_idle.local_addr().unwrap();
         let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<u32>();
-        tokio::spawn(mock_pool(sv2_idle, vec![0xAA; 8], 7, NoiseKeys::generate(), idle_tx));
+        tokio::spawn(mock_pool(
+            sv2_idle,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            idle_tx,
+        ));
         let sv1_buyer = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let buyer_addr = sv1_buyer.local_addr().unwrap();
         let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<()>();
@@ -3448,7 +3842,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&idle_addr.to_string(), "acctIdle")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&idle_addr.to_string(), "acctIdle"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -3475,16 +3874,24 @@ mod tests {
         sess.switch_to(order.id.clone(), buyer).await.unwrap();
 
         // Re-pointed to the SV1 extranonce, then a translated job + accepted share.
-        let (re_cid, re_prefix) = tokio::time::timeout(Duration::from_secs(15), miner.read_until_set_extranonce())
-            .await
-            .expect("set_extranonce after the translated switch")
-            .unwrap();
+        let (re_cid, re_prefix) =
+            tokio::time::timeout(Duration::from_secs(15), miner.read_until_set_extranonce())
+                .await
+                .expect("set_extranonce after the translated switch")
+                .unwrap();
         assert_eq!(re_cid, down_cid, "channel id stable across the switch");
-        assert_eq!(re_prefix, vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe], "now on the SV1 extranonce1");
-        let _ = tokio::time::timeout(Duration::from_secs(5), miner.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB))
-            .await
-            .expect("translated job after switch")
-            .unwrap();
+        assert_eq!(
+            re_prefix,
+            vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe],
+            "now on the SV1 extranonce1"
+        );
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            miner.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+        )
+        .await
+        .expect("translated job after switch")
+        .unwrap();
         miner.submit(down_cid, 0).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), sub_rx.recv())
             .await
@@ -3611,7 +4018,9 @@ mod tests {
         };
         miner
             .write
-            .write_frame(wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesExtended(m))))
+            .write_frame(wire::frame_from(AnyMessage::Mining(
+                Mining::SubmitSharesExtended(m),
+            )))
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
         Ok(())
@@ -3641,8 +4050,13 @@ mod tests {
                 return;
             };
             let accepted = accepted.clone();
-            let (en1, coinb1, coinb2, pv_str, share_target) =
-                (en1.clone(), coinb1.clone(), coinb2.clone(), pv_str.clone(), share_target.clone());
+            let (en1, coinb1, coinb2, pv_str, share_target) = (
+                en1.clone(),
+                coinb1.clone(),
+                coinb2.clone(),
+                pv_str.clone(),
+                share_target.clone(),
+            );
             tokio::spawn(async move {
                 let (r, mut w) = sock.into_split();
                 let mut lines = BufReader::new(r).lines();
@@ -3672,12 +4086,21 @@ mod tests {
                             let _ = w.write_all(format!("{notify}\n").as_bytes()).await;
                         }
                         "mining.authorize" => {
-                            authorized_worker = v.get("params").and_then(|p| p.as_array()).and_then(|a| a.first()).and_then(|x| x.as_str()).map(String::from);
+                            authorized_worker = v
+                                .get("params")
+                                .and_then(|p| p.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|x| x.as_str())
+                                .map(String::from);
                             let reply = json!({"id": id, "result": true, "error": Value::Null});
                             let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
                         }
                         "mining.submit" => {
-                            let p = v.get("params").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+                            let p = v
+                                .get("params")
+                                .and_then(|p| p.as_array())
+                                .cloned()
+                                .unwrap_or_default();
                             let submit_worker = p.first().and_then(|x| x.as_str());
                             if authorized_worker.as_deref() != submit_worker {
                                 let _ = accepted.send(false);
@@ -3685,28 +4108,48 @@ mod tests {
                                 let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
                                 continue;
                             }
-                            let en2 = p.get(2).and_then(|x| x.as_str()).map(hex_bytes).unwrap_or_default();
-                            let ntime = p.get(3).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
-                            let nonce = p.get(4).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
-                            let vbits = p.get(5).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+                            let en2 = p
+                                .get(2)
+                                .and_then(|x| x.as_str())
+                                .map(hex_bytes)
+                                .unwrap_or_default();
+                            let ntime = p
+                                .get(3)
+                                .and_then(|x| x.as_str())
+                                .and_then(|s| u32::from_str_radix(s, 16).ok())
+                                .unwrap_or(0);
+                            let nonce = p
+                                .get(4)
+                                .and_then(|x| x.as_str())
+                                .and_then(|s| u32::from_str_radix(s, 16).ok())
+                                .unwrap_or(0);
+                            let vbits = p
+                                .get(5)
+                                .and_then(|x| x.as_str())
+                                .and_then(|s| u32::from_str_radix(s, 16).ok())
+                                .unwrap_or(0);
 
                             let mut full_en = en1.clone();
                             full_en.extend_from_slice(&en2);
                             let empty: Vec<Vec<u8>> = vec![];
-                            let valid = match merkle_root_from_path(&coinb1, &coinb2, &full_en, &empty) {
-                                Some(root) => {
-                                    let version = (VERSION & !MASK) | (vbits & MASK);
-                                    let mut header = Vec::with_capacity(80);
-                                    header.extend_from_slice(&version.to_le_bytes());
-                                    header.extend_from_slice(&pv);
-                                    header.extend_from_slice(&root);
-                                    header.extend_from_slice(&ntime.to_le_bytes());
-                                    header.extend_from_slice(&NBITS.to_le_bytes());
-                                    header.extend_from_slice(&nonce.to_le_bytes());
-                                    le_leq(&sha256d::Hash::hash(&header).to_byte_array(), &share_target)
-                                }
-                                None => false,
-                            };
+                            let valid =
+                                match merkle_root_from_path(&coinb1, &coinb2, &full_en, &empty) {
+                                    Some(root) => {
+                                        let version = (VERSION & !MASK) | (vbits & MASK);
+                                        let mut header = Vec::with_capacity(80);
+                                        header.extend_from_slice(&version.to_le_bytes());
+                                        header.extend_from_slice(&pv);
+                                        header.extend_from_slice(&root);
+                                        header.extend_from_slice(&ntime.to_le_bytes());
+                                        header.extend_from_slice(&NBITS.to_le_bytes());
+                                        header.extend_from_slice(&nonce.to_le_bytes());
+                                        le_leq(
+                                            &sha256d::Hash::hash(&header).to_byte_array(),
+                                            &share_target,
+                                        )
+                                    }
+                                    None => false,
+                                };
                             let _ = accepted.send(valid);
                             let reply = json!({"id": id, "result": valid, "error": Value::Null});
                             let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
@@ -3722,7 +4165,10 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
     fn hex_bytes(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).filter_map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+        (0..s.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+            .collect()
     }
 
     #[tokio::test]
@@ -3746,7 +4192,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&sv1_addr.to_string(), "acctSV1")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&sv1_addr.to_string(), "acctSV1"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -3755,37 +4206,54 @@ mod tests {
 
         let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
         miner.setup().await.unwrap();
-        let (down_cid, prefix) = tokio::time::timeout(Duration::from_secs(15), miner.open("bc1qSELLER.rig1", 1))
-            .await
-            .expect("open did not complete")
-            .unwrap();
-        assert_eq!(prefix, vec![0xaa, 0xbb, 0xcc, 0xdd], "channel prefix = SV1 extranonce1");
+        let (down_cid, prefix) =
+            tokio::time::timeout(Duration::from_secs(15), miner.open("bc1qSELLER.rig1", 1))
+                .await
+                .expect("open did not complete")
+                .unwrap();
+        assert_eq!(
+            prefix,
+            vec![0xaa, 0xbb, 0xcc, 0xdd],
+            "channel prefix = SV1 extranonce1"
+        );
 
         // Mine a real share against the translated job and submit it.
-        tokio::time::timeout(Duration::from_secs(20), mine_and_submit_one(&mut miner, down_cid, prefix))
-            .await
-            .expect("mining timed out")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            mine_and_submit_one(&mut miner, down_cid, prefix),
+        )
+        .await
+        .expect("mining timed out")
+        .unwrap();
 
         // The pool validated the reconstructed header and accepted it.
         let valid = tokio::time::timeout(Duration::from_secs(5), acc_rx.recv())
             .await
             .expect("pool never saw the share")
             .unwrap();
-        assert!(valid, "the translated share must be cryptographically valid at the SV1 pool");
+        assert!(
+            valid,
+            "the translated share must be cryptographically valid at the SV1 pool"
+        );
 
         // The acceptance is translated back to the miner.
-        let ok_cid = tokio::time::timeout(Duration::from_secs(5), miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS))
-            .await
-            .expect("share result timed out")
-            .unwrap();
+        let ok_cid = tokio::time::timeout(
+            Duration::from_secs(5),
+            miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS),
+        )
+        .await
+        .expect("share result timed out")
+        .unwrap();
         assert_eq!(ok_cid, down_cid);
     }
 
     /// A header-only Standard miner: it gets a finished `merkle_root` in
     /// `NewMiningJob` (the proxy built the coinbase), grinds a nonce against the
     /// header, and submits `SubmitSharesStandard` (no extranonce).
-    async fn mine_standard_and_submit_one(miner: &mut MockMiner, channel_id: u32) -> anyhow::Result<()> {
+    async fn mine_standard_and_submit_one(
+        miner: &mut MockMiner,
+        channel_id: u32,
+    ) -> anyhow::Result<()> {
         use stratum_core::bitcoin::hashes::{sha256d, Hash};
 
         let mut job: Option<([u8; 32], u32, u32)> = None; // merkle_root, version, job_id
@@ -3850,7 +4318,9 @@ mod tests {
         };
         miner
             .write
-            .write_frame(wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesStandard(m))))
+            .write_frame(wire::frame_from(AnyMessage::Mining(
+                Mining::SubmitSharesStandard(m),
+            )))
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
         Ok(())
@@ -3877,7 +4347,12 @@ mod tests {
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
-        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&sv1_addr.to_string(), "acctSV1")).await;
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.rig1",
+            ext_target(&sv1_addr.to_string(), "acctSV1"),
+        )
+        .await;
         let keys = NoiseKeys::generate();
         tokio::spawn(async move {
             let (sock, peer) = proxy.accept().await.unwrap();
@@ -3893,13 +4368,20 @@ mod tests {
             nominal_hash_rate: 1.0e12,
             max_target: U256::from([0xffu8; 32]),
         });
-        miner.write.write_frame(wire::frame_from(AnyMessage::Mining(open))).await.unwrap();
+        miner
+            .write
+            .write_frame(wire::frame_from(AnyMessage::Mining(open)))
+            .await
+            .unwrap();
 
         let (channel_id, prefix) = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let mut f = read_one(&mut miner.read).await?;
-                if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS) {
-                    let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad open success"))?;
+                if wire::msg_type(&f)
+                    == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
+                {
+                    let info =
+                        parse_open_success(&mut f).ok_or_else(|| anyhow!("bad open success"))?;
                     return Ok::<_, anyhow::Error>((info.up_channel_id, info.extranonce_prefix));
                 }
             }
@@ -3907,23 +4389,36 @@ mod tests {
         .await
         .expect("standard open did not complete")
         .unwrap();
-        assert_eq!(prefix, vec![0xaa, 0xbb, 0xcc, 0xdd], "standard channel prefix = SV1 extranonce1");
+        assert_eq!(
+            prefix,
+            vec![0xaa, 0xbb, 0xcc, 0xdd],
+            "standard channel prefix = SV1 extranonce1"
+        );
 
-        tokio::time::timeout(Duration::from_secs(20), mine_standard_and_submit_one(&mut miner, channel_id))
-            .await
-            .expect("mining timed out")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            mine_standard_and_submit_one(&mut miner, channel_id),
+        )
+        .await
+        .expect("mining timed out")
+        .unwrap();
 
         let valid = tokio::time::timeout(Duration::from_secs(5), acc_rx.recv())
             .await
             .expect("pool never saw the share")
             .unwrap();
-        assert!(valid, "the translated standard share must be cryptographically valid at the SV1 pool");
+        assert!(
+            valid,
+            "the translated standard share must be cryptographically valid at the SV1 pool"
+        );
 
-        let ok_cid = tokio::time::timeout(Duration::from_secs(5), miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS))
-            .await
-            .expect("share result timed out")
-            .unwrap();
+        let ok_cid = tokio::time::timeout(
+            Duration::from_secs(5),
+            miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS),
+        )
+        .await
+        .expect("share result timed out")
+        .unwrap();
         assert_eq!(ok_cid, channel_id);
     }
 }

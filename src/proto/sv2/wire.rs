@@ -65,7 +65,9 @@ pub fn read_channel_id(frame: &mut Sv2Frame) -> Option<u32> {
     if payload.len() < 4 {
         return None;
     }
-    Some(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
+    Some(u32::from_le_bytes([
+        payload[0], payload[1], payload[2], payload[3],
+    ]))
 }
 
 /// Channel-scoped mining messages carry `channel_id` as their first field, so

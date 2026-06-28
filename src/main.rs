@@ -48,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
     let registry = registry::Registry::new();
 
     // Persistent state (rigs + orders) in one embedded SQLite file.
-    let db_url = std::env::var("RENTAL_PROXY_DB")
-        .unwrap_or_else(|_| "sqlite://rental-proxy.db".into());
+    let db_url =
+        std::env::var("RENTAL_PROXY_DB").unwrap_or_else(|_| "sqlite://rental-proxy.db".into());
     let pool = db::connect(&db_url)
         .await
         .with_context(|| format!("open state DB {db_url}"))?;

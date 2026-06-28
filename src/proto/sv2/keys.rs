@@ -43,7 +43,9 @@ impl NoiseKeys {
         if let Ok(s) = std::env::var("RENTAL_PROXY_SV2_SECRET") {
             match Self::from_secret_str(&s) {
                 Ok(k) => return k,
-                Err(e) => tracing::warn!(error = %e, "RENTAL_PROXY_SV2_SECRET invalid; trying file/ephemeral"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "RENTAL_PROXY_SV2_SECRET invalid; trying file/ephemeral")
+                }
             }
         }
         if let Ok(path) = std::env::var("RENTAL_PROXY_SV2_SECRET_FILE") {
@@ -70,7 +72,9 @@ impl NoiseKeys {
                         tracing::info!(public_key = %k.public_b58(), path, "loaded persisted SV2 Noise authority key");
                         return k;
                     }
-                    Err(e) => tracing::warn!(error = %e, path, "persisted SV2 secret invalid; regenerating"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, path, "persisted SV2 secret invalid; regenerating")
+                    }
                 }
             }
         }
@@ -85,7 +89,9 @@ impl NoiseKeys {
                 }
                 tracing::info!(public_key = %k.public_b58(), path, "generated + persisted SV2 Noise authority key");
             }
-            Err(e) => tracing::warn!(error = %e, path, "could not persist SV2 secret; key is ephemeral this run"),
+            Err(e) => {
+                tracing::warn!(error = %e, path, "could not persist SV2 secret; key is ephemeral this run")
+            }
         }
         k
     }
@@ -157,7 +163,10 @@ mod tests {
         // First call generates + writes; second call must reload the same key.
         let first = NoiseKeys::from_file_or_create(p).public_b58();
         let second = NoiseKeys::from_file_or_create(p).public_b58();
-        assert_eq!(first, second, "persisted key must be stable across restarts");
+        assert_eq!(
+            first, second,
+            "persisted key must be stable across restarts"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

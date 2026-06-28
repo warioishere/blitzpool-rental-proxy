@@ -150,7 +150,9 @@ pub fn set_difficulty_from_line(line: &str) -> Option<f64> {
     if n.method != "mining.set_difficulty" {
         return None;
     }
-    server_to_client::SetDifficulty::try_from(n).ok().map(|d| d.value)
+    server_to_client::SetDifficulty::try_from(n)
+        .ok()
+        .map(|d| d.value)
 }
 
 /// Build an SV2 `NewExtendedMiningJob` (and, for a block change, the activating
@@ -168,7 +170,10 @@ pub fn sv1_notify_to_sv2_job(
     job_id: u32,
     as_future: bool,
     version_rolling_allowed: bool,
-) -> Result<(NewExtendedMiningJob<'static>, Option<SetNewPrevHash<'static>>)> {
+) -> Result<(
+    NewExtendedMiningJob<'static>,
+    Option<SetNewPrevHash<'static>>,
+)> {
     let merkle_path: Vec<U256<'static>> = notify
         .merkle_branch
         .iter()
@@ -265,7 +270,8 @@ pub fn sv2_standard_submit_to_sv1(
     id: u64,
     version_rolling_mask: Option<u32>,
 ) -> Result<client_to_server::Submit<'static>> {
-    let extra_nonce2 = Extranonce::try_from(extranonce2).map_err(|e| anyhow!("extranonce: {e:?}"))?;
+    let extra_nonce2 =
+        Extranonce::try_from(extranonce2).map_err(|e| anyhow!("extranonce: {e:?}"))?;
     Ok(client_to_server::Submit {
         user_name,
         job_id,
@@ -327,7 +333,10 @@ mod tests {
         // scriptSig = OP_PUSH3 + 3 height bytes + extranonce region.
         let script_prefix = [0x03u8, 0x33, 0x33, 0x33];
         let script_sig_len = script_prefix.len() + en_len;
-        assert!(script_sig_len <= 100, "coinbase scriptSig must be ≤ 100 bytes");
+        assert!(
+            script_sig_len <= 100,
+            "coinbase scriptSig must be ≤ 100 bytes"
+        );
 
         let mut coinb1 = Vec::new();
         coinb1.extend_from_slice(&1u32.to_le_bytes()); // version
@@ -336,7 +345,7 @@ mod tests {
         coinb1.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
         coinb1.push(script_sig_len as u8); // scriptSig length (varint < 0xfd)
         coinb1.extend_from_slice(&script_prefix); // scriptSig up to the extranonce
-        // ── extranonce goes here ──
+                                                  // ── extranonce goes here ──
         let mut coinb2 = Vec::new();
         coinb2.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
         coinb2.push(0x01); // output count
@@ -346,7 +355,10 @@ mod tests {
         (coinb1, coinb2)
     }
 
-    fn sample_notify(clean: bool, merkle_branch: Vec<MerkleNode<'static>>) -> server_to_client::Notify<'static> {
+    fn sample_notify(
+        clean: bool,
+        merkle_branch: Vec<MerkleNode<'static>>,
+    ) -> server_to_client::Notify<'static> {
         let (coinb1, coinb2) = legacy_coinbase(8);
         server_to_client::Notify {
             job_id: "abc123".to_string(),
@@ -442,7 +454,10 @@ mod tests {
         let path: Vec<Vec<u8>> = branch.iter().map(|b| b.to_vec()).collect();
         let pool_root = merkle_root_from_path(&wprefix, &wsuffix, &extranonce, &path)
             .expect("witness coinbase must deserialize");
-        assert_eq!(miner_root, pool_root, "stripped SV1 coinbase folds to the witness txid merkle root");
+        assert_eq!(
+            miner_root, pool_root,
+            "stripped SV1 coinbase folds to the witness txid merkle root"
+        );
     }
 
     #[test]
@@ -451,7 +466,10 @@ mod tests {
             let t = target_from_difficulty(d);
             let back = difficulty_from_target(&t);
             let rel = (back - d).abs() / d;
-            assert!(rel < 1e-3, "difficulty {d} round-tripped to {back} (rel {rel})");
+            assert!(
+                rel < 1e-3,
+                "difficulty {d} round-tripped to {back} (rel {rel})"
+            );
         }
         // Non-positive difficulty → max target (no threshold).
         assert_eq!(target_from_difficulty(0.0), [0xff; 32]);
@@ -469,14 +487,20 @@ mod tests {
 
         let back = sv2_job_to_sv1_notify(prev, job, true).unwrap();
 
-        assert_eq!(String::from(back.prev_hash.clone()), String::from(original.prev_hash.clone()));
+        assert_eq!(
+            String::from(back.prev_hash.clone()),
+            String::from(original.prev_hash.clone())
+        );
         assert_eq!(back.coin_base1, original.coin_base1);
         assert_eq!(back.coin_base2, original.coin_base2);
         assert_eq!(back.version, original.version);
         assert_eq!(back.bits, original.bits);
         assert_eq!(back.time, original.time);
         assert_eq!(back.merkle_branch.len(), 1);
-        assert_eq!(back.merkle_branch[0].0.inner_as_ref(), original.merkle_branch[0].0.inner_as_ref());
+        assert_eq!(
+            back.merkle_branch[0].0.inner_as_ref(),
+            original.merkle_branch[0].0.inner_as_ref()
+        );
         assert!(back.clean_jobs);
     }
 
@@ -501,16 +525,29 @@ mod tests {
             nonce: 0xdead_beef,
             ntime: 0x6500_0001,
             version: 0x2123_4000,
-            extranonce: U256::from([0u8; 32]).inner_as_ref()[..4].to_vec().try_into().unwrap(),
+            extranonce: U256::from([0u8; 32]).inner_as_ref()[..4]
+                .to_vec()
+                .try_into()
+                .unwrap(),
         };
-        let s = sv2_submit_to_sv1(&submit, "bc1qX.rig".into(), "job7".into(), 11, Some(VERSION_ROLLING_MASK)).unwrap();
+        let s = sv2_submit_to_sv1(
+            &submit,
+            "bc1qX.rig".into(),
+            "job7".into(),
+            11,
+            Some(VERSION_ROLLING_MASK),
+        )
+        .unwrap();
         assert_eq!(s.user_name, "bc1qX.rig");
         assert_eq!(s.job_id, "job7");
         assert_eq!(s.nonce.0, 0xdead_beef);
         assert_eq!(s.time.0, 0x6500_0001);
         assert_eq!(s.id, 11);
         // version_bits = version & mask (the rolled bits only).
-        assert_eq!(s.version_bits.unwrap().0, 0x2123_4000 & VERSION_ROLLING_MASK);
+        assert_eq!(
+            s.version_bits.unwrap().0,
+            0x2123_4000 & VERSION_ROLLING_MASK
+        );
         assert_eq!(s.extra_nonce2.0.inner_as_ref().len(), 4);
 
         // No mask negotiated → no version_bits.
@@ -562,7 +599,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found, "no nonce met the easy target — header reconstruction is wrong");
+        assert!(
+            found,
+            "no nonce met the easy target — header reconstruction is wrong"
+        );
     }
 
     /// `a ≤ b` for two 32-byte little-endian numbers.
@@ -582,7 +622,10 @@ mod tests {
         assert!(line.ends_with('\n'), "wire line must be newline-terminated");
         let parsed = notify_from_line(&line).expect("round-trips back to a notify");
         assert_eq!(parsed.job_id, original.job_id);
-        assert_eq!(String::from(parsed.prev_hash), String::from(original.prev_hash.clone()));
+        assert_eq!(
+            String::from(parsed.prev_hash),
+            String::from(original.prev_hash.clone())
+        );
         assert_eq!(parsed.coin_base1, original.coin_base1);
         assert_eq!(parsed.coin_base2, original.coin_base2);
         assert_eq!(parsed.version, original.version);
@@ -598,7 +641,10 @@ mod tests {
     fn set_difficulty_line_parses() {
         let line = "{\"method\":\"mining.set_difficulty\",\"params\":[1024.0]}";
         assert_eq!(set_difficulty_from_line(line), Some(1024.0));
-        assert_eq!(set_difficulty_from_line("{\"method\":\"mining.notify\",\"params\":[]}"), None);
+        assert_eq!(
+            set_difficulty_from_line("{\"method\":\"mining.notify\",\"params\":[]}"),
+            None
+        );
         // Round-trips through the library-built line.
         let l = set_difficulty_to_line(2048.0);
         assert!(l.ends_with('\n'));
@@ -616,7 +662,14 @@ mod tests {
             version: 0x2000_0000,
             extranonce: vec![1u8, 2, 3, 4].try_into().unwrap(),
         };
-        let s = sv2_submit_to_sv1(&submit, "acct.rig".into(), "9".into(), 5, Some(VERSION_ROLLING_MASK)).unwrap();
+        let s = sv2_submit_to_sv1(
+            &submit,
+            "acct.rig".into(),
+            "9".into(),
+            5,
+            Some(VERSION_ROLLING_MASK),
+        )
+        .unwrap();
         let line = submit_to_line(s);
         assert!(line.ends_with('\n'));
         let msg: json_rpc::Message = serde_json::from_str(line.trim()).unwrap();
@@ -636,7 +689,10 @@ mod tests {
         // A Standard channel job carries a complete merkle_root the proxy folds
         // from coinb1 + extranonce1 + extranonce2 + coinb2. Confirm it matches an
         // independent fold (multi-branch) and that the resulting header can mine.
-        let branch = vec![MerkleNode(U256::from([0x07u8; 32])), MerkleNode(U256::from([0x5cu8; 32]))];
+        let branch = vec![
+            MerkleNode(U256::from([0x07u8; 32])),
+            MerkleNode(U256::from([0x5cu8; 32])),
+        ];
         let notify = sample_notify(true, branch); // legacy_coinbase reserves 8 extranonce bytes
         let en1 = [0xAA, 0xBB, 0xCC, 0xDD];
         let en2 = [0x00, 0x00, 0x00, 0x01];
@@ -647,9 +703,17 @@ mod tests {
         let coinb2 = Vec::<u8>::from(notify.coin_base2.clone());
         let mut full = en1.to_vec();
         full.extend_from_slice(&en2);
-        let path: Vec<Vec<u8>> = notify.merkle_branch.iter().map(|m| m.0.inner_as_ref().to_vec()).collect();
+        let path: Vec<Vec<u8>> = notify
+            .merkle_branch
+            .iter()
+            .map(|m| m.0.inner_as_ref().to_vec())
+            .collect();
         let expected = merkle_root_from_path(&coinb1, &coinb2, &full, &path).unwrap();
-        assert_eq!(job.merkle_root.inner_as_ref(), expected.as_slice(), "merkle root matches");
+        assert_eq!(
+            job.merkle_root.inner_as_ref(),
+            expected.as_slice(),
+            "merkle root matches"
+        );
 
         let mut header = Vec::with_capacity(80);
         header.extend_from_slice(&job.version.to_le_bytes());
@@ -682,12 +746,26 @@ mod tests {
             ntime: 0x6500_0002,
             version: 0x2000_2000,
         };
-        let s = sv2_standard_submit_to_sv1(&submit, "w.rig".into(), "jid".into(), vec![9, 8, 7, 6], 4, Some(VERSION_ROLLING_MASK))
-            .unwrap();
+        let s = sv2_standard_submit_to_sv1(
+            &submit,
+            "w.rig".into(),
+            "jid".into(),
+            vec![9, 8, 7, 6],
+            4,
+            Some(VERSION_ROLLING_MASK),
+        )
+        .unwrap();
         assert_eq!(s.job_id, "jid");
         assert_eq!(s.nonce.0, 0xabcd_1234);
         assert_eq!(s.time.0, 0x6500_0002);
-        assert_eq!(s.extra_nonce2.0.inner_as_ref(), &[9, 8, 7, 6], "extranonce2 is the proxy-chosen one");
-        assert_eq!(s.version_bits.unwrap().0, 0x2000_2000 & VERSION_ROLLING_MASK);
+        assert_eq!(
+            s.extra_nonce2.0.inner_as_ref(),
+            &[9, 8, 7, 6],
+            "extranonce2 is the proxy-chosen one"
+        );
+        assert_eq!(
+            s.version_bits.unwrap().0,
+            0x2000_2000 & VERSION_ROLLING_MASK
+        );
     }
 }

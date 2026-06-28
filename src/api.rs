@@ -55,7 +55,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sellers/{worker}/rentable", post(set_rentable))
         .route("/api/orders", get(list_orders).post(create_order))
         .route("/api/orders/{id}", get(get_order).delete(cancel_order))
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
 
     Router::new()
         .route("/api/health", get(health))
@@ -337,7 +340,10 @@ async fn list_orders(State(s): State<AppState>) -> Json<Value> {
     Json(json!({ "orders": orders }))
 }
 
-async fn get_order(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+async fn get_order(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
     match s.orders.get(&id).await {
         Some(o) => Ok(Json(order_json(&o))),
         None => Err((StatusCode::NOT_FOUND, "order not found".into())),
@@ -387,7 +393,10 @@ async fn create_order(
     // this a past `until_ms` would slip through the max-duration check (negative
     // duration is not "too long") and create an already-expired order.
     if req.until_ms != 0 && req.until_ms <= now_ms() {
-        return Err((StatusCode::CONFLICT, "end time must be in the future".into()));
+        return Err((
+            StatusCode::CONFLICT,
+            "end time must be in the future".into(),
+        ));
     }
     // A registered rig that's toggled off can't be rented; and a rig with a
     // max-duration cap rejects open-ended or too-long rentals.
@@ -413,7 +422,11 @@ async fn create_order(
         }
     }
     // An already-rented rig (live order) can't be rented again.
-    if s.orders.active_for_worker(&req.worker, now_ms()).await.is_some() {
+    if s.orders
+        .active_for_worker(&req.worker, now_ms())
+        .await
+        .is_some()
+    {
         return Err((StatusCode::CONFLICT, "rig is already rented".into()));
     }
     // Only rigs currently delivering hashrate can be rented (summed across all
@@ -484,7 +497,10 @@ async fn create_order(
 }
 
 /// Cancel an order; if the worker is connected, revert it to its default pool.
-async fn cancel_order(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+async fn cancel_order(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
     let order = s
         .orders
         .cancel(&id)
@@ -492,7 +508,9 @@ async fn cancel_order(State(s): State<AppState>, Path(id): Path<String>) -> Resu
         .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
     let sessions = s.registry.get_all(&order.worker).await;
     let reverted = reconnect_all(&sessions);
-    Ok(Json(json!({"ok": true, "reverted": reverted, "of": sessions.len()})))
+    Ok(Json(
+        json!({"ok": true, "reverted": reverted, "of": sessions.len()}),
+    ))
 }
 
 #[cfg(test)]
@@ -646,7 +664,10 @@ mod tests {
             .await
             .unwrap();
         let v = body_json(resp).await;
-        assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["default_pool"]["url"], "poolA:3333");
+        assert_eq!(
+            v["sellers"]["bc1qSELLER.rig1"]["default_pool"]["url"],
+            "poolA:3333"
+        );
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["advertised_ths"], 220.0);
         // A registered rig with no connected miner is offline (not delivering).
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["online"], false);
@@ -694,7 +715,10 @@ mod tests {
                 r#"{"url":"poolA:3333","user":"acct","max_rental_secs":3600}"#,
             ))
             .unwrap();
-        assert_eq!(app.clone().oneshot(set).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.clone().oneshot(set).await.unwrap().status(),
+            StatusCode::OK
+        );
 
         // 5h rental on a 1h-capped rig → rejected as too long (before the
         // offline check, so no connected miner needed).
@@ -774,7 +798,10 @@ mod tests {
         let mut sellers = HashMap::new();
         sellers.insert(
             "bc1qA.on".to_string(),
-            Rig { advertised_ths: 100.0, ..Default::default() },
+            Rig {
+                advertised_ths: 100.0,
+                ..Default::default()
+            },
         );
         sellers.insert("bc1qA.off".to_string(), Rig::default());
 
@@ -852,7 +879,10 @@ mod tests {
             .header("authorization", BEARER)
             .body(Body::from(r#"{"rentable":false}"#))
             .unwrap();
-        assert_eq!(app.clone().oneshot(off).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.clone().oneshot(off).await.unwrap().status(),
+            StatusCode::OK
+        );
 
         // Creating a rental for a non-rentable rig is rejected by the rentable gate.
         let order = Request::post("/api/orders")
@@ -874,7 +904,10 @@ mod tests {
             .header("authorization", BEARER)
             .body(Body::from(r#"{"rentable":true}"#))
             .unwrap();
-        assert_eq!(app.clone().oneshot(on).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.clone().oneshot(on).await.unwrap().status(),
+            StatusCode::OK
+        );
 
         let order2 = Request::post("/api/orders")
             .header("content-type", "application/json")

@@ -134,9 +134,13 @@ impl SellerStore {
     /// Toggle whether a rig is listed for rent. Returns `false` if no such rig.
     pub async fn set_rentable(&self, worker: &str, rentable: bool) -> sqlx::Result<bool> {
         let flag = rentable as i64;
-        let res = sqlx::query!("UPDATE rigs SET rentable = ? WHERE worker = ?", flag, worker)
-            .execute(&self.pool)
-            .await?;
+        let res = sqlx::query!(
+            "UPDATE rigs SET rentable = ? WHERE worker = ?",
+            flag,
+            worker
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() > 0)
     }
 

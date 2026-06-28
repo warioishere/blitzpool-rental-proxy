@@ -262,7 +262,9 @@ impl OrderStore {
         .execute(&self.pool)
         .await
         .map_err(|e| {
-            if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+            if e.as_database_error()
+                .is_some_and(|d| d.is_unique_violation())
+            {
                 CreateOrderError::AlreadyActive
             } else {
                 CreateOrderError::Db(e)
@@ -466,7 +468,10 @@ mod tests {
     #[tokio::test]
     async fn create_active_for_worker_and_cancel() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let o = store.create("w1".into(), target(), None,0, 0.0, 0.0).await.unwrap(); // open-ended
+        let o = store
+            .create("w1".into(), target(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap(); // open-ended
         assert!(store.active_for_worker("w1", now_ms()).await.is_some());
         let cancelled = store.cancel(&o.id).await.unwrap();
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
@@ -476,24 +481,39 @@ mod tests {
     #[tokio::test]
     async fn one_active_order_per_worker() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let first = store.create("w7".into(), target(), None,0, 0.0, 0.0).await.unwrap();
+        let first = store
+            .create("w7".into(), target(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
         // A second active order for the same worker is rejected by the DB guard.
         assert!(matches!(
-            store.create("w7".into(), target(), None,0, 0.0, 0.0).await,
+            store.create("w7".into(), target(), None, 0, 0.0, 0.0).await,
             Err(CreateOrderError::AlreadyActive)
         ));
         // A different worker is unaffected.
-        assert!(store.create("w8".into(), target(), None,0, 0.0, 0.0).await.is_ok());
+        assert!(store
+            .create("w8".into(), target(), None, 0, 0.0, 0.0)
+            .await
+            .is_ok());
         // Once the first ends, the worker can be rented again.
         store.cancel(&first.id).await.unwrap();
-        assert!(store.create("w7".into(), target(), None,0, 0.0, 0.0).await.is_ok());
+        assert!(store
+            .create("w7".into(), target(), None, 0, 0.0, 0.0)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn expiry_marks_ended_and_is_returned() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let _past = store.create("w2".into(), target(), None,now_ms() - 1000, 0.0, 0.0).await.unwrap();
-        let _live = store.create("w3".into(), target(), None,now_ms() + 60_000, 0.0, 0.0).await.unwrap();
+        let _past = store
+            .create("w2".into(), target(), None, now_ms() - 1000, 0.0, 0.0)
+            .await
+            .unwrap();
+        let _live = store
+            .create("w3".into(), target(), None, now_ms() + 60_000, 0.0, 0.0)
+            .await
+            .unwrap();
         let expired = store.take_expired(now_ms()).await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].worker, "w2");
@@ -505,8 +525,14 @@ mod tests {
     async fn funding_exhausted_ends_the_order() {
         let store = OrderStore::new(crate::db::test_pool().await);
         // price 1.0 per TH·day, prepaid budget 100, open-ended deadline.
-        let o = store.create("w5".into(), target(), None,0, 1.0, 100.0).await.unwrap();
-        assert!(store.take_expired(now_ms()).await.is_empty(), "fresh order is live");
+        let o = store
+            .create("w5".into(), target(), None, 0, 1.0, 100.0)
+            .await
+            .unwrap();
+        assert!(
+            store.take_expired(now_ms()).await.is_empty(),
+            "fresh order is live"
+        );
 
         let work_for_100_th_days = 100.0 * HASHES_PER_TH_DAY / DIFF1_HASHES;
         store.add_work(&o.id, work_for_100_th_days, 1);
@@ -524,7 +550,10 @@ mod tests {
     #[tokio::test]
     async fn work_and_submitted_accumulate() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let o = store.create("w6".into(), target(), None,0, 0.0, 0.0).await.unwrap();
+        let o = store
+            .create("w6".into(), target(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
         store.add_work(&o.id, 2.5, 2);
         store.add_work(&o.id, 1.5, 1);
         store.add_submitted(&o.id, 4);
@@ -544,18 +573,27 @@ mod tests {
             password: "x".into(),
             authority_pubkey: Some("KEY".into()),
         };
-        let o = store.create("wf".into(), target(), Some(fb.clone()), 0, 0.0, 0.0).await.unwrap();
+        let o = store
+            .create("wf".into(), target(), Some(fb.clone()), 0, 0.0, 0.0)
+            .await
+            .unwrap();
         assert_eq!(o.fallback, Some(fb.clone()));
         assert_eq!(store.get(&o.id).await.unwrap().fallback, Some(fb));
         // No fallback round-trips as None.
-        let o2 = store.create("wf2".into(), target(), None, 0, 0.0, 0.0).await.unwrap();
+        let o2 = store
+            .create("wf2".into(), target(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
         assert!(store.get(&o2.id).await.unwrap().fallback.is_none());
     }
 
     #[tokio::test]
     async fn add_work_is_buffered_until_flush() {
         let store = OrderStore::new(crate::db::test_pool().await);
-        let o = store.create("wb".into(), target(), None,0, 0.0, 0.0).await.unwrap();
+        let o = store
+            .create("wb".into(), target(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
         store.add_work(&o.id, 3.0, 2);
         store.add_submitted(&o.id, 5);
         // Buffered — not yet in the DB.
@@ -576,7 +614,11 @@ mod tests {
         let pool = crate::db::test_pool().await;
         let id = {
             let store = OrderStore::new(pool.clone());
-            store.create("w4".into(), target(), None,0, 0.0, 0.0).await.unwrap().id
+            store
+                .create("w4".into(), target(), None, 0, 0.0, 0.0)
+                .await
+                .unwrap()
+                .id
         };
         let reloaded = OrderStore::new(pool);
         assert!(reloaded.get(&id).await.is_some());
