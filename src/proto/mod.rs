@@ -12,3 +12,6 @@ pub mod detect;
 pub mod relay;
 pub mod sv1;
 pub mod sv2;
+/// SV1<->SV2 job/share translation used by the bidirectional upstream paths.
+#[cfg(feature = "sv2")]
+pub mod translate;

@@ -2473,6 +2473,8 @@ dependencies = [
  "mining_sv2",
  "noise_sv2",
  "parsers_sv2",
+ "stratum_translation",
+ "sv1_api",
  "template_distribution_sv2",
 ]
 
@@ -2498,6 +2500,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratum_translation"
+version = "0.4.0"
+source = "git+https://github.com/stratum-mining/stratum?branch=main#6be1267d261fccddb326d0a78d8a12cdc2606533"
+dependencies = [
+ "binary_sv2",
+ "bitcoin",
+ "channels_sv2",
+ "mining_sv2",
+ "serde_json",
+ "sv1_api",
+ "tracing",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2513,6 +2529,19 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sv1_api"
+version = "5.0.0"
+source = "git+https://github.com/stratum-mining/stratum?branch=main#6be1267d261fccddb326d0a78d8a12cdc2606533"
+dependencies = [
+ "binary_sv2",
+ "bitcoin",
+ "byteorder",
+ "serde",
+ "serde_json",
+ "tracing",
+]
 
 [[package]]
 name = "syn"

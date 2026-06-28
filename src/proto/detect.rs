@@ -5,6 +5,11 @@
 //! JSON (`{` or leading whitespace), SV2 opens with a binary Noise handshake.
 //! The byte is *peeked* (not consumed), so the chosen adapter reads the full
 //! stream normally.
+//!
+//! Upstream (buyer pool) protocol detection is separate: it is folded into the
+//! upstream-connect path (the native protocol is attempted first and its socket
+//! reused; only on failure is the other protocol tried + translated), so there
+//! is no standalone upstream prober here.
 
 use crate::config::Protocol;
 

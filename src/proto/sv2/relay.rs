@@ -21,14 +21,23 @@
 //! synchronous open is the switch re-open (see [`open_on`]), which must stage the
 //! new upstream before the atomic swap.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+use stratum_core::bitcoin::hashes::hex::FromHex;
+
+use crate::proto::sv1::RpcMessage;
+use crate::proto::translate;
 
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
 use stratum_apps::network_helpers::{accept_noise_connection, connect_with_noise};
@@ -54,12 +63,12 @@ const CERT_VALIDITY: u64 = 3600;
 /// SV2 protocol version the proxy speaks.
 const SV2_VERSION: u16 = 2;
 
-type Read = NoiseTcpReadHalf<Msg>;
-type Write = NoiseTcpWriteHalf<Msg>;
+pub(crate) type Read = NoiseTcpReadHalf<Msg>;
+pub(crate) type Write = NoiseTcpWriteHalf<Msg>;
 
 /// The miner's channel-open request, captured to re-open against each upstream.
 #[derive(Clone)]
-enum OpenSpec {
+pub(crate) enum OpenSpec {
     Standard {
         request_id: u32,
         nominal_hash_rate: f32,
@@ -93,13 +102,13 @@ struct MinerOpen {
 }
 
 /// An upstream's channel-open result (success), copied out as owned bytes.
-struct ChannelInfo {
-    request_id: u32,
-    up_channel_id: u32,
-    extranonce_prefix: Vec<u8>,
-    target: Vec<u8>,
-    extranonce_size: u16,
-    group_channel_id: u32,
+pub(crate) struct ChannelInfo {
+    pub(crate) request_id: u32,
+    pub(crate) up_channel_id: u32,
+    pub(crate) extranonce_prefix: Vec<u8>,
+    pub(crate) target: Vec<u8>,
+    pub(crate) extranonce_size: u16,
+    pub(crate) group_channel_id: u32,
 }
 
 // ── message builders ────────────────────────────────────────────────
@@ -252,7 +261,7 @@ fn parse_miner_open(frame: &mut Sv2Frame) -> Option<MinerOpen> {
     }
 }
 
-fn parse_open_success(frame: &mut Sv2Frame) -> Option<ChannelInfo> {
+pub(crate) fn parse_open_success(frame: &mut Sv2Frame) -> Option<ChannelInfo> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
@@ -285,7 +294,7 @@ fn parse_setup_success_flags(frame: &mut Sv2Frame) -> Option<u32> {
     }
 }
 
-fn parse_accepted_count(frame: &mut Sv2Frame) -> Option<u32> {
+pub(crate) fn parse_accepted_count(frame: &mut Sv2Frame) -> Option<u32> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
@@ -294,11 +303,51 @@ fn parse_accepted_count(frame: &mut Sv2Frame) -> Option<u32> {
     }
 }
 
-fn parse_set_target(frame: &mut Sv2Frame) -> Option<Vec<u8>> {
+/// `(last_sequence_number, new_submits_accepted_count)` of a `SubmitSharesSuccess`.
+pub(crate) fn parse_submit_success(frame: &mut Sv2Frame) -> Option<(u32, u32)> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::SubmitSharesSuccess(s) => Some((s.last_sequence_number, s.new_submits_accepted_count)),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_set_target(frame: &mut Sv2Frame) -> Option<Vec<u8>> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
         Mining::SetTarget(m) => Some(m.maximum_target.inner_as_ref().to_vec()),
+        _ => None,
+    }
+}
+
+/// Parse a `NewExtendedMiningJob` out of a frame (owned/`'static`).
+pub(crate) fn parse_new_extended_job(frame: &mut Sv2Frame) -> Option<mining::NewExtendedMiningJob<'static>> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::NewExtendedMiningJob(m) => Some(m.into_static()),
+        _ => None,
+    }
+}
+
+/// Parse a `SetNewPrevHash` out of a frame (owned/`'static`).
+pub(crate) fn parse_set_new_prev_hash(frame: &mut Sv2Frame) -> Option<mining::SetNewPrevHash<'static>> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::SetNewPrevHash(m) => Some(m.into_static()),
+        _ => None,
+    }
+}
+
+/// The `sequence_number` of a `SubmitSharesError` (the rejected share's id).
+pub(crate) fn parse_submit_error_seq(frame: &mut Sv2Frame) -> Option<u32> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::SubmitSharesError(m) => Some(m.sequence_number),
         _ => None,
     }
 }
@@ -327,7 +376,7 @@ async fn read_one(read: &mut Read) -> anyhow::Result<Sv2Frame> {
 
 /// Connect an upstream, run SetupConnection, return the (post-setup) halves and
 /// the upstream's negotiated flags.
-async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, u32)> {
+pub(crate) async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, u32)> {
     let tcp = TcpStream::connect(&target.url)
         .await
         .with_context(|| format!("connect upstream {}", target.url))?;
@@ -361,7 +410,7 @@ async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, 
 /// atomically swaps `active`, so miner traffic is never routed to a channel that
 /// isn't open yet. The fresh-open path (initial + additional channels) instead
 /// finalizes through the steady reader; this is only used by [`Sv2Session::swap_upstream`].
-async fn open_on(
+pub(crate) async fn open_on(
     read: &mut Read,
     write: &mut Write,
     spec: &OpenSpec,
@@ -516,6 +565,10 @@ struct Inner {
     /// Edge-trigger so the low-accept-ratio warning is logged once.
     accept_low_logged: bool,
     label: String,
+    /// True when the active upstream is an SV1 pool reached via translation (the
+    /// buyer pool speaks SV1 behind this SV2 miner). Jobs/shares are converted;
+    /// additional channels are not multiplexed over the single SV1 connection.
+    translating: bool,
 }
 
 impl Inner {
@@ -649,11 +702,18 @@ impl Sv2Session {
             bail!("no channels to switch");
         }
 
-        // Open all channels on the new upstream before tearing the old one down,
-        // so a failed switch leaves the miner mining on the current upstream.
-        let (mut read, mut write, _flags) = connect_setup(&target)
-            .await
-            .map_err(|e| anyhow!("switch to {}: {e}", target.url))?;
+        // Native first: re-open on SV2; if the new pool doesn't answer as SV2,
+        // it's an SV1 buyer pool → translate the switch onto it.
+        let (mut read, mut write, _flags) =
+            match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_setup(&target)).await {
+                Ok(Ok(c)) => c,
+                res => {
+                    if let Ok(Err(e)) = &res {
+                        debug!(url = %target.url, error = %e, "upstream not SV2; switching via SV1 translation");
+                    }
+                    return self.swap_to_sv1_translate(target, routing, generation, up_ident).await;
+                }
+            };
         let mut new_channels = Vec::with_capacity(specs.len());
         let mut up_to_down = std::collections::HashMap::new();
         let mut repoint = Vec::with_capacity(specs.len());
@@ -905,6 +965,620 @@ impl Sv2Session {
     }
 }
 
+// ── SV1 upstream translator (combo 4): SV2 miner ↔ SV1 buyer pool ────
+//
+// The buyer pool may speak SV1 behind an SV2 miner. The proxy is the SV1 client
+// to the pool and synthesizes the miner-facing SV2 channel: the SV1 extranonce1
+// becomes the channel's extranonce_prefix, `mining.notify` becomes a future
+// `NewExtendedMiningJob` + `SetNewPrevHash` (SV2 §7 order), `mining.set_difficulty`
+// becomes `SetTarget`, the miner's `SubmitSharesExtended` becomes a `mining.submit`,
+// and the pool's result becomes `SubmitSharesSuccess`/`SubmitSharesError`. One
+// Extended channel per SV1 connection (a single extranonce1); Standard channels
+// and additional channels are refused (loudly), not silently dropped.
+
+/// An SV1 pool connection for translation, positioned after the handshake.
+struct Sv1UpConn {
+    read: BufReader<OwnedReadHalf>,
+    write: OwnedWriteHalf,
+    extranonce1: Vec<u8>,
+    extranonce2_size: u16,
+    version_mask: Option<u32>,
+    initial_diff: f64,
+    /// `set_difficulty`/`notify` notifications seen during the handshake (the
+    /// initial difficulty + first job), replayed to the reader on start.
+    prelude: Vec<String>,
+}
+
+/// Per-job state the proxy must remember to translate the miner's submit back to
+/// the pool: the pool's string job id, and (Standard only) the `extranonce2` the
+/// proxy chose when it built that job's coinbase (a Standard submit carries none).
+#[derive(Clone)]
+struct Sv1JobInfo {
+    sv1_job_id: String,
+    extranonce2: Option<Vec<u8>>,
+}
+
+/// Shared state between the two SV1-translate driver tasks.
+#[derive(Default)]
+struct Sv1UpState {
+    version_mask: Option<u32>,
+    user_name: String,
+    /// Extended channel (miner rolls its own extranonce) vs Standard (the proxy
+    /// assembles the coinbase + folds the merkle root and rolls the extranonce2).
+    extended: bool,
+    /// The SV1 pool's fixed extranonce1 (the coinbase prefix for Standard builds).
+    extranonce1: Vec<u8>,
+    /// The extranonce2 byte length the SV1 pool allows.
+    extranonce2_size: u16,
+    /// Rolls a distinct extranonce2 per Standard job → distinct merkle roots.
+    next_extranonce2: u64,
+    next_job_id: u32,
+    job_map: HashMap<u32, Sv1JobInfo>,
+    next_submit_id: u64,
+    submit_seq: HashMap<u64, u32>,
+    first_job_sent: bool,
+}
+
+
+/// Connect an SV1 pool and run `configure`(version-rolling) → `subscribe` →
+/// `authorize`, capturing the extranonce, the negotiated version mask, and the
+/// handshake notifications (initial difficulty + first job).
+async fn connect_sv1_upstream(target: &UpstreamTarget) -> anyhow::Result<Sv1UpConn> {
+    let tcp = TcpStream::connect(&target.url)
+        .await
+        .with_context(|| format!("connect sv1 upstream {}", target.url))?;
+    let _ = tcp.set_nodelay(true);
+    let (r, mut w) = tcp.into_split();
+    let mut read = BufReader::new(r);
+    let mut prelude: Vec<String> = Vec::new();
+
+    let cfg = RpcMessage::request(
+        json!(1),
+        "mining.configure",
+        json!([["version-rolling"], {"version-rolling.mask": "1fffe000"}]),
+    );
+    w.write_all(cfg.to_line().as_bytes()).await?;
+    let cfg_resp = sv1_read_response(&mut read, &mut prelude).await?;
+    let version_mask = parse_version_mask(&cfg_resp);
+
+    let sub = RpcMessage::request(json!(2), "mining.subscribe", json!(["stratum-rental-proxy/0.1"]));
+    w.write_all(sub.to_line().as_bytes()).await?;
+    let sub_resp = sv1_read_response(&mut read, &mut prelude).await?;
+    let (en1_hex, extranonce2_size) =
+        parse_subscribe_sv1(&sub_resp).ok_or_else(|| anyhow!("bad subscribe result"))?;
+
+    let auth = RpcMessage::request(json!(3), "mining.authorize", json!([target.user, target.password]));
+    w.write_all(auth.to_line().as_bytes()).await?;
+    let _ = sv1_read_response(&mut read, &mut prelude).await?;
+
+    let initial_diff = prelude
+        .iter()
+        .rev()
+        .find_map(|l| translate::set_difficulty_from_line(l))
+        .unwrap_or(1.0);
+    Ok(Sv1UpConn {
+        read,
+        write: w,
+        extranonce1: Vec::<u8>::from_hex(&en1_hex).map_err(|e| anyhow!("bad extranonce hex: {e}"))?,
+        extranonce2_size,
+        version_mask,
+        initial_diff,
+        prelude,
+    })
+}
+
+/// Read SV1 lines until a response (no `method`), pushing interleaved
+/// notifications to `prelude`.
+async fn sv1_read_response(
+    read: &mut BufReader<OwnedReadHalf>,
+    prelude: &mut Vec<String>,
+) -> anyhow::Result<RpcMessage> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if read.read_line(&mut line).await? == 0 {
+            bail!("sv1 upstream closed during handshake");
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(m) = RpcMessage::parse(t) {
+            if m.method.is_none() {
+                return Ok(m);
+            }
+            prelude.push(format!("{t}\n"));
+        }
+    }
+}
+
+fn parse_version_mask(resp: &RpcMessage) -> Option<u32> {
+    let r = resp.result.as_ref()?;
+    if r.get("version-rolling")?.as_bool() != Some(true) {
+        return None;
+    }
+    let mask = r
+        .get("version-rolling.mask")
+        .and_then(|v| v.as_str())
+        .and_then(|s| u32::from_str_radix(s, 16).ok());
+    Some(mask.unwrap_or(translate::VERSION_ROLLING_MASK))
+}
+
+fn parse_subscribe_sv1(resp: &RpcMessage) -> Option<(String, u16)> {
+    let arr = resp.result.as_ref()?.as_array()?;
+    if arr.len() < 3 {
+        return None;
+    }
+    Some((arr[1].as_str()?.to_string(), arr[2].as_u64()? as u16))
+}
+
+/// Writer: the miner's share frames → SV1 `mining.submit` lines. Handles both
+/// `SubmitSharesExtended` (extranonce from the share) and `SubmitSharesStandard`
+/// (extranonce2 is the one the proxy chose when it built that job).
+fn spawn_sv1_translate_writer(
+    mut write: OwnedWriteHalf,
+    state: Arc<Mutex<Sv1UpState>>,
+    mut rx: mpsc::UnboundedReceiver<EitherFrame>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            let Some(mut f) = wire::into_sv2(frame) else {
+                continue;
+            };
+            let Some(mt) = wire::msg_type(&f) else {
+                continue;
+            };
+            let payload = f.payload();
+            let line = match Mining::try_from((mt, payload)) {
+                Ok(Mining::SubmitSharesExtended(submit)) => {
+                    let mut s = state.lock().await;
+                    let Some(info) = s.job_map.get(&submit.job_id).cloned() else {
+                        continue; // share for a job we no longer have
+                    };
+                    let id = s.next_submit_id;
+                    s.next_submit_id = s.next_submit_id.wrapping_add(1);
+                    s.submit_seq.insert(id, submit.sequence_number);
+                    let (mask, user) = (s.version_mask, s.user_name.clone());
+                    drop(s);
+                    translate::sv2_submit_to_sv1(&submit, user, info.sv1_job_id, id, mask)
+                }
+                Ok(Mining::SubmitSharesStandard(submit)) => {
+                    let mut s = state.lock().await;
+                    let Some(info) = s.job_map.get(&submit.job_id).cloned() else {
+                        continue;
+                    };
+                    // Standard jobs always recorded an extranonce2 at build time.
+                    let Some(extranonce2) = info.extranonce2 else {
+                        continue;
+                    };
+                    let id = s.next_submit_id;
+                    s.next_submit_id = s.next_submit_id.wrapping_add(1);
+                    s.submit_seq.insert(id, submit.sequence_number);
+                    let (mask, user) = (s.version_mask, s.user_name.clone());
+                    drop(s);
+                    translate::sv2_standard_submit_to_sv1(&submit, user, info.sv1_job_id, extranonce2, id, mask)
+                }
+                _ => continue, // only shares cross to the SV1 pool
+            };
+            let sv1 = match line {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "sv2→sv1 submit translation failed");
+                    continue;
+                }
+            };
+            if write.write_all(translate::submit_to_line(sv1).as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// Reader: SV1 pool lines → synthesized SV2 frames for the miner (jobs, target,
+/// share results), plus accounting. Processes the handshake `prelude` first.
+fn spawn_sv1_translate_reader(
+    session: Arc<Sv2Session>,
+    generation: u64,
+    mut read: BufReader<OwnedReadHalf>,
+    state: Arc<Mutex<Sv1UpState>>,
+    down_cid: u32,
+    prelude: Vec<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        for line in prelude {
+            handle_sv1_line(&session, generation, &state, down_cid, line.trim()).await;
+        }
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match read.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let l = line.trim();
+            if l.is_empty() {
+                continue;
+            }
+            handle_sv1_line(&session, generation, &state, down_cid, l).await;
+        }
+        // Pool closed/errored (an intentional swap aborts this task first).
+        let _ = session.died_tx.send(generation);
+    })
+}
+
+async fn handle_sv1_line(
+    session: &Arc<Sv2Session>,
+    generation: u64,
+    state: &Arc<Mutex<Sv1UpState>>,
+    down_cid: u32,
+    line: &str,
+) {
+    // mining.notify → a job (+ SetNewPrevHash on a clean/first job). Extended:
+    // pass the coinbase parts through (the miner folds). Standard: the proxy
+    // chooses an extranonce2, assembles the coinbase + folds the merkle root.
+    if let Some(notify) = translate::notify_from_line(line) {
+        let (sv2_job_id, as_future, vra, extended, en1, en2) = {
+            let mut s = state.lock().await;
+            let jid = s.next_job_id;
+            s.next_job_id = s.next_job_id.wrapping_add(1);
+            if s.job_map.len() >= 64 {
+                s.job_map.clear();
+            }
+            // The first job must be future (the miner has no prev-hash yet).
+            let as_future = notify.clean_jobs || !s.first_job_sent;
+            s.first_job_sent = true;
+            let vra = s.version_mask.is_some();
+            if s.extended {
+                s.job_map.insert(jid, Sv1JobInfo { sv1_job_id: notify.job_id.clone(), extranonce2: None });
+                (jid, as_future, vra, true, Vec::new(), Vec::new())
+            } else {
+                let mut e2 = vec![0u8; s.extranonce2_size as usize];
+                let counter = s.next_extranonce2.to_le_bytes();
+                s.next_extranonce2 = s.next_extranonce2.wrapping_add(1);
+                let n = e2.len().min(counter.len());
+                e2[..n].copy_from_slice(&counter[..n]);
+                let en1 = s.extranonce1.clone();
+                s.job_map.insert(jid, Sv1JobInfo { sv1_job_id: notify.job_id.clone(), extranonce2: Some(e2.clone()) });
+                (jid, as_future, vra, false, en1, e2)
+            }
+        };
+        let built = if extended {
+            translate::sv1_notify_to_sv2_job(&notify, down_cid, sv2_job_id, as_future, vra)
+                .map(|(j, p)| (wire::frame_from(AnyMessage::Mining(Mining::NewExtendedMiningJob(j))), p))
+        } else {
+            translate::sv1_notify_to_sv2_standard_job(&notify, down_cid, sv2_job_id, &en1, &en2, as_future)
+                .map(|(j, p)| (wire::frame_from(AnyMessage::Mining(Mining::NewMiningJob(j))), p))
+        };
+        match built {
+            Ok((job_frame, prev)) => {
+                session.send_translate_frame(generation, job_frame).await;
+                if let Some(p) = prev {
+                    let prev_frame = wire::frame_from(AnyMessage::Mining(Mining::SetNewPrevHash(p)));
+                    session.send_translate_frame(generation, prev_frame).await;
+                }
+            }
+            Err(e) => warn!(error = %e, "sv1→sv2 job translation failed"),
+        }
+        return;
+    }
+    // mining.set_difficulty → SetTarget.
+    if let Some(diff) = translate::set_difficulty_from_line(line) {
+        session.set_translate_diff(generation, down_cid, diff).await;
+        if let Ok(f) = set_target(down_cid, translate::target_from_difficulty(diff).to_vec()) {
+            session.send_translate_frame(generation, f).await;
+        }
+        return;
+    }
+    // A submit response → SubmitSharesSuccess / SubmitSharesError for the miner.
+    if let Ok(m) = RpcMessage::parse(line) {
+        if m.method.is_some() {
+            return;
+        }
+        let Some(id) = m.id.as_ref().and_then(|v| v.as_u64()) else {
+            return;
+        };
+        let seq = state.lock().await.submit_seq.remove(&id);
+        let Some(seq) = seq else { return };
+        if matches!(&m.result, Some(Value::Bool(true))) {
+            session.credit_translate(generation, down_cid).await;
+            let ok = mining::SubmitSharesSuccess {
+                channel_id: down_cid,
+                last_sequence_number: seq,
+                new_submits_accepted_count: 1,
+                new_shares_sum: 1,
+            };
+            let f = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesSuccess(ok)));
+            session.send_translate_frame(generation, f).await;
+        } else if let Ok(error_code) = Str0255::try_from("rejected".to_string()) {
+            let err = mining::SubmitSharesError {
+                channel_id: down_cid,
+                sequence_number: seq,
+                error_code,
+            };
+            let f = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesError(err)));
+            session.send_translate_frame(generation, f).await;
+        }
+    }
+}
+
+impl Sv2Session {
+    /// Forward a synthesized frame to the miner if the generation is current.
+    async fn send_translate_frame(&self, generation: u64, frame: EitherFrame) {
+        {
+            let i = self.inner.lock().await;
+            if generation != i.active.generation {
+                return;
+            }
+        }
+        let _ = self.to_miner.send(frame);
+    }
+
+    /// Record the share difficulty implied by the SV1 pool's `set_difficulty`.
+    async fn set_translate_diff(&self, generation: u64, down_cid: u32, diff: f64) {
+        let mut i = self.inner.lock().await;
+        if generation != i.active.generation {
+            return;
+        }
+        if let Some(c) = i.channels.iter_mut().find(|c| c.down_channel_id == down_cid) {
+            c.difficulty = diff;
+        }
+    }
+
+    /// Credit one accepted share (diff-weighted) to the hashrate window and, when
+    /// rented, the order. Generation-guarded.
+    async fn credit_translate(&self, generation: u64, down_cid: u32) {
+        let credit = {
+            let mut i = self.inner.lock().await;
+            if generation != i.active.generation {
+                return;
+            }
+            let work = i
+                .channels
+                .iter()
+                .find(|c| c.down_channel_id == down_cid)
+                .map(|c| c.difficulty)
+                .unwrap_or(0.0);
+            let mut credit = None;
+            if work > 0.0 {
+                i.hashrate.record(work);
+                i.delivered_work += work;
+                i.accepted_shares += 1;
+                if let Routing::Rented { order_id, .. } = &i.routing {
+                    credit = Some((order_id.clone(), work, 1u64));
+                }
+                debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted share (translated)");
+            }
+            if !i.accept_low_logged
+                && crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares)
+            {
+                i.accept_low_logged = true;
+                warn!(
+                    worker = %i.label,
+                    accepted = i.accepted_shares,
+                    submitted = i.submitted_shares,
+                    "low accept ratio — possible pool under-reporting or misbehaving miner"
+                );
+            }
+            credit
+        };
+        if let Some((order_id, work, shares)) = credit {
+            self.orders.add_work(&order_id, work, shares);
+        }
+    }
+
+    /// Connect `target` (protocol auto-detected) and install it as the initial
+    /// upstream: SV2 passthrough, or SV1 translation.
+    async fn connect_and_install_initial(
+        self: &Arc<Self>,
+        target: UpstreamTarget,
+        spec: OpenSpec,
+        worker: &str,
+        routing: Routing,
+    ) -> anyhow::Result<()> {
+        let up_ident = crate::proto::relay::upstream_worker(&target.user, worker);
+        // Native first: try SV2 (reusing its socket on success); if the pool
+        // doesn't answer as SV2, it's an SV1 buyer pool → translate.
+        match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_setup(&target)).await {
+            Ok(Ok((read, write, _flags))) => {
+                self.install_sv2_initial(read, write, spec, up_ident, target, routing).await
+            }
+            res => {
+                if let Ok(Err(e)) = &res {
+                    debug!(url = %target.url, error = %e, "upstream not SV2; trying SV1 translation");
+                }
+                let conn = connect_sv1_upstream(&target).await?;
+                self.install_sv1_translate_initial(conn, spec, up_ident, target, routing).await
+            }
+        }
+    }
+
+    /// Install an SV2 passthrough upstream and forward the miner's open (the
+    /// steady reader finalizes it on the pool's OpenSuccess).
+    async fn install_sv2_initial(
+        self: &Arc<Self>,
+        read: Read,
+        write: Write,
+        spec: OpenSpec,
+        up_ident: String,
+        target: UpstreamTarget,
+        routing: Routing,
+    ) -> anyhow::Result<()> {
+        let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
+        let writer = spawn_writer(write, up_rx);
+        let mut i = self.inner.lock().await;
+        let reader = spawn_upstream_reader(self.clone(), 0, read);
+        i.active.reader.abort();
+        i.active.writer.abort();
+        i.active = ActiveUpstream {
+            generation: 0,
+            target,
+            to_up,
+            reader,
+            writer,
+        };
+        i.routing = routing;
+        i.translating = false;
+        i.pending.insert(spec.request_id(), spec.clone());
+        i.active
+            .to_up
+            .send(open_channel_upstream(&spec, &up_ident)?)
+            .map_err(|_| anyhow!("upstream writer gone"))?;
+        Ok(())
+    }
+
+    /// Install an SV1 translation upstream: open the channel locally (synthesize
+    /// the OpenSuccess) and start the driver tasks.
+    async fn install_sv1_translate_initial(
+        self: &Arc<Self>,
+        conn: Sv1UpConn,
+        spec: OpenSpec,
+        up_ident: String,
+        target: UpstreamTarget,
+        routing: Routing,
+    ) -> anyhow::Result<()> {
+        let extended = spec.is_extended();
+        let down_cid = {
+            let mut i = self.inner.lock().await;
+            let c = i.next_down_cid;
+            i.next_down_cid += 1;
+            c
+        };
+        // Reply OpenSuccess to the miner before any job (FIFO on to_miner): the
+        // SV1 extranonce1 is the channel's extranonce_prefix. The builder emits a
+        // Standard or Extended success per the channel type the miner opened.
+        let info = ChannelInfo {
+            request_id: spec.request_id(),
+            up_channel_id: down_cid,
+            extranonce_prefix: conn.extranonce1.clone(),
+            target: translate::target_from_difficulty(conn.initial_diff).to_vec(),
+            extranonce_size: conn.extranonce2_size,
+            group_channel_id: 0,
+        };
+        self.to_miner
+            .send(open_success_downstream(&spec, down_cid, 0, &info)?)
+            .map_err(|_| anyhow!("miner writer gone"))?;
+
+        let state = Arc::new(Mutex::new(Sv1UpState {
+            version_mask: conn.version_mask,
+            user_name: up_ident,
+            extended,
+            extranonce1: conn.extranonce1,
+            extranonce2_size: conn.extranonce2_size,
+            next_job_id: 1,
+            next_submit_id: 1,
+            ..Default::default()
+        }));
+        let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
+        let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
+        {
+            let mut i = self.inner.lock().await;
+            // Spawn the reader inside the lock so the new generation is in place
+            // before its first job/diff line is processed.
+            let reader = spawn_sv1_translate_reader(
+                self.clone(),
+                i.active.generation,
+                conn.read,
+                state,
+                down_cid,
+                conn.prelude,
+            );
+            i.active.reader.abort();
+            i.active.writer.abort();
+            let generation = i.active.generation;
+            i.active = ActiveUpstream {
+                generation,
+                target,
+                to_up,
+                reader,
+                writer,
+            };
+            i.channels = vec![Channel {
+                down_channel_id: down_cid,
+                up_channel_id: down_cid,
+                spec,
+                difficulty: conn.initial_diff,
+            }];
+            i.up_to_down = HashMap::from([(down_cid, down_cid)]);
+            i.pending.clear();
+            i.routing = routing;
+            i.translating = true;
+        }
+        Ok(())
+    }
+
+    /// Switch the (single) channel onto an SV1 buyer pool via translation.
+    async fn swap_to_sv1_translate(
+        self: &Arc<Self>,
+        target: UpstreamTarget,
+        routing: Routing,
+        generation: u64,
+        up_ident: String,
+    ) -> anyhow::Result<()> {
+        let (down_cid, spec) = {
+            let i = self.inner.lock().await;
+            match i.channels.first() {
+                Some(c) => (c.down_channel_id, c.spec.clone()),
+                None => bail!("no channel to switch"),
+            }
+        };
+        let extended = spec.is_extended();
+        let conn = connect_sv1_upstream(&target)
+            .await
+            .map_err(|e| anyhow!("switch to {}: {e}", target.url))?;
+        let initial_target = translate::target_from_difficulty(conn.initial_diff).to_vec();
+        let extranonce1 = conn.extranonce1.clone();
+        let state = Arc::new(Mutex::new(Sv1UpState {
+            version_mask: conn.version_mask,
+            user_name: up_ident,
+            extended,
+            extranonce1: conn.extranonce1,
+            extranonce2_size: conn.extranonce2_size,
+            next_job_id: 1,
+            next_submit_id: 1,
+            ..Default::default()
+        }));
+        let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
+        let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
+        let abandoned: Vec<u32> = {
+            let mut i = self.inner.lock().await;
+            let reader =
+                spawn_sv1_translate_reader(self.clone(), generation, conn.read, state, down_cid, conn.prelude);
+            i.active.reader.abort();
+            i.active.writer.abort();
+            i.active = ActiveUpstream {
+                generation,
+                target: target.clone(),
+                to_up,
+                reader,
+                writer,
+            };
+            i.channels = vec![Channel {
+                down_channel_id: down_cid,
+                up_channel_id: down_cid,
+                spec,
+                difficulty: conn.initial_diff,
+            }];
+            i.up_to_down = HashMap::from([(down_cid, down_cid)]);
+            let abandoned = i.pending.keys().copied().collect();
+            i.pending.clear();
+            i.routing = routing;
+            i.translating = true;
+            abandoned
+        };
+        // Re-point the miner: new extranonce prefix + target; the reader streams
+        // the new pool's first job after.
+        let _ = self.to_miner.send(set_extranonce_prefix(down_cid, extranonce1)?);
+        let _ = self.to_miner.send(set_target(down_cid, initial_target)?);
+        for request_id in abandoned {
+            if let Ok(f) = open_channel_error(request_id, "upstream switched; please reopen") {
+                let _ = self.to_miner.send(f);
+            }
+        }
+        info!(upstream = %target.url, generation, "sv2→sv1 upstream switched (translated)");
+        Ok(())
+    }
+}
+
 // ── connection handler ──────────────────────────────────────────────
 
 /// Drive one SV2 seller miner end to end.
@@ -969,32 +1643,11 @@ pub async fn handle_seller_miner_sv2(
         None => (idle_target.clone(), Routing::Idle),
     };
 
-    // 6. Connect the chosen upstream (SetupConnection only). The channel open is
-    //    finalized by the steady reader below — the miner's OpenMiningChannel is
-    //    forwarded as a `pending` open, exactly like an additional channel or a
-    //    switch re-open, so there is a single open-finalize path.
-    //    If the rental's primary pool is unreachable, fall back to the order's
-    //    fallback pool (same protocol). `up_ident` is computed after, so it
-    //    reflects whichever pool we landed on.
-    let (up_read, up_write, _up_flags) = match connect_setup(&open_target).await {
-        Ok(c) => c,
-        Err(e) => match active_order.as_ref().and_then(|o| o.fallback.clone()) {
-            Some(fb) => {
-                warn!(%worker, error = %e, "primary buyer pool unreachable — using fallback");
-                open_target = fb;
-                connect_setup(&open_target).await?
-            }
-            None => return Err(e),
-        },
-    };
-    // user_identity = pool account + the miner's worker, tagged -bp-proxy, so
-    // the pool shows the rig (not "default") and marks it as proxied.
-    let up_ident = crate::proto::relay::upstream_worker(&open_target.user, &worker);
-    let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
-    let up_writer = spawn_writer(up_write, up_rx);
-    let mut pending = std::collections::HashMap::new();
-    pending.insert(spec.request_id(), spec.clone());
+    // 6. Build the session with a placeholder upstream, then connect + install
+    //    the real one — SV2 passthrough or SV1 translation, auto-detected from the
+    //    pool. On the primary's failure, fall back to the order's fallback pool.
     let (died_tx, died_rx) = mpsc::unbounded_channel::<u64>();
+    let (placeholder_to_up, _placeholder_rx) = mpsc::unbounded_channel::<EitherFrame>();
     let session = Arc::new(Sv2Session {
         to_miner: to_miner.clone(),
         switch: Mutex::new(()),
@@ -1004,17 +1657,17 @@ pub async fn handle_seller_miner_sv2(
             active: ActiveUpstream {
                 generation: 0,
                 target: open_target.clone(),
-                to_up,
-                reader: tokio::spawn(async {}), // placeholder, replaced below
-                writer: up_writer,
+                to_up: placeholder_to_up,
+                reader: tokio::spawn(async {}), // placeholders, installed below
+                writer: tokio::spawn(async {}),
             },
             generation_counter: 0,
             channels: Vec::new(),
             up_to_down: std::collections::HashMap::new(),
             group_down_id: None,
-            pending,
+            pending: std::collections::HashMap::new(),
             next_down_cid: 1,
-            routing,
+            routing: routing.clone(),
             default_target: idle_target.clone(),
             hashrate: HashrateWindow::new(Duration::from_secs(600)),
             delivered_work: 0.0,
@@ -1022,23 +1675,24 @@ pub async fn handle_seller_miner_sv2(
             submitted_shares: 0,
             accept_low_logged: false,
             label: worker.clone(),
+            translating: false,
         }),
     });
 
-    // 7. Wire the steady reader to the session (replacing the placeholder), then
-    //    send the miner's OpenMiningChannel upstream. Its OpenSuccess streams back
-    //    through the reader, which assigns the stable downstream channel id, maps
-    //    it (incl. the Extended group id), and replies OpenSuccess to the miner;
-    //    the pool's jobs + prev-hash then follow on the same socket.
+    if let Err(e) = session
+        .connect_and_install_initial(open_target.clone(), spec.clone(), &worker, routing.clone())
+        .await
     {
-        let reader = spawn_upstream_reader(session.clone(), 0, up_read);
-        let mut i = session.inner.lock().await;
-        let old = std::mem::replace(&mut i.active.reader, reader);
-        old.abort();
-        i.active
-            .to_up
-            .send(open_channel_upstream(&spec, &up_ident)?)
-            .map_err(|_| anyhow!("upstream writer gone"))?;
+        match active_order.as_ref().and_then(|o| o.fallback.clone()) {
+            Some(fb) => {
+                warn!(%worker, error = %e, "primary buyer pool unreachable — using fallback");
+                open_target = fb.clone();
+                session
+                    .connect_and_install_initial(fb, spec.clone(), &worker, routing.clone())
+                    .await?;
+            }
+            None => return Err(e),
+        }
     }
 
     ctx.registry
@@ -1069,9 +1723,21 @@ pub async fn handle_seller_miner_sv2(
                 || mt == mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL
             {
                 // Additional channel: forward to the active upstream (account
-                // rewritten); the upstream reader finalizes it on success.
+                // rewritten); the upstream reader finalizes it on success. A
+                // translated SV1 upstream carries a single extranonce1, so it
+                // can't multiplex extra channels — refuse them loudly.
                 if let Some(open) = parse_miner_open(&mut frame) {
                     let mut i = session.inner.lock().await;
+                    if i.translating {
+                        drop(i);
+                        if let Ok(f) = open_channel_error(
+                            open.spec.request_id(),
+                            "additional channels are not supported on an SV1 upstream",
+                        ) {
+                            let _ = to_miner.send(f);
+                        }
+                        continue;
+                    }
                     let account =
                         crate::proto::relay::upstream_worker(&i.active.target.user, &i.label);
                     match open_channel_upstream(&open.spec, &account) {
@@ -2543,5 +3209,617 @@ mod tests {
         // The rig reads as rented (any session rented ⇒ rig rented).
         let st = registry.aggregated_status("bc1qSELLER.farm").await.unwrap();
         assert_eq!(st.routing, "rented", "the whole rig is rented");
+    }
+
+    /// A mock SV1 pool for the translate path: configure(version-rolling) →
+    /// subscribe (extranonce1 `deadbeefcafebabe`, en2=8) + a set_difficulty and a
+    /// `mining.notify`, then accepts every `mining.submit`. Reports each submit.
+    async fn mock_sv1_pool_translate(listener: TcpListener, submits: mpsc::UnboundedSender<()>) {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let submits = submits.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = sock.into_split();
+                let mut lines = BufReader::new(r).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let id = v.get("id").cloned().unwrap_or(Value::Null);
+                    match v.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                        "mining.configure" => {
+                            let reply = json!({"id": id, "result": {"version-rolling": true, "version-rolling.mask": "1fffe000"}, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        "mining.subscribe" => {
+                            let reply = json!({"id": id, "result": [[["mining.notify", "1"]], "deadbeefcafebabe", 8], "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                            let sd = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [1024.0]});
+                            let _ = w.write_all(format!("{sd}\n").as_bytes()).await;
+                            let notify = json!({"id": Value::Null, "method": "mining.notify", "params": ["j1", "0000000000000000000000000000000000000000000000000000000000000000", "01000000", "00000000", [], "20000000", "17072cf6", "65000000", true]});
+                            let _ = w.write_all(format!("{notify}\n").as_bytes()).await;
+                        }
+                        "mining.authorize" => {
+                            let reply = json!({"id": id, "result": true, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        "mining.submit" => {
+                            let _ = submits.send(());
+                            let reply = json!({"id": id, "result": true, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn sv2_miner_rented_onto_sv1_pool_translates_end_to_end() {
+        // The rig's idle pool is SV1, so the SV2 miner is served via translation:
+        // the proxy is the SV1 client and synthesizes the miner's Extended channel.
+        let sv1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sv1_addr = sv1.local_addr().unwrap();
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<()>();
+        tokio::spawn(mock_sv1_pool_translate(sv1, sub_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&sv1_addr.to_string(), "acctSV1")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        // The SV2-native connect probe to the SV1 pool must time out before the
+        // proxy falls back to SV1 translation, so allow generous time for open().
+        let (down_cid, prefix) = tokio::time::timeout(Duration::from_secs(15), miner.open("bc1qSELLER.rig1", 1))
+            .await
+            .expect("open did not complete")
+            .unwrap();
+        assert_eq!(
+            prefix,
+            vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe],
+            "Extended channel prefix = the SV1 extranonce1"
+        );
+
+        // The translated job (built from the SV1 mining.notify) reaches the miner.
+        let job_cid = tokio::time::timeout(
+            Duration::from_secs(5),
+            miner.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+        )
+        .await
+        .expect("translated job timed out")
+        .unwrap();
+        assert_eq!(job_cid, down_cid, "job addressed to the miner's channel");
+
+        // Submit → translated to a mining.submit on the SV1 pool.
+        miner.submit(down_cid, 0).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sub_rx.recv())
+            .await
+            .expect("share never reached the SV1 pool")
+            .unwrap();
+
+        // The pool's accept is translated back to a SubmitSharesSuccess.
+        let ok_cid = tokio::time::timeout(
+            Duration::from_secs(5),
+            miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS),
+        )
+        .await
+        .expect("share result timed out")
+        .unwrap();
+        assert_eq!(ok_cid, down_cid, "translated share accepted end to end");
+
+        // Accounting credited the delivered work.
+        let sess = registry.get_all("bc1qSELLER.rig1").await.into_iter().next().unwrap();
+        let st = sess.status().await;
+        assert!(st.accepted_shares >= 1, "accepted share counted");
+        assert!(st.delivered_work > 0.0, "delivered work credited");
+    }
+
+    #[tokio::test]
+    async fn rent_sv2_miner_switches_onto_sv1_pool() {
+        // Idle on an SV2 pool (passthrough), then rented onto an SV1 buyer pool —
+        // the switch must translate (swap_to_sv1_translate) and re-point the miner.
+        let sv2_idle = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let idle_addr = sv2_idle.local_addr().unwrap();
+        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(sv2_idle, vec![0xAA; 8], 7, NoiseKeys::generate(), idle_tx));
+        let sv1_buyer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let buyer_addr = sv1_buyer.local_addr().unwrap();
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<()>();
+        tokio::spawn(mock_sv1_pool_translate(sv1_buyer, sub_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let orders = crate::orders::OrderStore::new(db.clone());
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: orders.clone(),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&idle_addr.to_string(), "acctIdle")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, prefix) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+        assert_eq!(prefix, vec![0xAA; 8], "idle on the SV2 pool (passthrough)");
+
+        // Rent onto the SV1 buyer pool → translated switch.
+        let sess = loop {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        let buyer = ext_target(&buyer_addr.to_string(), "acctBuyer");
+        let order = orders
+            .create("bc1qSELLER.rig1".into(), buyer.clone(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
+        sess.switch_to(order.id.clone(), buyer).await.unwrap();
+
+        // Re-pointed to the SV1 extranonce, then a translated job + accepted share.
+        let (re_cid, re_prefix) = tokio::time::timeout(Duration::from_secs(15), miner.read_until_set_extranonce())
+            .await
+            .expect("set_extranonce after the translated switch")
+            .unwrap();
+        assert_eq!(re_cid, down_cid, "channel id stable across the switch");
+        assert_eq!(re_prefix, vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe], "now on the SV1 extranonce1");
+        let _ = tokio::time::timeout(Duration::from_secs(5), miner.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB))
+            .await
+            .expect("translated job after switch")
+            .unwrap();
+        miner.submit(down_cid, 0).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sub_rx.recv())
+            .await
+            .expect("share reached the SV1 buyer pool")
+            .unwrap();
+        assert_eq!(sess.status().await.routing, "rented");
+    }
+
+    // ── self-validating combo 4: a real mined share, validated by the pool ──
+
+    /// `a <= b` for two 32-byte little-endian numbers (Bitcoin hash vs target).
+    fn le_leq(a: &[u8], b: &[u8]) -> bool {
+        for i in (0..32).rev() {
+            if a[i] != b[i] {
+                return a[i] < b[i];
+            }
+        }
+        true
+    }
+
+    /// A legacy coinbase split reserving `en_len` bytes for the extranonce so
+    /// `coinb1 + extranonce + coinb2` deserializes as a valid transaction.
+    fn legacy_cb_reserving(en_len: usize) -> (Vec<u8>, Vec<u8>) {
+        let script_prefix = [0x03u8, 0x33, 0x33, 0x33];
+        let ssl = script_prefix.len() + en_len;
+        let mut c1 = Vec::new();
+        c1.extend_from_slice(&1u32.to_le_bytes());
+        c1.push(0x01);
+        c1.extend_from_slice(&[0u8; 32]);
+        c1.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        c1.push(ssl as u8);
+        c1.extend_from_slice(&script_prefix);
+        let mut c2 = Vec::new();
+        c2.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        c2.push(0x01);
+        c2.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+        c2.push(0x00);
+        c2.extend_from_slice(&0u32.to_le_bytes());
+        (c1, c2)
+    }
+
+    /// Read the SV2 job/prev-hash/target, mine a real nonce that meets the target,
+    /// and submit it — exercising the full coinbase (prefix+extranonce+suffix) and
+    /// header reconstruction the SV1 pool will independently re-check.
+    async fn mine_and_submit_one(
+        miner: &mut MockMiner,
+        channel_id: u32,
+        extranonce_prefix: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        use stratum_core::bitcoin::hashes::{sha256d, Hash};
+        use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
+
+        let mut job: Option<(u32, u32, Vec<u8>, Vec<u8>)> = None; // job_id, version, cb_prefix, cb_suffix
+        let mut prev: Option<([u8; 32], u32, u32)> = None; // prev_hash, min_ntime, nbits
+        let mut target: Option<Vec<u8>> = None;
+        for _ in 0..50 {
+            let mut f = read_one(&mut miner.read).await?;
+            match wire::msg_type(&f) {
+                Some(mt) if mt == mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
+                    if let Some(m) = parse_new_extended_job(&mut f) {
+                        job = Some((
+                            m.job_id,
+                            m.version,
+                            m.coinbase_tx_prefix.inner_as_ref().to_vec(),
+                            m.coinbase_tx_suffix.inner_as_ref().to_vec(),
+                        ));
+                    }
+                }
+                Some(mt) if mt == mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+                    if let Some(m) = parse_set_new_prev_hash(&mut f) {
+                        let ph: [u8; 32] = m.prev_hash.inner_as_ref().try_into().unwrap();
+                        prev = Some((ph, m.min_ntime, m.nbits));
+                    }
+                }
+                Some(mt) if mt == mining::MESSAGE_TYPE_SET_TARGET => {
+                    if let Some(t) = parse_set_target(&mut f) {
+                        target = Some(t);
+                    }
+                }
+                _ => {}
+            }
+            if job.is_some() && prev.is_some() && target.is_some() {
+                break;
+            }
+        }
+        let (job_id, version, cb_prefix, cb_suffix) = job.ok_or_else(|| anyhow!("no job"))?;
+        let (prev_hash, min_ntime, nbits) = prev.ok_or_else(|| anyhow!("no prev-hash"))?;
+        let target = target.ok_or_else(|| anyhow!("no target"))?;
+
+        // Full extranonce = the channel prefix + the miner's rolled part.
+        let miner_extranonce = vec![0u8, 0, 0, 1];
+        let mut full_en = extranonce_prefix;
+        full_en.extend_from_slice(&miner_extranonce);
+        let empty: Vec<Vec<u8>> = vec![];
+        let merkle_root = merkle_root_from_path(&cb_prefix, &cb_suffix, &full_en, &empty)
+            .ok_or_else(|| anyhow!("coinbase did not deserialize"))?;
+
+        let mut header = Vec::with_capacity(80);
+        header.extend_from_slice(&version.to_le_bytes());
+        header.extend_from_slice(&prev_hash);
+        header.extend_from_slice(&merkle_root);
+        header.extend_from_slice(&min_ntime.to_le_bytes());
+        header.extend_from_slice(&nbits.to_le_bytes());
+        let noff = header.len();
+        header.extend_from_slice(&0u32.to_le_bytes());
+        let mut nonce = None;
+        for n in 0u32..5_000_000 {
+            header[noff..noff + 4].copy_from_slice(&n.to_le_bytes());
+            if le_leq(&sha256d::Hash::hash(&header).to_byte_array(), &target) {
+                nonce = Some(n);
+                break;
+            }
+        }
+        let nonce = nonce.ok_or_else(|| anyhow!("no winning nonce"))?;
+
+        let m = SubmitSharesExtended {
+            channel_id,
+            sequence_number: 0,
+            job_id,
+            nonce,
+            ntime: min_ntime,
+            version,
+            extranonce: B032::try_from(miner_extranonce).unwrap(),
+        };
+        miner
+            .write
+            .write_frame(wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesExtended(m))))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    /// A mock SV1 pool that *validates* each submitted share: it reconstructs the
+    /// coinbase (`coinb1 + extranonce1 + extranonce2 + coinb2`), the merkle root,
+    /// and the 80-byte header, and accepts only if SHA256d ≤ the share target.
+    async fn validating_sv1_pool(listener: TcpListener, accepted: mpsc::UnboundedSender<bool>) {
+        use stratum_core::bitcoin::hashes::{sha256d, Hash};
+        use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
+        use stratum_core::sv1_api::utils::PrevHash as Sv1PrevHash;
+
+        const MASK: u32 = 0x1fff_e000;
+        const VERSION: u32 = 0x2000_0000;
+        const NBITS: u32 = 0x207f_ffff;
+        const NTIME: u32 = 0x6500_0000;
+        const DIFFICULTY: f64 = 1e-9;
+        let en1: Vec<u8> = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let (coinb1, coinb2) = legacy_cb_reserving(en1.len() + 4);
+        let pv = [0x11u8; 32]; // internal byte order
+        let pv_str = String::from(Sv1PrevHash(U256::from(pv)));
+        let share_target = translate::target_from_difficulty(DIFFICULTY).to_vec();
+
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let accepted = accepted.clone();
+            let (en1, coinb1, coinb2, pv_str, share_target) =
+                (en1.clone(), coinb1.clone(), coinb2.clone(), pv_str.clone(), share_target.clone());
+            tokio::spawn(async move {
+                let (r, mut w) = sock.into_split();
+                let mut lines = BufReader::new(r).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let id = v.get("id").cloned().unwrap_or(Value::Null);
+                    let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    match method {
+                        "mining.configure" => {
+                            let reply = json!({"id": id, "result": {"version-rolling": true, "version-rolling.mask": "1fffe000"}, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        "mining.subscribe" => {
+                            let reply = json!({"id": id, "result": [[["mining.notify", "1"]], hex_string(&en1), 4], "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                            let sd = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [DIFFICULTY]});
+                            let _ = w.write_all(format!("{sd}\n").as_bytes()).await;
+                            let notify = json!({"id": Value::Null, "method": "mining.notify", "params": [
+                                "j1", pv_str, hex_string(&coinb1), hex_string(&coinb2), [],
+                                format!("{VERSION:08x}"), format!("{NBITS:08x}"), format!("{NTIME:08x}"), true
+                            ]});
+                            let _ = w.write_all(format!("{notify}\n").as_bytes()).await;
+                        }
+                        "mining.authorize" => {
+                            let reply = json!({"id": id, "result": true, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        "mining.submit" => {
+                            let p = v.get("params").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+                            let en2 = p.get(2).and_then(|x| x.as_str()).map(hex_bytes).unwrap_or_default();
+                            let ntime = p.get(3).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+                            let nonce = p.get(4).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+                            let vbits = p.get(5).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+
+                            let mut full_en = en1.clone();
+                            full_en.extend_from_slice(&en2);
+                            let empty: Vec<Vec<u8>> = vec![];
+                            let valid = match merkle_root_from_path(&coinb1, &coinb2, &full_en, &empty) {
+                                Some(root) => {
+                                    let version = (VERSION & !MASK) | (vbits & MASK);
+                                    let mut header = Vec::with_capacity(80);
+                                    header.extend_from_slice(&version.to_le_bytes());
+                                    header.extend_from_slice(&pv);
+                                    header.extend_from_slice(&root);
+                                    header.extend_from_slice(&ntime.to_le_bytes());
+                                    header.extend_from_slice(&NBITS.to_le_bytes());
+                                    header.extend_from_slice(&nonce.to_le_bytes());
+                                    le_leq(&sha256d::Hash::hash(&header).to_byte_array(), &share_target)
+                                }
+                                None => false,
+                            };
+                            let _ = accepted.send(valid);
+                            let reply = json!({"id": id, "result": valid, "error": Value::Null});
+                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+
+    fn hex_string(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).filter_map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn sv2_to_sv1_translated_share_is_cryptographically_valid() {
+        // The end-to-end proof: an SV2 miner mines a real share against the
+        // translated job; the SV1 pool independently rebuilds the coinbase +
+        // header and confirms SHA256d ≤ target. A wrong extranonce split or
+        // endianness anywhere makes the two headers diverge and the pool reject.
+        let sv1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sv1_addr = sv1.local_addr().unwrap();
+        let (acc_tx, mut acc_rx) = mpsc::unbounded_channel::<bool>();
+        tokio::spawn(validating_sv1_pool(sv1, acc_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&sv1_addr.to_string(), "acctSV1")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (down_cid, prefix) = tokio::time::timeout(Duration::from_secs(15), miner.open("bc1qSELLER.rig1", 1))
+            .await
+            .expect("open did not complete")
+            .unwrap();
+        assert_eq!(prefix, vec![0xaa, 0xbb, 0xcc, 0xdd], "channel prefix = SV1 extranonce1");
+
+        // Mine a real share against the translated job and submit it.
+        tokio::time::timeout(Duration::from_secs(20), mine_and_submit_one(&mut miner, down_cid, prefix))
+            .await
+            .expect("mining timed out")
+            .unwrap();
+
+        // The pool validated the reconstructed header and accepted it.
+        let valid = tokio::time::timeout(Duration::from_secs(5), acc_rx.recv())
+            .await
+            .expect("pool never saw the share")
+            .unwrap();
+        assert!(valid, "the translated share must be cryptographically valid at the SV1 pool");
+
+        // The acceptance is translated back to the miner.
+        let ok_cid = tokio::time::timeout(Duration::from_secs(5), miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS))
+            .await
+            .expect("share result timed out")
+            .unwrap();
+        assert_eq!(ok_cid, down_cid);
+    }
+
+    /// A header-only Standard miner: it gets a finished `merkle_root` in
+    /// `NewMiningJob` (the proxy built the coinbase), grinds a nonce against the
+    /// header, and submits `SubmitSharesStandard` (no extranonce).
+    async fn mine_standard_and_submit_one(miner: &mut MockMiner, channel_id: u32) -> anyhow::Result<()> {
+        use stratum_core::bitcoin::hashes::{sha256d, Hash};
+
+        let mut job: Option<([u8; 32], u32, u32)> = None; // merkle_root, version, job_id
+        let mut prev: Option<([u8; 32], u32, u32)> = None; // prev_hash, min_ntime, nbits
+        let mut target: Option<Vec<u8>> = None;
+        for _ in 0..50 {
+            let mut f = read_one(&mut miner.read).await?;
+            match wire::msg_type(&f) {
+                Some(mt) if mt == mining::MESSAGE_TYPE_NEW_MINING_JOB => {
+                    let payload = f.payload();
+                    if let Ok(Mining::NewMiningJob(m)) = Mining::try_from((mt, payload)) {
+                        let root: [u8; 32] = m.merkle_root.inner_as_ref().try_into().unwrap();
+                        job = Some((root, m.version, m.job_id));
+                    }
+                }
+                Some(mt) if mt == mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+                    if let Some(m) = parse_set_new_prev_hash(&mut f) {
+                        let ph: [u8; 32] = m.prev_hash.inner_as_ref().try_into().unwrap();
+                        prev = Some((ph, m.min_ntime, m.nbits));
+                    }
+                }
+                Some(mt) if mt == mining::MESSAGE_TYPE_SET_TARGET => {
+                    if let Some(t) = parse_set_target(&mut f) {
+                        target = Some(t);
+                    }
+                }
+                _ => {}
+            }
+            if job.is_some() && prev.is_some() && target.is_some() {
+                break;
+            }
+        }
+        let (merkle_root, version, job_id) = job.ok_or_else(|| anyhow!("no job"))?;
+        let (prev_hash, min_ntime, nbits) = prev.ok_or_else(|| anyhow!("no prev-hash"))?;
+        let target = target.ok_or_else(|| anyhow!("no target"))?;
+
+        let mut header = Vec::with_capacity(80);
+        header.extend_from_slice(&version.to_le_bytes());
+        header.extend_from_slice(&prev_hash);
+        header.extend_from_slice(&merkle_root);
+        header.extend_from_slice(&min_ntime.to_le_bytes());
+        header.extend_from_slice(&nbits.to_le_bytes());
+        let noff = header.len();
+        header.extend_from_slice(&0u32.to_le_bytes());
+        let mut nonce = None;
+        for n in 0u32..5_000_000 {
+            header[noff..noff + 4].copy_from_slice(&n.to_le_bytes());
+            if le_leq(&sha256d::Hash::hash(&header).to_byte_array(), &target) {
+                nonce = Some(n);
+                break;
+            }
+        }
+        let nonce = nonce.ok_or_else(|| anyhow!("no winning nonce"))?;
+
+        let m = mining::SubmitSharesStandard {
+            channel_id,
+            sequence_number: 0,
+            job_id,
+            nonce,
+            ntime: min_ntime,
+            version,
+        };
+        miner
+            .write
+            .write_frame(wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesStandard(m))))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sv2_standard_miner_onto_sv1_pool_is_cryptographically_valid() {
+        // Same proof as the Extended case, but for a header-only Standard miner:
+        // the proxy assembles the coinbase + folds the merkle root the miner mines
+        // against, and replays its chosen extranonce2 on the submit. The SV1 pool
+        // rebuilds the header independently and confirms SHA256d ≤ target.
+        let sv1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sv1_addr = sv1.local_addr().unwrap();
+        let (acc_tx, mut acc_rx) = mpsc::unbounded_channel::<bool>();
+        tokio::spawn(validating_sv1_pool(sv1, acc_tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&sv1_addr.to_string(), "acctSV1")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        // Open a STANDARD channel (the miner can't roll extranonce).
+        let open = Mining::OpenStandardMiningChannel(OpenStandardMiningChannel {
+            request_id: U32AsRef::from(1u32),
+            user_identity: Str0255::try_from("bc1qSELLER.rig1".to_string()).unwrap(),
+            nominal_hash_rate: 1.0e12,
+            max_target: U256::from([0xffu8; 32]),
+        });
+        miner.write.write_frame(wire::frame_from(AnyMessage::Mining(open))).await.unwrap();
+
+        let (channel_id, prefix) = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let mut f = read_one(&mut miner.read).await?;
+                if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS) {
+                    let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad open success"))?;
+                    return Ok::<_, anyhow::Error>((info.up_channel_id, info.extranonce_prefix));
+                }
+            }
+        })
+        .await
+        .expect("standard open did not complete")
+        .unwrap();
+        assert_eq!(prefix, vec![0xaa, 0xbb, 0xcc, 0xdd], "standard channel prefix = SV1 extranonce1");
+
+        tokio::time::timeout(Duration::from_secs(20), mine_standard_and_submit_one(&mut miner, channel_id))
+            .await
+            .expect("mining timed out")
+            .unwrap();
+
+        let valid = tokio::time::timeout(Duration::from_secs(5), acc_rx.recv())
+            .await
+            .expect("pool never saw the share")
+            .unwrap();
+        assert!(valid, "the translated standard share must be cryptographically valid at the SV1 pool");
+
+        let ok_cid = tokio::time::timeout(Duration::from_secs(5), miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS))
+            .await
+            .expect("share result timed out")
+            .unwrap();
+        assert_eq!(ok_cid, channel_id);
     }
 }
