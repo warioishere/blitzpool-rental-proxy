@@ -1087,7 +1087,7 @@ async fn connect_sv1_upstream(
     let sub = RpcMessage::request(
         json!(2),
         "mining.subscribe",
-        json!(["stratum-rental-proxy/0.1"]),
+        json!(["bp-proxy"]),
     );
     w.write_all(sub.to_line().as_bytes()).await?;
     let sub_resp = sv1_read_response(&mut read, &mut prelude).await?;
