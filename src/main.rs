@@ -99,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
         registry,
         sellers,
         orders,
+        #[cfg(feature = "sv2")]
+        sv2_rigs: Default::default(),
     };
 
     // Select the wire protocol's adapter at boot; the accept loop is

@@ -1122,6 +1122,8 @@ pub async fn handle_seller_miner(
         registry,
         sellers,
         orders,
+        // SV2-only rig bundling registry; not used by the SV1 relay.
+        ..
     } = ctx;
     let ip = peer_ip(&peer);
     // A fresh reconnect-hint (the miner returning onto its own pool) wins over
@@ -1919,6 +1921,8 @@ mod sv2_translate_tests {
         let ctx = ProxyContext {
             default_target: Some(boot_target.clone()),
             registry: registry.clone(),
+            #[cfg(feature = "sv2")]
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
@@ -2026,6 +2030,8 @@ mod sv2_translate_tests {
         let ctx = ProxyContext {
             default_target: Some(boot_target.clone()),
             registry: registry.clone(),
+            #[cfg(feature = "sv2")]
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };

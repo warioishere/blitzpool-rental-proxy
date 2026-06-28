@@ -40,6 +40,10 @@ pub struct ProxyContext {
     pub sellers: Arc<SellerStore>,
     /// Rental orders (a buyer renting a worker until a deadline).
     pub orders: Arc<OrderStore>,
+    /// Bundle-target SV2 rig per worker, so several same-rig SV2 miners share one
+    /// upstream (one group of N channels) instead of one upstream each.
+    #[cfg(feature = "sv2")]
+    pub sv2_rigs: Arc<crate::proto::sv2::relay::Sv2RigRegistry>,
 }
 
 /// Drives a single downstream miner connection for one Stratum protocol.

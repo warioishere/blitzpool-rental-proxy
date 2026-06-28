@@ -64,6 +64,9 @@ use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 const CERT_VALIDITY: u64 = 3600;
 /// SV2 protocol version the proxy speaks.
 const SV2_VERSION: u16 = 2;
+/// Default window to keep a rig's upstream warm after its last member leaves, so
+/// a quick reconnect re-attaches without a fresh Noise handshake + channel reopen.
+const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 pub(crate) type Read = NoiseTcpReadHalf<Msg>;
 pub(crate) type Write = NoiseTcpWriteHalf<Msg>;
@@ -148,16 +151,25 @@ fn setup_success(flags: u32) -> EitherFrame {
     )))
 }
 
-fn open_channel_upstream(spec: &OpenSpec, account: &str) -> anyhow::Result<EitherFrame> {
+/// Build an upstream `OpenMiningChannel` for `spec` under a caller-supplied
+/// `request_id`. Several members of one rig may pick the SAME downstream
+/// request_id, so the proxy assigns a unique one per open on the shared upstream
+/// (see `Inner::next_up_req`) and maps the reply back to the member; the stored
+/// spec keeps the miner's original request_id for the downstream OpenSuccess.
+fn open_channel_upstream(
+    spec: &OpenSpec,
+    account: &str,
+    request_id: u32,
+) -> anyhow::Result<EitherFrame> {
     let user = Str0255::try_from(account.to_string()).map_err(|_| anyhow!("account too long"))?;
     let msg = match spec {
         OpenSpec::Extended {
-            request_id,
             nominal_hash_rate,
             max_target,
             min_extranonce_size,
+            ..
         } => Mining::OpenExtendedMiningChannel(OpenExtendedMiningChannel {
-            request_id: *request_id,
+            request_id,
             user_identity: user,
             nominal_hash_rate: *nominal_hash_rate,
             max_target: U256::try_from(max_target.clone())
@@ -165,11 +177,11 @@ fn open_channel_upstream(spec: &OpenSpec, account: &str) -> anyhow::Result<Eithe
             min_extranonce_size: *min_extranonce_size,
         }),
         OpenSpec::Standard {
-            request_id,
             nominal_hash_rate,
             max_target,
+            ..
         } => Mining::OpenStandardMiningChannel(OpenStandardMiningChannel {
-            request_id: U32AsRef::from(*request_id),
+            request_id: U32AsRef::from(request_id),
             user_identity: user,
             nominal_hash_rate: *nominal_hash_rate,
             max_target: U256::try_from(max_target.clone())
@@ -241,6 +253,18 @@ fn open_channel_error(request_id: u32, reason: &str) -> anyhow::Result<EitherFra
     )))
 }
 
+/// Tell the upstream to close one of our channels — sent when a bundled member
+/// disconnects so the pool drops just that member from the rig's group (the
+/// other members keep mining on the shared upstream).
+fn close_channel_upstream(channel_id: u32) -> anyhow::Result<EitherFrame> {
+    let m = mining::CloseChannel {
+        channel_id,
+        reason_code: Str0255::try_from("member disconnected".to_string())
+            .map_err(|_| anyhow!("reason too long"))?,
+    };
+    Ok(wire::frame_from(AnyMessage::Mining(Mining::CloseChannel(m))))
+}
+
 // ── message parsers (copy fields out as owned) ──────────────────────
 
 fn parse_miner_open(frame: &mut Sv2Frame) -> Option<MinerOpen> {
@@ -288,6 +312,17 @@ pub(crate) fn parse_open_success(frame: &mut Sv2Frame) -> Option<ChannelInfo> {
             extranonce_size: 0,
             group_channel_id: m.group_channel_id,
         }),
+        _ => None,
+    }
+}
+
+/// The `request_id` of an `OpenMiningChannelError`, to route the failure back to
+/// the member whose pending open it answers.
+fn parse_open_error_request_id(frame: &mut Sv2Frame) -> Option<u32> {
+    let mt = wire::msg_type(frame)?;
+    let payload = frame.payload();
+    match Mining::try_from((mt, payload)).ok()? {
+        Mining::OpenMiningChannelError(m) => Some(m.request_id),
         _ => None,
     }
 }
@@ -424,7 +459,7 @@ pub(crate) async fn open_on(
     account: &str,
 ) -> anyhow::Result<ChannelInfo> {
     write
-        .write_frame(open_channel_upstream(spec, account)?)
+        .write_frame(open_channel_upstream(spec, account, spec.request_id())?)
         .await
         .map_err(|e| anyhow!("send OpenMiningChannel: {e:?}"))?;
     loop {
@@ -543,6 +578,10 @@ struct Channel {
     /// Current share difficulty (diff-1 units) from the channel's target;
     /// updated by `SetTarget`. Used to weight accepted shares for accounting.
     difficulty: f64,
+    /// The rig member (downstream connection) that opened this channel, so the
+    /// pool's per-channel frames route back to the right miner when several
+    /// same-rig miners share this upstream.
+    owner: u32,
 }
 
 struct Inner {
@@ -561,10 +600,25 @@ struct Inner {
     /// on it maps its (re-issued) upstream group_channel_id to this one id, which
     /// the miner learned from its OpenExtendedMiningChannelSuccess.
     group_down_id: Option<u32>,
-    /// request_id → spec for additional opens awaiting the upstream's success.
-    pending: std::collections::HashMap<u32, OpenSpec>,
+    /// proxy-assigned upstream request_id → (member, spec) for opens awaiting the
+    /// upstream's success. Keyed by the UNIQUE upstream request_id (not the
+    /// miner's, which can collide across members on a shared upstream); the member
+    /// is the connection that asked and the spec keeps the miner's original
+    /// request_id for the downstream OpenSuccess.
+    pending: std::collections::HashMap<u32, (u32, OpenSpec)>,
     /// Next downstream channel_id to hand out (proxy-assigned, stable).
     next_down_cid: u32,
+    /// Next proxy-assigned upstream request_id, unique across the shared upstream
+    /// so concurrent same-rig opens don't collide in `pending`.
+    next_up_req: u32,
+    /// Downstream miner connections sharing this rig's upstream, keyed by a
+    /// rig-local member id; each holds that connection's frame sink. Per-channel
+    /// upstream frames route to the owning member; group-broadcast jobs fan out
+    /// to all members. Usually one (a 1:1 miner connection); more than one when
+    /// several same-rig miners are bundled onto a single upstream.
+    members: std::collections::HashMap<u32, mpsc::UnboundedSender<EitherFrame>>,
+    /// Next member id to hand out.
+    next_member_id: u32,
     routing: Routing,
     default_target: UpstreamTarget,
     hashrate: HashrateWindow,
@@ -580,6 +634,14 @@ struct Inner {
     /// buyer pool speaks SV1 behind this SV2 miner). Jobs/shares are converted;
     /// additional channels are not multiplexed over the single SV1 connection.
     translating: bool,
+    /// The rig's upstream supervisor task (reconnect/failover). Owned by the rig,
+    /// not any one member, so it survives a single member leaving and is aborted
+    /// only when the last member disconnects.
+    supervisor: Option<JoinHandle<()>>,
+    /// Bumped each time the rig goes empty. A scheduled idle reaper only fires if
+    /// the token still matches, so a rejoin-then-leave round can't be reaped by a
+    /// stale earlier reaper.
+    idle_token: u64,
 }
 
 impl Inner {
@@ -590,14 +652,47 @@ impl Inner {
             .map(|c| c.up_channel_id)
     }
 
-    fn register_channel(&mut self, down_cid: u32, up_cid: u32, spec: OpenSpec, difficulty: f64) {
+    fn register_channel(
+        &mut self,
+        down_cid: u32,
+        up_cid: u32,
+        spec: OpenSpec,
+        difficulty: f64,
+        owner: u32,
+    ) {
         self.up_to_down.insert(up_cid, down_cid);
         self.channels.push(Channel {
             down_channel_id: down_cid,
             up_channel_id: up_cid,
             spec,
             difficulty,
+            owner,
         });
+    }
+
+    /// Register a downstream miner connection as a member of this rig, returning
+    /// its id. Each member has its own sink; per-channel upstream frames route to
+    /// the owning member, group-broadcast jobs fan out to all members.
+    fn add_member(&mut self, sink: mpsc::UnboundedSender<EitherFrame>) -> u32 {
+        let id = self.next_member_id;
+        self.next_member_id += 1;
+        self.members.insert(id, sink);
+        id
+    }
+
+    /// The sink of a given member, if still attached.
+    fn member_sink(&self, member: u32) -> Option<&mpsc::UnboundedSender<EitherFrame>> {
+        self.members.get(&member)
+    }
+
+    /// The sink of the member that owns the channel behind `up_cid`, if any.
+    fn member_sink_for_up(&self, up_cid: u32) -> Option<&mpsc::UnboundedSender<EitherFrame>> {
+        let owner = self
+            .channels
+            .iter()
+            .find(|c| c.up_channel_id == up_cid)?
+            .owner;
+        self.members.get(&owner)
     }
 
     /// Map an Extended channel's upstream `group_channel_id` into the downstream
@@ -625,9 +720,10 @@ impl Inner {
     }
 }
 
-/// A live SV2 seller-miner session.
+/// A live SV2 seller rig: one swappable upstream shared by one or more same-rig
+/// miner connections (members). Per-channel frames route to the owning member;
+/// group-broadcast jobs fan out to every member.
 pub struct Sv2Session {
-    to_miner: mpsc::UnboundedSender<EitherFrame>,
     inner: Mutex<Inner>,
     /// Serializes upstream swaps so two concurrent switches (e.g. an API rent and
     /// the expiry revert) can't interleave their connect/install and leave
@@ -710,19 +806,22 @@ impl Sv2Session {
         // Snapshot the channels to re-open (down_channel_id + spec) + worker +
         // the stable downstream group id (the miner already knows it, so the new
         // upstream's re-issued group id must map back onto it).
-        let (specs, generation, label, group_down_id) = {
+        let (specs, generation, label, group_down_id, members) = {
             let mut i = self.inner.lock().await;
             i.generation_counter += 1;
-            let specs: Vec<(u32, OpenSpec)> = i
+            let specs: Vec<(u32, u32, OpenSpec)> = i
                 .channels
                 .iter()
-                .map(|c| (c.down_channel_id, c.spec.clone()))
+                .map(|c| (c.down_channel_id, c.owner, c.spec.clone()))
                 .collect();
             (
                 specs,
                 i.generation_counter,
                 i.label.clone(),
                 i.group_down_id,
+                // Members don't change across an upstream swap; snapshot their
+                // sinks (cheap Sender clones) to re-point each one after.
+                i.members.clone(),
             )
         };
         // user_identity on the new pool: its account + the miner's worker, tagged.
@@ -752,7 +851,7 @@ impl Sv2Session {
         let mut new_channels = Vec::with_capacity(specs.len());
         let mut up_to_down = std::collections::HashMap::new();
         let mut repoint = Vec::with_capacity(specs.len());
-        for (down_cid, spec) in &specs {
+        for (down_cid, owner, spec) in &specs {
             let info = open_on(&mut read, &mut write, spec, &up_ident)
                 .await
                 .map_err(|e| anyhow!("switch reopen channel {down_cid}: {e}"))?;
@@ -776,13 +875,14 @@ impl Sv2Session {
                 up_channel_id: info.up_channel_id,
                 spec: spec.clone(),
                 difficulty: difficulty_from_target(&info.target),
+                owner: *owner,
             });
-            repoint.push((*down_cid, info.extranonce_prefix, info.target));
+            repoint.push((*down_cid, *owner, info.extranonce_prefix, info.target));
         }
 
         let (to_up, up_rx) = mpsc::unbounded_channel();
 
-        let abandoned: Vec<u32> = {
+        let abandoned: Vec<(u32, u32)> = {
             let mut i = self.inner.lock().await;
             // Spawn the new upstream's reader/writer while holding the lock and
             // install `active` (carrying the new generation) before releasing it.
@@ -805,9 +905,12 @@ impl Sv2Session {
             i.channels = new_channels;
             i.up_to_down = up_to_down;
             // In-flight opens were sent to the old upstream; abandon them and
-            // tell the miner so it can reopen (rather than hang).
-            let abandoned = i.pending.keys().copied().collect();
-            i.pending.clear();
+            // tell the requesting member so it can reopen (rather than hang).
+            let abandoned: Vec<(u32, u32)> = i
+                .pending
+                .drain()
+                .map(|(request_id, (member, _))| (member, request_id))
+                .collect();
             i.routing = routing;
             abandoned
         };
@@ -816,13 +919,17 @@ impl Sv2Session {
         // upstream then streams jobs + prev-hash per channel, which the reader
         // forwards. Downstream channel ids are unchanged, so the miner does not
         // reconnect.
-        for (down_cid, prefix, tgt) in repoint {
-            let _ = self.to_miner.send(set_extranonce_prefix(down_cid, prefix)?);
-            let _ = self.to_miner.send(set_target(down_cid, tgt)?);
+        for (down_cid, owner, prefix, tgt) in repoint {
+            if let Some(sink) = members.get(&owner) {
+                let _ = sink.send(set_extranonce_prefix(down_cid, prefix)?);
+                let _ = sink.send(set_target(down_cid, tgt)?);
+            }
         }
-        for request_id in abandoned {
+        for (member, request_id) in abandoned {
             if let Ok(f) = open_channel_error(request_id, "upstream switched; please reopen") {
-                let _ = self.to_miner.send(f);
+                if let Some(sink) = members.get(&member) {
+                    let _ = sink.send(f);
+                }
             }
         }
         info!(upstream = %target.url, generation, channels = specs.len(), "sv2 upstream switched");
@@ -847,25 +954,45 @@ impl Sv2Session {
             || mt == mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS
         {
             if let Some(info) = parse_open_success(&mut frame) {
-                if let Some(spec) = i.pending.remove(&info.request_id) {
+                if let Some((member, spec)) = i.pending.remove(&info.request_id) {
                     let down_cid = i.next_down_cid;
                     i.next_down_cid += 1;
                     let diff = difficulty_from_target(&info.target);
-                    i.register_channel(down_cid, info.up_channel_id, spec.clone(), diff);
+                    i.register_channel(down_cid, info.up_channel_id, spec.clone(), diff, member);
                     let down_group_id = i.map_group(info.group_channel_id, spec.is_extended());
                     if let Ok(reply) =
                         open_success_downstream(&spec, down_cid, down_group_id, &info)
                     {
-                        let _ = self.to_miner.send(reply);
+                        if let Some(sink) = i.member_sink(member) {
+                            let _ = sink.send(reply);
+                        }
                     }
-                    info!(worker = %i.label, down_cid, up_cid = info.up_channel_id, down_group_id, "sv2 additional channel opened");
+                    info!(worker = %i.label, member, down_cid, up_cid = info.up_channel_id, down_group_id, "sv2 additional channel opened");
                 }
             }
             return;
         }
-        // An additional open was rejected: pass the error to the miner.
+        // An additional open was rejected: pass the error back to the member that
+        // asked for it (or fan out if the request is unknown, so no miner hangs).
         if mt == mining::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR {
-            let _ = self.to_miner.send(frame.into());
+            match parse_open_error_request_id(&mut frame).and_then(|req| i.pending.remove(&req)) {
+                Some((member, spec)) => {
+                    // Rebuild with the miner's original request_id (the upstream
+                    // error echoes the proxy-assigned one the miner won't know).
+                    if let Some(sink) = i.member_sink(member) {
+                        if let Ok(f) =
+                            open_channel_error(spec.request_id(), "upstream rejected channel open")
+                        {
+                            let _ = sink.send(f);
+                        }
+                    }
+                }
+                None => {
+                    for sink in i.members.values() {
+                        let _ = sink.send(frame.clone().into());
+                    }
+                }
+            }
             return;
         }
 
@@ -963,10 +1090,32 @@ impl Sv2Session {
             }
         }
 
-        // Forward to the miner with the channel id remapped.
+        // Forward with the channel id remapped. A frame addressed to the group id
+        // (the pool's group-broadcast job + prev-hash) is fanned out to every
+        // member of the rig; a per-channel frame routes only to its owner.
         if let Some(&down_cid) = i.up_to_down.get(&up_cid) {
             wire::rewrite_channel_id(&mut frame, down_cid);
-            let _ = self.to_miner.send(frame.into());
+            if Some(down_cid) == i.group_down_id {
+                // Group-broadcast job: only members with an Extended channel are in
+                // the group. Standard members are ungrouped — their work arrives
+                // per channel — and must NOT get a group-addressed NewExtendedMiningJob
+                // (a header-only device can't process it). Fan out to grouped members.
+                let grouped: std::collections::HashSet<u32> = i
+                    .channels
+                    .iter()
+                    .filter(|c| c.spec.is_extended())
+                    .map(|c| c.owner)
+                    .collect();
+                for m in &grouped {
+                    if let Some(sink) = i.members.get(m) {
+                        let _ = sink.send(frame.clone().into());
+                    }
+                }
+            } else if let Some(sink) = i.member_sink_for_up(up_cid) {
+                let _ = sink.send(frame.into());
+            } else {
+                debug!(up_cid, down_cid, "no member owns this channel; dropping");
+            }
         } else {
             debug!(up_cid, "no channel mapping for upstream frame; dropping");
         }
@@ -1004,6 +1153,180 @@ impl Sv2Session {
     async fn worker_label(&self) -> String {
         self.inner.lock().await.label.clone()
     }
+
+    /// Whether the rig's upstream is an SV1 pool reached via translation (can't
+    /// multiplex extra channels, so it can't take bundled members).
+    async fn is_translating(&self) -> bool {
+        self.inner.lock().await.translating
+    }
+
+    /// Attach a same-rig miner connection as a new member and open its first
+    /// channel on the shared upstream. The steady reader finalizes the open and
+    /// routes the OpenSuccess back to this member. Returns the member id, or
+    /// `None` if the rig can't take more members (SV1-translated upstream).
+    async fn attach_member(
+        &self,
+        sink: mpsc::UnboundedSender<EitherFrame>,
+        spec: &OpenSpec,
+    ) -> Option<u32> {
+        let mut i = self.inner.lock().await;
+        if i.translating {
+            return None;
+        }
+        let member = i.add_member(sink);
+        let account = crate::proto::relay::upstream_worker(&i.active.target.user, &i.label);
+        let up_req = i.next_up_req;
+        i.next_up_req += 1;
+        match open_channel_upstream(spec, &account, up_req) {
+            Ok(f) => {
+                i.pending.insert(up_req, (member, spec.clone()));
+                let _ = i.active.to_up.send(f);
+            }
+            Err(e) => warn!(error = %e, "attach: additional channel open failed"),
+        }
+        Some(member)
+    }
+
+    /// Detach a member: close its channels on the shared upstream (so the pool
+    /// drops just this member from the group) and forget its channels/pending.
+    /// Returns true if this was the last member, so the caller tears the rig down.
+    async fn detach_member(&self, member: u32) -> bool {
+        let mut i = self.inner.lock().await;
+        i.members.remove(&member);
+        let up_cids: Vec<u32> = i
+            .channels
+            .iter()
+            .filter(|c| c.owner == member)
+            .map(|c| c.up_channel_id)
+            .collect();
+        for up in up_cids {
+            if let Ok(f) = close_channel_upstream(up) {
+                let _ = i.active.to_up.send(f);
+            }
+            i.up_to_down.remove(&up);
+        }
+        i.channels.retain(|c| c.owner != member);
+        i.pending.retain(|_, (m, _)| *m != member);
+        i.members.is_empty()
+    }
+}
+
+/// The bundle-target SV2 rig for each worker, so several same-rig miners share
+/// one upstream (one group of N channels) instead of one upstream each. Holds
+/// only non-translating (SV2) sessions; SV1-translated rigs and any parallel
+/// standalone sessions are not bundle targets and stay 1:1.
+pub struct Sv2RigRegistry {
+    rigs: Mutex<HashMap<String, Arc<Sv2Session>>>,
+    /// Per-worker create-or-attach gate so two same-rig miners connecting at once
+    /// don't both build an upstream; the loser waits, then attaches. The idle
+    /// reaper takes the same gate, so an attach and a reap can't interleave.
+    /// Distinct workers don't contend. Kept for the proxy's lifetime (bounded by
+    /// distinct worker names) so a waiting attach can't race a fresh gate Arc.
+    gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// How long to keep an emptied rig's upstream warm before reaping it.
+    idle_grace: Duration,
+}
+
+impl Default for Sv2RigRegistry {
+    fn default() -> Self {
+        Self {
+            rigs: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
+            idle_grace: DEFAULT_IDLE_GRACE,
+        }
+    }
+}
+
+impl Sv2RigRegistry {
+    /// A registry with a custom idle-grace window (tests use a short one).
+    #[cfg(test)]
+    fn with_grace(idle_grace: Duration) -> Self {
+        Self {
+            idle_grace,
+            ..Default::default()
+        }
+    }
+
+    /// The serialization gate for one worker's create-or-attach (and reap).
+    async fn gate(&self, worker: &str) -> Arc<Mutex<()>> {
+        self.gates
+            .lock()
+            .await
+            .entry(worker.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// The bundle-target rig for a worker, if one is registered.
+    async fn get(&self, worker: &str) -> Option<Arc<Sv2Session>> {
+        self.rigs.lock().await.get(worker).cloned()
+    }
+
+    /// Is `rig` the currently-registered bundle target for `worker`?
+    async fn is_target(&self, worker: &str, rig: &Arc<Sv2Session>) -> bool {
+        self.rigs
+            .lock()
+            .await
+            .get(worker)
+            .is_some_and(|r| Arc::ptr_eq(r, rig))
+    }
+
+    /// Register `rig` as the bundle target for `worker`, but only if the slot is
+    /// free (a translated rig or a race may already hold it; then this session
+    /// runs standalone). Returns whether it became the bundle target.
+    async fn insert_if_absent(&self, worker: &str, rig: Arc<Sv2Session>) -> bool {
+        let mut m = self.rigs.lock().await;
+        if m.contains_key(worker) {
+            return false;
+        }
+        m.insert(worker.to_string(), rig);
+        true
+    }
+
+    /// Remove `rig` as the bundle target for `worker` — but only if it is still
+    /// the registered one (a late teardown must not evict a fresh replacement).
+    /// The per-worker gate is intentionally kept.
+    async fn remove(&self, worker: &str, rig: &Arc<Sv2Session>) {
+        let mut m = self.rigs.lock().await;
+        if m.get(worker).is_some_and(|existing| Arc::ptr_eq(existing, rig)) {
+            m.remove(worker);
+        }
+    }
+}
+
+/// After the idle-grace window, reap a rig whose last member never came back:
+/// drop it from both registries and abort its upstream tasks. No-ops if a member
+/// has since (re)attached, or if the rig emptied again under a newer token (a
+/// fresh reaper owns that round). Takes the per-worker gate so it can't interleave
+/// with a concurrent attach.
+async fn reap_idle_rig(
+    rigs: Arc<Sv2RigRegistry>,
+    registry: Arc<crate::registry::Registry>,
+    session: Arc<Sv2Session>,
+    worker: String,
+    token: u64,
+    grace: Duration,
+) {
+    tokio::time::sleep(grace).await;
+    let gate = rigs.gate(&worker).await;
+    let _hold = gate.lock().await;
+    {
+        let i = session.inner.lock().await;
+        if !i.members.is_empty() || i.idle_token != token {
+            return; // a member rejoined, or a newer idle round owns the reap
+        }
+    }
+    rigs.remove(&worker, &session).await;
+    registry
+        .remove_if(&worker, &AnySession::Sv2(session.clone()))
+        .await;
+    let i = session.inner.lock().await;
+    i.active.reader.abort();
+    i.active.writer.abort();
+    if let Some(sup) = &i.supervisor {
+        sup.abort();
+    }
+    info!(%worker, "sv2 rig reaped after idle grace");
 }
 
 // ── SV1 upstream translator (combo 4): SV2 miner ↔ SV1 buyer pool ────
@@ -1397,13 +1720,16 @@ async fn handle_sv1_line(
 impl Sv2Session {
     /// Forward a synthesized frame to the miner if the generation is current.
     async fn send_translate_frame(&self, generation: u64, frame: EitherFrame) {
-        {
-            let i = self.inner.lock().await;
-            if generation != i.active.generation {
-                return;
-            }
+        let i = self.inner.lock().await;
+        if generation != i.active.generation {
+            return;
         }
-        let _ = self.to_miner.send(frame);
+        // SV1 translation carries a single channel/member; deliver to it. (The
+        // transport `EitherFrame` isn't `Clone`, so there's no fan-out here — SV1
+        // upstreams are never bundled.)
+        if let Some(sink) = i.members.values().next() {
+            let _ = sink.send(frame);
+        }
     }
 
     /// Record the share difficulty implied by the SV1 pool's `set_difficulty`.
@@ -1471,6 +1797,7 @@ impl Sv2Session {
         spec: OpenSpec,
         worker: &str,
         routing: Routing,
+        member: u32,
     ) -> anyhow::Result<()> {
         let up_ident = crate::proto::relay::upstream_worker(&target.user, worker);
         // Native first: try SV2 (reusing its socket on success); if the pool
@@ -1478,7 +1805,7 @@ impl Sv2Session {
         match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_setup(&target)).await
         {
             Ok(Ok((read, write, _flags))) => {
-                self.install_sv2_initial(read, write, spec, up_ident, target, routing)
+                self.install_sv2_initial(read, write, spec, up_ident, target, routing, member)
                     .await
             }
             res => {
@@ -1486,7 +1813,7 @@ impl Sv2Session {
                     debug!(url = %target.url, error = %e, "upstream not SV2; trying SV1 translation");
                 }
                 let conn = connect_sv1_upstream(&target, &up_ident).await?;
-                self.install_sv1_translate_initial(conn, spec, up_ident, target, routing)
+                self.install_sv1_translate_initial(conn, spec, up_ident, target, routing, member)
                     .await
             }
         }
@@ -1494,6 +1821,7 @@ impl Sv2Session {
 
     /// Install an SV2 passthrough upstream and forward the miner's open (the
     /// steady reader finalizes it on the pool's OpenSuccess).
+    #[allow(clippy::too_many_arguments)] // wire-plumbing install path; cohesive args
     async fn install_sv2_initial(
         self: &Arc<Self>,
         read: Read,
@@ -1502,6 +1830,7 @@ impl Sv2Session {
         up_ident: String,
         target: UpstreamTarget,
         routing: Routing,
+        member: u32,
     ) -> anyhow::Result<()> {
         let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
         let writer = spawn_writer(write, up_rx);
@@ -1518,10 +1847,12 @@ impl Sv2Session {
         };
         i.routing = routing;
         i.translating = false;
-        i.pending.insert(spec.request_id(), spec.clone());
+        let up_req = i.next_up_req;
+        i.next_up_req += 1;
+        i.pending.insert(up_req, (member, spec.clone()));
         i.active
             .to_up
-            .send(open_channel_upstream(&spec, &up_ident)?)
+            .send(open_channel_upstream(&spec, &up_ident, up_req)?)
             .map_err(|_| anyhow!("upstream writer gone"))?;
         Ok(())
     }
@@ -1535,15 +1866,16 @@ impl Sv2Session {
         up_ident: String,
         target: UpstreamTarget,
         routing: Routing,
+        member: u32,
     ) -> anyhow::Result<()> {
         let extended = spec.is_extended();
-        let down_cid = {
+        let (down_cid, sink) = {
             let mut i = self.inner.lock().await;
             let c = i.next_down_cid;
             i.next_down_cid += 1;
-            c
+            (c, i.member_sink(member).cloned())
         };
-        // Reply OpenSuccess to the miner before any job (FIFO on to_miner): the
+        // Reply OpenSuccess to the member before any job (FIFO on its sink): the
         // SV1 extranonce1 is the channel's extranonce_prefix. The builder emits a
         // Standard or Extended success per the channel type the miner opened.
         let info = ChannelInfo {
@@ -1554,9 +1886,10 @@ impl Sv2Session {
             extranonce_size: conn.extranonce2_size,
             group_channel_id: 0,
         };
-        self.to_miner
-            .send(open_success_downstream(&spec, down_cid, 0, &info)?)
-            .map_err(|_| anyhow!("miner writer gone"))?;
+        if let Some(sink) = &sink {
+            sink.send(open_success_downstream(&spec, down_cid, 0, &info)?)
+                .map_err(|_| anyhow!("miner writer gone"))?;
+        }
 
         let state = Arc::new(Mutex::new(Sv1UpState {
             version_mask: conn.version_mask,
@@ -1597,6 +1930,7 @@ impl Sv2Session {
                 up_channel_id: down_cid,
                 spec,
                 difficulty: conn.initial_diff,
+                owner: member,
             }];
             i.up_to_down = HashMap::from([(down_cid, down_cid)]);
             i.pending.clear();
@@ -1614,10 +1948,15 @@ impl Sv2Session {
         generation: u64,
         up_ident: String,
     ) -> anyhow::Result<()> {
-        let (down_cid, spec) = {
+        let (down_cid, owner, spec, members) = {
             let i = self.inner.lock().await;
             match i.channels.first() {
-                Some(c) => (c.down_channel_id, c.spec.clone()),
+                Some(c) => (
+                    c.down_channel_id,
+                    c.owner,
+                    c.spec.clone(),
+                    i.members.clone(),
+                ),
                 None => bail!("no channel to switch"),
             }
         };
@@ -1639,7 +1978,7 @@ impl Sv2Session {
         }));
         let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
         let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
-        let abandoned: Vec<u32> = {
+        let abandoned: Vec<(u32, u32)> = {
             let mut i = self.inner.lock().await;
             let reader = spawn_sv1_translate_reader(
                 self.clone(),
@@ -1663,23 +2002,29 @@ impl Sv2Session {
                 up_channel_id: down_cid,
                 spec,
                 difficulty: conn.initial_diff,
+                owner,
             }];
             i.up_to_down = HashMap::from([(down_cid, down_cid)]);
-            let abandoned = i.pending.keys().copied().collect();
-            i.pending.clear();
+            let abandoned: Vec<(u32, u32)> = i
+                .pending
+                .drain()
+                .map(|(request_id, (member, _))| (member, request_id))
+                .collect();
             i.routing = routing;
             i.translating = true;
             abandoned
         };
-        // Re-point the miner: new extranonce prefix + target; the reader streams
-        // the new pool's first job after.
-        let _ = self
-            .to_miner
-            .send(set_extranonce_prefix(down_cid, extranonce1)?);
-        let _ = self.to_miner.send(set_target(down_cid, initial_target)?);
-        for request_id in abandoned {
+        // Re-point the channel's owner: new extranonce prefix + target; the reader
+        // streams the new pool's first job after.
+        if let Some(sink) = members.get(&owner) {
+            let _ = sink.send(set_extranonce_prefix(down_cid, extranonce1)?);
+            let _ = sink.send(set_target(down_cid, initial_target)?);
+        }
+        for (member, request_id) in abandoned {
             if let Ok(f) = open_channel_error(request_id, "upstream switched; please reopen") {
-                let _ = self.to_miner.send(f);
+                if let Some(sink) = members.get(&member) {
+                    let _ = sink.send(f);
+                }
             }
         }
         info!(upstream = %target.url, generation, "sv2→sv1 upstream switched (translated)");
@@ -1750,70 +2095,127 @@ pub async fn handle_seller_miner_sv2(
         None => (idle_target.clone(), Routing::Idle),
     };
 
-    // 6. Build the session with a placeholder upstream, then connect + install
-    //    the real one — SV2 passthrough or SV1 translation, auto-detected from the
-    //    pool. On the primary's failure, fall back to the order's fallback pool.
-    let (died_tx, died_rx) = mpsc::unbounded_channel::<u64>();
-    let (placeholder_to_up, _placeholder_rx) = mpsc::unbounded_channel::<EitherFrame>();
-    let session = Arc::new(Sv2Session {
-        to_miner: to_miner.clone(),
-        switch: Mutex::new(()),
-        died_tx,
-        orders: ctx.orders.clone(),
-        reconnect: Notify::new(),
-        inner: Mutex::new(Inner {
-            active: ActiveUpstream {
-                generation: 0,
-                target: open_target.clone(),
-                to_up: placeholder_to_up,
-                reader: tokio::spawn(async {}), // placeholders, installed below
-                writer: tokio::spawn(async {}),
-            },
-            generation_counter: 0,
-            channels: Vec::new(),
-            up_to_down: std::collections::HashMap::new(),
-            group_down_id: None,
-            pending: std::collections::HashMap::new(),
-            next_down_cid: 1,
-            routing: routing.clone(),
-            default_target: idle_target.clone(),
-            hashrate: HashrateWindow::new(Duration::from_secs(600)),
-            delivered_work: 0.0,
-            accepted_shares: 0,
-            submitted_shares: 0,
-            accept_low_logged: false,
-            label: worker.clone(),
-            translating: false,
-        }),
-    });
+    // 6. Bundle onto this rig's existing SV2 upstream if one is live; else build a
+    //    fresh session (which becomes the rig if its upstream ends up SV2). The
+    //    per-worker gate serializes create-or-attach so two same-rig miners
+    //    connecting at once don't each build an upstream.
+    let gate = ctx.sv2_rigs.gate(&worker).await;
+    let _hold = gate.lock().await;
 
-    if let Err(e) = session
-        .connect_and_install_initial(open_target.clone(), spec.clone(), &worker, routing.clone())
-        .await
-    {
-        match active_order.as_ref().and_then(|o| o.fallback.clone()) {
-            Some(fb) => {
-                warn!(%worker, error = %e, "primary buyer pool unreachable — using fallback");
-                open_target = fb.clone();
-                session
-                    .connect_and_install_initial(fb, spec.clone(), &worker, routing.clone())
-                    .await?;
+    let attached = match ctx.sv2_rigs.get(&worker).await {
+        Some(rig) => rig
+            .attach_member(to_miner.clone(), &spec)
+            .await
+            .map(|member| (rig, member)),
+        None => None,
+    };
+
+    let (session, member_id) = match attached {
+        Some((rig, member)) => {
+            drop(_hold);
+            info!(%peer, %worker, member, "sv2 miner bundled onto existing rig");
+            (rig, member)
+        }
+        None => {
+            // Build the session with a placeholder upstream, then connect +
+            // install the real one — SV2 passthrough or SV1 translation,
+            // auto-detected. On primary failure, fall back to the order's pool.
+            let (died_tx, died_rx) = mpsc::unbounded_channel::<u64>();
+            let (placeholder_to_up, _placeholder_rx) = mpsc::unbounded_channel::<EitherFrame>();
+            let session = Arc::new(Sv2Session {
+                switch: Mutex::new(()),
+                died_tx,
+                orders: ctx.orders.clone(),
+                reconnect: Notify::new(),
+                inner: Mutex::new(Inner {
+                    active: ActiveUpstream {
+                        generation: 0,
+                        target: open_target.clone(),
+                        to_up: placeholder_to_up,
+                        reader: tokio::spawn(async {}), // placeholders, installed below
+                        writer: tokio::spawn(async {}),
+                    },
+                    generation_counter: 0,
+                    channels: Vec::new(),
+                    up_to_down: std::collections::HashMap::new(),
+                    group_down_id: None,
+                    pending: std::collections::HashMap::new(),
+                    next_down_cid: 1,
+                    next_up_req: 1,
+                    members: std::collections::HashMap::new(),
+                    next_member_id: 1,
+                    routing: routing.clone(),
+                    default_target: idle_target.clone(),
+                    hashrate: HashrateWindow::new(Duration::from_secs(600)),
+                    delivered_work: 0.0,
+                    accepted_shares: 0,
+                    submitted_shares: 0,
+                    accept_low_logged: false,
+                    label: worker.clone(),
+                    translating: false,
+                    supervisor: None,
+                    idle_token: 0,
+                }),
+            });
+
+            // This connection is the rig's first member; its sink owns the
+            // initial channel and receives that channel's per-channel frames.
+            let member_id = session.inner.lock().await.add_member(to_miner.clone());
+
+            if let Err(e) = session
+                .connect_and_install_initial(
+                    open_target.clone(),
+                    spec.clone(),
+                    &worker,
+                    routing.clone(),
+                    member_id,
+                )
+                .await
+            {
+                match active_order.as_ref().and_then(|o| o.fallback.clone()) {
+                    Some(fb) => {
+                        warn!(%worker, error = %e, "primary buyer pool unreachable — using fallback");
+                        open_target = fb.clone();
+                        session
+                            .connect_and_install_initial(
+                                fb,
+                                spec.clone(),
+                                &worker,
+                                routing.clone(),
+                                member_id,
+                            )
+                            .await?;
+                    }
+                    None => return Err(e),
+                }
             }
-            None => return Err(e),
-        }
-    }
 
-    ctx.registry
-        .insert(worker.clone(), AnySession::Sv2(session.clone()))
-        .await;
-    // Supervisor: reconnect / fail over to the fallback if the upstream drops.
-    let supervisor = tokio::spawn(supervise_upstream(session.clone(), died_rx));
-    match &active_order {
-        Some(o) => {
-            info!(%peer, %worker, upstream = %open_target.url, order = %o.id, "sv2 relay established (rented)")
+            ctx.registry
+                .insert(worker.clone(), AnySession::Sv2(session.clone()))
+                .await;
+            // Supervisor owned by the rig (aborted only on last-member teardown).
+            let supervisor = tokio::spawn(supervise_upstream(session.clone(), died_rx));
+            session.inner.lock().await.supervisor = Some(supervisor);
+
+            // Become the bundle target for this worker only if the upstream is SV2
+            // (a translated SV1 rig can't multiplex) and the slot is still free.
+            if !session.is_translating().await {
+                ctx.sv2_rigs
+                    .insert_if_absent(&worker, session.clone())
+                    .await;
+            }
+            drop(_hold);
+            match &active_order {
+                Some(o) => {
+                    info!(%peer, %worker, member = member_id, upstream = %open_target.url, order = %o.id, "sv2 relay established (rented)")
+                }
+                None => {
+                    info!(%peer, %worker, member = member_id, upstream = %open_target.url, "sv2 relay established (idle)")
+                }
+            }
+            (session, member_id)
         }
-        None => info!(%peer, %worker, upstream = %open_target.url, "sv2 relay established (idle)"),
-    }
+    };
 
     // 9. Downstream loop: open additional channels and forward shares/updates
     //    upstream (channel-id remapped per channel).
@@ -1859,9 +2261,11 @@ pub async fn handle_seller_miner_sv2(
                     }
                     let account =
                         crate::proto::relay::upstream_worker(&i.active.target.user, &i.label);
-                    match open_channel_upstream(&open.spec, &account) {
+                    let up_req = i.next_up_req;
+                    i.next_up_req += 1;
+                    match open_channel_upstream(&open.spec, &account, up_req) {
                         Ok(f) => {
-                            i.pending.insert(open.spec.request_id(), open.spec.clone());
+                            i.pending.insert(up_req, (member_id, open.spec.clone()));
                             let _ = i.active.to_up.send(f);
                         }
                         Err(e) => warn!(%worker, error = %e, "additional channel open failed"),
@@ -1912,19 +2316,48 @@ pub async fn handle_seller_miner_sv2(
         debug!(%peer, error = %e, "sv2 downstream ended");
     }
 
-    // Teardown.
-    let label = session.worker_label().await;
-    ctx.registry
-        .remove_if(&label, &AnySession::Sv2(session.clone()))
-        .await;
-    supervisor.abort();
-    {
-        let i = session.inner.lock().await;
-        i.active.reader.abort();
-        i.active.writer.abort();
-    }
+    // Teardown: detach this member (close its channels on the shared upstream so
+    // the pool drops it from the group). Only when it was the LAST member do we
+    // tear the whole rig down — other bundled members keep mining.
+    let was_last = session.detach_member(member_id).await;
     miner_writer.abort();
-    info!(%peer, "sv2 relay closed");
+    if was_last {
+        let label = session.worker_label().await;
+        if ctx.sv2_rigs.is_target(&label, &session).await {
+            // Bundle-target rig: keep the upstream warm for a grace window so a
+            // quick reconnect re-attaches without a fresh handshake. A reaper
+            // closes it if it's still idle when the window elapses.
+            let token = {
+                let mut i = session.inner.lock().await;
+                i.idle_token += 1;
+                i.idle_token
+            };
+            info!(%peer, %label, "sv2 rig idle (last member left); grace before close");
+            tokio::spawn(reap_idle_rig(
+                ctx.sv2_rigs.clone(),
+                ctx.registry.clone(),
+                session.clone(),
+                label,
+                token,
+                ctx.sv2_rigs.idle_grace,
+            ));
+        } else {
+            // Standalone session (not a bundle target): close immediately — a
+            // reconnect couldn't re-attach to it anyway.
+            ctx.registry
+                .remove_if(&label, &AnySession::Sv2(session.clone()))
+                .await;
+            let i = session.inner.lock().await;
+            i.active.reader.abort();
+            i.active.writer.abort();
+            if let Some(sup) = &i.supervisor {
+                sup.abort();
+            }
+            info!(%peer, %label, "sv2 session closed");
+        }
+    } else {
+        info!(%peer, member = member_id, "sv2 member left; rig keeps running");
+    }
     Ok(())
 }
 
@@ -2176,7 +2609,7 @@ mod tests {
                 min_extranonce_size: 8,
             };
             self.write
-                .write_frame(open_channel_upstream(&spec, worker)?)
+                .write_frame(open_channel_upstream(&spec, worker, request_id)?)
                 .await
                 .map_err(|e| anyhow!("{e:?}"))
         }
@@ -2188,6 +2621,32 @@ mod tests {
                 let mut f = read_one(&mut self.read).await?;
                 if wire::msg_type(&f)
                     == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
+                {
+                    let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
+                    return Ok((info.up_channel_id, info.extranonce_prefix));
+                }
+            }
+        }
+
+        /// Open a Standard channel; returns `(downstream_channel_id, prefix)`.
+        async fn open_standard(
+            &mut self,
+            worker: &str,
+            request_id: u32,
+        ) -> anyhow::Result<(u32, Vec<u8>)> {
+            let spec = OpenSpec::Standard {
+                request_id,
+                nominal_hash_rate: 1.0e12,
+                max_target: vec![0xffu8; 32],
+            };
+            self.write
+                .write_frame(open_channel_upstream(&spec, worker, request_id)?)
+                .await
+                .map_err(|e| anyhow!("{e:?}"))?;
+            loop {
+                let mut f = read_one(&mut self.read).await?;
+                if wire::msg_type(&f)
+                    == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
                 {
                     let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
                     return Ok((info.up_channel_id, info.extranonce_prefix));
@@ -2236,6 +2695,23 @@ mod tests {
             self.write
                 .write_frame(wire::frame_from(AnyMessage::Mining(
                     Mining::SubmitSharesExtended(m),
+                )))
+                .await
+                .map_err(|e| anyhow!("{e:?}"))
+        }
+
+        async fn submit_standard(&mut self, channel_id: u32, seq: u32) -> anyhow::Result<()> {
+            let m = mining::SubmitSharesStandard {
+                channel_id,
+                sequence_number: seq,
+                job_id: 1,
+                nonce: 0,
+                ntime: 0,
+                version: 0x2000_0000,
+            };
+            self.write
+                .write_frame(wire::frame_from(AnyMessage::Mining(
+                    Mining::SubmitSharesStandard(m),
                 )))
                 .await
                 .map_err(|e| anyhow!("{e:?}"))
@@ -2324,6 +2800,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
@@ -2421,6 +2898,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
@@ -2498,6 +2976,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
@@ -2615,6 +3094,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
@@ -2690,6 +3170,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: orders.clone(),
         };
@@ -2815,6 +3296,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(pool.clone()),
             orders: crate::orders::OrderStore::new(pool.clone()),
         };
@@ -2915,6 +3397,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
@@ -3055,6 +3538,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
@@ -3182,6 +3666,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
@@ -3275,6 +3760,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
@@ -3344,6 +3830,9 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            // Short idle-grace so the post-drop deregistration is observable in the
+            // test window (the miner here does not reconnect).
+            sv2_rigs: Arc::new(Sv2RigRegistry::with_grace(Duration::from_millis(50))),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
@@ -3431,6 +3920,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
@@ -3521,6 +4011,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
@@ -3583,8 +4074,9 @@ mod tests {
 
     #[tokio::test]
     async fn same_worker_miners_form_one_rig_switched_together() {
-        // MRR model: 2 miners under the SAME worker name = one rig. Each is its
-        // own session; renting switches BOTH and the rig status sums them.
+        // MRR model: 2 miners under the SAME worker name = one rig. They are
+        // BUNDLED onto one shared upstream (one connection, two channels); renting
+        // switches the rig (both members at once) and the status covers both.
         let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a_addr = pool_a.local_addr().unwrap();
         let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3613,6 +4105,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
@@ -3634,7 +4127,8 @@ mod tests {
             }
         });
 
-        // Two miners, SAME worker name → both land on pool A.
+        // Two miners, SAME worker name → both bundle onto ONE shared upstream to
+        // pool A (the second attaches as a member, no second upstream).
         let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
         m1.setup().await.unwrap();
         let (cid1, p1) = m1.open("bc1qSELLER.farm", 1).await.unwrap();
@@ -3644,22 +4138,21 @@ mod tests {
         let (_cid2, p2) = m2.open("bc1qSELLER.farm", 1).await.unwrap();
         assert_eq!(p2, vec![0xAA; 8], "miner 2 on seller default pool A");
 
-        // Both registered as ONE rig (two sessions under the shared name).
+        // Bundled into ONE rig session (one shared upstream), not two.
         let sessions = loop {
             let s = registry.get_all("bc1qSELLER.farm").await;
-            if s.len() == 2 {
+            if s.len() == 1 {
                 break s;
             }
             tokio::task::yield_now().await;
         };
-        assert_eq!(sessions.len(), 2, "two miners → one rig, two sessions");
+        assert_eq!(sessions.len(), 1, "two same-rig miners → one shared session");
 
-        // Rent the whole rig: switch every session to pool B.
-        for sess in &sessions {
-            sess.switch_to("o1".to_string(), ext_target(&b_addr.to_string(), "acctB"))
-                .await
-                .unwrap();
-        }
+        // Rent the rig: switching the single session re-points BOTH members.
+        sessions[0]
+            .switch_to("o1".to_string(), ext_target(&b_addr.to_string(), "acctB"))
+            .await
+            .unwrap();
 
         // BOTH miners get re-pointed to pool B (new prefix), same channel id.
         let (rc1, rp1) = m1.read_until_set_extranonce().await.unwrap();
@@ -3668,9 +4161,608 @@ mod tests {
         let (_rc2, rp2) = m2.read_until_set_extranonce().await.unwrap();
         assert_eq!(rp2, vec![0xBB; 8], "miner 2 switched to pool B");
 
-        // The rig reads as rented (any session rented ⇒ rig rented).
+        // The rig reads as rented.
         let st = registry.aggregated_status("bc1qSELLER.farm").await.unwrap();
         assert_eq!(st.routing, "rented", "the whole rig is rented");
+    }
+
+    #[tokio::test]
+    async fn bundled_member_can_leave_and_rejoin_without_dropping_the_rig() {
+        // A bundled member disconnecting must NOT tear the rig down: the others
+        // keep mining on the shared upstream, and a later (re)connect attaches as
+        // a fresh member rather than opening a second upstream.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let (a_tx, mut a_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool_multi(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sv2_rigs: Default::default(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.farm",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = proxy.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+                });
+            }
+        });
+
+        // Two same-rig miners bundle onto one shared upstream.
+        let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+        m1.setup().await.unwrap();
+        let (_cid1, _) = m1.open("bc1qSELLER.farm", 1).await.unwrap();
+        let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+        m2.setup().await.unwrap();
+        let (cid2, _) = m2.open("bc1qSELLER.farm", 1).await.unwrap();
+
+        loop {
+            if registry.get_all("bc1qSELLER.farm").await.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Miner 1 leaves the bundle.
+        drop(m1);
+
+        // Miner 2 keeps mining on the shared upstream: its share still reaches A.
+        m2.submit(cid2, 1).await.unwrap();
+        a_rx
+            .recv()
+            .await
+            .expect("miner 2 share reaches pool A after miner 1 left");
+
+        // The rig is still the one shared session (a member leaving didn't drop it).
+        assert_eq!(
+            registry.get_all("bc1qSELLER.farm").await.len(),
+            1,
+            "rig survives a member leaving"
+        );
+
+        // A new same-rig miner rejoins the SAME rig (attaches; no second session).
+        let mut m3 = MockMiner::connect(proxy_addr).await.unwrap();
+        m3.setup().await.unwrap();
+        let (_cid3, p3) = m3.open("bc1qSELLER.farm", 1).await.unwrap();
+        assert_eq!(p3, vec![0xAA; 8], "rejoining miner lands on the shared pool A");
+        assert_eq!(
+            registry.get_all("bc1qSELLER.farm").await.len(),
+            1,
+            "rejoin attaches to the existing rig, not a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn three_same_rig_miners_bundle_and_switch_together() {
+        // Three miners under one worker share a single upstream; renting the rig
+        // re-points all three members to the buyer pool at once.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = pool_b.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool_multi(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+        tokio::spawn(mock_pool_multi(
+            pool_b,
+            vec![0xBB; 8],
+            99,
+            NoiseKeys::generate(),
+            b_tx,
+        ));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sv2_rigs: Default::default(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.farm",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = proxy.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+                });
+            }
+        });
+
+        // Three same-rig miners (connected one after another so each bundles onto
+        // the rig the first one created).
+        let mut miners = Vec::new();
+        let mut cids = Vec::new();
+        for _ in 0..3 {
+            let mut m = MockMiner::connect(proxy_addr).await.unwrap();
+            m.setup().await.unwrap();
+            let (cid, p) = m.open("bc1qSELLER.farm", 1).await.unwrap();
+            assert_eq!(p, vec![0xAA; 8], "miner on shared pool A");
+            cids.push(cid);
+            miners.push(m);
+        }
+
+        let sessions = loop {
+            let s = registry.get_all("bc1qSELLER.farm").await;
+            if s.len() == 1 {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(sessions.len(), 1, "three same-rig miners → one shared session");
+
+        // Rent: switching the single session re-points ALL three members.
+        sessions[0]
+            .switch_to("o1".to_string(), ext_target(&b_addr.to_string(), "acctB"))
+            .await
+            .unwrap();
+        for (i, m) in miners.iter_mut().enumerate() {
+            let (rc, rp) = m.read_until_set_extranonce().await.unwrap();
+            assert_eq!(rp, vec![0xBB; 8], "miner {i} switched to pool B");
+            assert_eq!(rc, cids[i], "miner {i} keeps its downstream channel id");
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_same_worker_connects_form_one_rig() {
+        // Two miners connecting at the same time must still form ONE rig: the
+        // per-worker gate serializes create-or-attach so they don't each build an
+        // upstream (which would register two sessions).
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool_multi(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sv2_rigs: Default::default(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.farm",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = proxy.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+                });
+            }
+        });
+
+        // Drive both connect→setup→open flows concurrently.
+        let flow = |addr| async move {
+            let mut m = MockMiner::connect(addr).await.unwrap();
+            m.setup().await.unwrap();
+            m.open("bc1qSELLER.farm", 1).await.unwrap();
+            m
+        };
+        let (_m1, _m2) = tokio::join!(flow(proxy_addr), flow(proxy_addr));
+
+        // Never more than one session, and it settles at exactly one.
+        loop {
+            let n = registry.get_all("bc1qSELLER.farm").await.len();
+            assert!(n <= 1, "the gate must prevent a second rig (saw {n})");
+            if n == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_rig_is_reaped_after_grace() {
+        // A single-miner rig whose member leaves and does NOT return is reaped
+        // after the idle-grace window: the upstream closes and the slot frees.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool_multi(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sv2_rigs: Arc::new(Sv2RigRegistry::with_grace(Duration::from_millis(150))),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.farm",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = proxy.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+                });
+            }
+        });
+
+        let mut m = MockMiner::connect(proxy_addr).await.unwrap();
+        m.setup().await.unwrap();
+        m.open("bc1qSELLER.farm", 1).await.unwrap();
+        loop {
+            if registry.get_all("bc1qSELLER.farm").await.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Member leaves for good → reaped after the grace window.
+        drop(m);
+        let reaped = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registry.get_all("bc1qSELLER.farm").await.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(reaped.is_ok(), "idle rig reaped after the grace window");
+    }
+
+    #[tokio::test]
+    async fn reconnect_within_grace_reuses_the_warm_rig() {
+        // The last member leaves, but a new same-rig miner reconnects within the
+        // grace window: it attaches to the still-warm upstream and the reaper does
+        // NOT close the rig.
+        let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = pool_a.local_addr().unwrap();
+        let (a_tx, mut a_rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool_multi(
+            pool_a,
+            vec![0xAA; 8],
+            7,
+            NoiseKeys::generate(),
+            a_tx,
+        ));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sv2_rigs: Arc::new(Sv2RigRegistry::with_grace(Duration::from_millis(500))),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.farm",
+            ext_target(&a_addr.to_string(), "acctA"),
+        )
+        .await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = proxy.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+                });
+            }
+        });
+
+        let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+        m1.setup().await.unwrap();
+        m1.open("bc1qSELLER.farm", 1).await.unwrap();
+        loop {
+            if registry.get_all("bc1qSELLER.farm").await.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Last member leaves → grace starts. Reconnect well within the window.
+        drop(m1);
+        let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+        m2.setup().await.unwrap();
+        let (c2, p2) = m2.open("bc1qSELLER.farm", 1).await.unwrap();
+        assert_eq!(p2, vec![0xAA; 8], "reconnect attaches to the warm pool A upstream");
+
+        // Past the grace window the rig is still alive (the reaper saw a member).
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            registry.get_all("bc1qSELLER.farm").await.len(),
+            1,
+            "warm rig survived; the reconnect reused it"
+        );
+        // And the reused upstream still works: m2's share reaches pool A.
+        m2.submit(c2, 1).await.unwrap();
+        a_rx
+            .recv()
+            .await
+            .expect("share over the reused warm upstream reaches pool A");
+    }
+
+    /// A mock pool for a mixed rig: replies to an Extended open with a grouped
+    /// channel (group id 77) and broadcasts a `NewExtendedMiningJob` to that group;
+    /// replies to a Standard open with an UNGROUPED channel (group id 0). Reports
+    /// each submit's channel id.
+    async fn mock_pool_mixed(
+        listener: TcpListener,
+        keys: NoiseKeys,
+        submits: mpsc::UnboundedSender<u32>,
+    ) -> anyhow::Result<()> {
+        let (sock, _) = listener.accept().await?;
+        let _ = sock.set_nodelay(true);
+        let stream =
+            accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+                .await
+                .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+        let (mut read, mut write) = stream.into_split();
+        loop {
+            let f = read_one(&mut read).await?;
+            if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+                break;
+            }
+        }
+        write
+            .write_frame(setup_success(0))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
+        while let Ok(mut f) = read_one(&mut read).await {
+            match wire::msg_type(&f) {
+                Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) => {
+                    let Some(open) = parse_miner_open(&mut f) else {
+                        continue;
+                    };
+                    // Extended channel 10, grouped under group id 77.
+                    let success = Mining::OpenExtendedMiningChannelSuccess(
+                        OpenExtendedMiningChannelSuccess {
+                            request_id: open.spec.request_id(),
+                            channel_id: 10,
+                            target: U256::try_from(diff1_target()).unwrap(),
+                            extranonce_size: 8,
+                            extranonce_prefix: B032::try_from(vec![0xAA; 8]).unwrap(),
+                            group_channel_id: 77,
+                        },
+                    );
+                    write
+                        .write_frame(wire::frame_from(AnyMessage::Mining(success)))
+                        .await
+                        .map_err(|e| anyhow!("{e:?}"))?;
+                    // Broadcast a job addressed to the GROUP id (77).
+                    let empty_path: Vec<U256> = vec![];
+                    let job = mining::NewExtendedMiningJob {
+                        channel_id: 77,
+                        job_id: 1,
+                        min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                        version: 0x2000_0000,
+                        version_rolling_allowed: true,
+                        merkle_path: empty_path.into(),
+                        coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![])
+                            .unwrap(),
+                        coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![])
+                            .unwrap(),
+                    };
+                    write
+                        .write_frame(wire::frame_from(AnyMessage::Mining(
+                            Mining::NewExtendedMiningJob(job),
+                        )))
+                        .await
+                        .map_err(|e| anyhow!("{e:?}"))?;
+                }
+                Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL) => {
+                    let Some(open) = parse_miner_open(&mut f) else {
+                        continue;
+                    };
+                    // Standard channel 20, UNGROUPED (group_channel_id 0).
+                    let success = Mining::OpenStandardMiningChannelSuccess(
+                        OpenStandardMiningChannelSuccess {
+                            request_id: U32AsRef::from(open.spec.request_id()),
+                            channel_id: 20,
+                            target: U256::try_from(diff1_target()).unwrap(),
+                            extranonce_prefix: B032::try_from(vec![0xBB; 8]).unwrap(),
+                            group_channel_id: 0,
+                        },
+                    );
+                    write
+                        .write_frame(wire::frame_from(AnyMessage::Mining(success)))
+                        .await
+                        .map_err(|e| anyhow!("{e:?}"))?;
+                }
+                Some(mining::MESSAGE_TYPE_SUBMIT_SHARES_STANDARD)
+                | Some(mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED) => {
+                    let Some(cid) = wire::read_channel_id(&mut f) else {
+                        continue;
+                    };
+                    let _ = submits.send(cid);
+                    let ok = SubmitSharesSuccess {
+                        channel_id: cid,
+                        last_sequence_number: 0,
+                        new_submits_accepted_count: 1,
+                        new_shares_sum: 1,
+                    };
+                    write
+                        .write_frame(wire::frame_from(AnyMessage::Mining(
+                            Mining::SubmitSharesSuccess(ok),
+                        )))
+                        .await
+                        .map_err(|e| anyhow!("{e:?}"))?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_standard_and_extended_members_share_one_rig() {
+        // A Standard miner and an Extended miner under the same worker bundle onto
+        // ONE upstream. The Extended member is grouped and receives the group
+        // broadcast; the Standard member is ungrouped and must NOT get that
+        // group-addressed NewExtendedMiningJob. Both can submit on the shared link.
+        let pool = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = pool.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool_mixed(pool, NoiseKeys::generate(), tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sv2_rigs: Default::default(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: crate::orders::OrderStore::new(db.clone()),
+        };
+        register_rig(
+            &ctx.sellers,
+            "bc1qSELLER.farm",
+            ext_target(&addr.to_string(), "acct"),
+        )
+        .await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = proxy.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+                });
+            }
+        });
+
+        // Standard member first.
+        let mut m_std = MockMiner::connect(proxy_addr).await.unwrap();
+        m_std.setup().await.unwrap();
+        let (cid_std, p_std) = m_std.open_standard("bc1qSELLER.farm", 1).await.unwrap();
+        assert_eq!(p_std, vec![0xBB; 8], "standard member sees its prefix");
+
+        // Extended member second → triggers the group broadcast while BOTH are
+        // attached, so the fan-out decision sees the Standard member too.
+        let mut m_ext = MockMiner::connect(proxy_addr).await.unwrap();
+        m_ext.setup().await.unwrap();
+        let (cid_ext, down_group, p_ext) = m_ext.open_full("bc1qSELLER.farm", 1).await.unwrap();
+        assert_eq!(p_ext, vec![0xAA; 8], "extended member sees its prefix");
+        assert_ne!(down_group, 0, "extended member is grouped");
+
+        // Standard + Extended under one worker → one shared session.
+        loop {
+            if registry.get_all("bc1qSELLER.farm").await.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // The Extended member receives the group job (remapped to its group id).
+        let job_cid = tokio::time::timeout(
+            Duration::from_secs(5),
+            m_ext.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+        )
+        .await
+        .expect("extended member should receive the group job")
+        .unwrap();
+        assert_eq!(
+            job_cid, down_group,
+            "group job remapped to the extended member's group id"
+        );
+
+        // The Standard member must NOT receive the group-addressed extended job.
+        let leaked = tokio::time::timeout(
+            Duration::from_millis(300),
+            m_std.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+        )
+        .await;
+        assert!(
+            leaked.is_err(),
+            "standard member must not receive the group's NewExtendedMiningJob"
+        );
+
+        // Both members are live on the shared upstream: their submits reach the
+        // pool on distinct channels.
+        m_std.submit_standard(cid_std, 1).await.unwrap();
+        m_ext.submit(cid_ext, 1).await.unwrap();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(rx.recv().await.expect("a submit reaches the pool"));
+        seen.insert(rx.recv().await.expect("a submit reaches the pool"));
+        assert_eq!(
+            seen.len(),
+            2,
+            "both members' submits reached the pool on distinct channels"
+        );
     }
 
     /// A mock SV1 pool for the translate path: configure(version-rolling) →
@@ -3735,6 +4827,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
@@ -3831,6 +4924,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
         };
@@ -4181,6 +5275,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
@@ -4336,6 +5431,7 @@ mod tests {
         let ctx = ProxyContext {
             default_target: None,
             registry: registry.clone(),
+            sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: crate::orders::OrderStore::new(db.clone()),
         };
