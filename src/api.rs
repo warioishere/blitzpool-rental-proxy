@@ -134,30 +134,17 @@ async fn get_session(
     }
 }
 
-/// Switch all of a rig's sessions onto the order's pool (primary→fallback);
-/// returns how many succeeded. Tolerates partial failure (a dead session's
-/// reconnect resumes the order), but logs it.
-async fn switch_all(sessions: &[crate::control::AnySession], order_id: &str) -> usize {
-    let mut ok = 0;
+/// Force every connected miner of a rig to reconnect; returns the count. Each
+/// session re-resolves its upstream from current state on reconnect (a new
+/// rental's buyer pool, or the idle pool after a rental ends), so the caller
+/// MUST persist that state first. A clean reconnect — rather than a live
+/// re-point — avoids miners that ignore a mid-session extranonce change and
+/// keep wasting shares on the old pool.
+fn reconnect_all(sessions: &[crate::control::AnySession]) -> usize {
     for sess in sessions {
-        match sess.switch_to_order(order_id.to_string()).await {
-            Ok(()) => ok += 1,
-            Err(e) => tracing::warn!(error = %e, "rig session switch failed"),
-        }
+        sess.force_reconnect();
     }
-    ok
-}
-
-/// Revert all of a rig's sessions to their default pool; returns how many succeeded.
-async fn revert_all(sessions: &[crate::control::AnySession]) -> usize {
-    let mut ok = 0;
-    for sess in sessions {
-        match sess.revert().await {
-            Ok(()) => ok += 1,
-            Err(e) => tracing::warn!(error = %e, "rig session revert failed"),
-        }
-    }
-    ok
+    sessions.len()
 }
 
 #[derive(Deserialize)]
@@ -289,11 +276,13 @@ async fn set_seller(
         .set(worker.clone(), rig)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // If connected + idle, apply the new default pool now — to every miner of
-    // the rig (a rented session keeps its buyer target).
+    // If connected + idle, switch to the new default pool now — to every miner
+    // of the rig (a rented session keeps its buyer target). Force a reconnect
+    // (not a live re-point): the store is already updated above, so the miner
+    // re-handshakes onto the new pool with a clean extranonce/difficulty.
     for sess in s.registry.get_all(&worker).await {
         if sess.status().await.routing == "idle" {
-            let _ = sess.set_default(target.clone()).await;
+            sess.force_reconnect();
         }
     }
     Ok(Json(json!({"ok": true})))
@@ -478,11 +467,12 @@ async fn create_order(
         }
     };
     let sessions = s.registry.get_all(&req.worker).await;
-    // Switch every connected miner of the rig. Partial success is fine: billing is
-    // pay-as-you-hash (the buyer is charged for measured delivered work and the
-    // unspent prepaid budget is refunded when the order ends), so a miner that
-    // didn't switch simply delivers less. The response reports switched/of.
-    let switched = switch_all(&sessions, &order.id).await;
+    // Reconnect every connected miner of the rig; each lands on the new rental's
+    // buyer pool (failover handled at the connect path). Partial success is fine:
+    // billing is pay-as-you-hash (the buyer is charged for measured delivered work
+    // and the unspent prepaid budget is refunded when the order ends), so a miner
+    // that doesn't come back simply delivers less. The response reports switched/of.
+    let switched = reconnect_all(&sessions);
     let applied = switched > 0;
     Ok(Json(json!({
         "ok": true,
@@ -501,7 +491,7 @@ async fn cancel_order(State(s): State<AppState>, Path(id): Path<String>) -> Resu
         .await
         .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
     let sessions = s.registry.get_all(&order.worker).await;
-    let reverted = revert_all(&sessions).await;
+    let reverted = reconnect_all(&sessions);
     Ok(Json(json!({"ok": true, "reverted": reverted, "of": sessions.len()})))
 }
 

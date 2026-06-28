@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+#[cfg(all(test, feature = "sv2"))]
 use crate::session::UpstreamTarget;
 
 /// Minimum submitted-share sample before the accept-ratio is considered
@@ -69,9 +70,9 @@ pub enum AnySession {
 
 impl AnySession {
     /// Route this session's hashrate to a single `target` (no fallback). The
-    /// production path is [`AnySession::switch_to_order`]; this lower-level form
-    /// is used by the relay tests to drive a switch without a stored order.
-    #[cfg(test)]
+    /// production path forces a reconnect; this lower-level live-swap form is
+    /// used by the sv2 relay tests to drive a switch without a stored order.
+    #[cfg(all(test, feature = "sv2"))]
     pub async fn switch_to(&self, order_id: String, target: UpstreamTarget) -> anyhow::Result<()> {
         match self {
             AnySession::Sv1(s) => s.switch_to(order_id, target).await,
@@ -81,7 +82,10 @@ impl AnySession {
     }
 
     /// Route this session onto a rental order's pool, with primary→fallback
-    /// failover (the pools are resolved from the order).
+    /// failover (the pools are resolved from the order). Production switches go
+    /// through [`AnySession::force_reconnect`]; this live-swap path is exercised
+    /// by the sv2 relay failover tests.
+    #[cfg(all(test, feature = "sv2"))]
     pub async fn switch_to_order(&self, order_id: String) -> anyhow::Result<()> {
         match self {
             AnySession::Sv1(s) => s.switch_to_order(order_id).await,
@@ -90,21 +94,16 @@ impl AnySession {
         }
     }
 
-    /// Route back to the seller's default upstream (a rental ends).
-    pub async fn revert(&self) -> anyhow::Result<()> {
+    /// Drop the miner connection so it reconnects and re-resolves its upstream
+    /// from current state. Callers MUST persist the new pool/rental state before
+    /// calling this. Used for operator-initiated pool changes (idle-pool edit,
+    /// rent start, rent end/cancel) so the miner gets a clean handshake on the
+    /// new pool instead of a live re-point it may not honor (wasted shares).
+    pub fn force_reconnect(&self) {
         match self {
-            AnySession::Sv1(s) => s.revert().await,
+            AnySession::Sv1(s) => s.force_reconnect(),
             #[cfg(feature = "sv2")]
-            AnySession::Sv2(s) => s.revert().await,
-        }
-    }
-
-    /// Set + apply the seller's default upstream (while idle).
-    pub async fn set_default(&self, target: UpstreamTarget) -> anyhow::Result<()> {
-        match self {
-            AnySession::Sv1(s) => s.set_default(target).await,
-            #[cfg(feature = "sv2")]
-            AnySession::Sv2(s) => s.set_default(target).await,
+            AnySession::Sv2(s) => s.force_reconnect(),
         }
     }
 

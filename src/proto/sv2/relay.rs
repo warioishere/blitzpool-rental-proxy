@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -629,6 +629,13 @@ pub struct Sv2Session {
     died_tx: mpsc::UnboundedSender<u64>,
     /// For crediting measured delivered work to the active rental order.
     orders: Arc<OrderStore>,
+    /// Fired by [`Sv2Session::force_reconnect`] to drop the miner connection so
+    /// it reconnects and re-resolves its upstream from current state. Used for
+    /// operator-initiated pool changes (idle-pool edit, rent start, rent
+    /// end/cancel) where a live re-point would risk the miner mining on a stale
+    /// extranonce. Automatic upstream failover does NOT use this (it re-points in
+    /// place) so a flapping pool can't storm the miner with reconnects.
+    reconnect: Notify,
 }
 
 impl Sv2Session {
@@ -667,11 +674,16 @@ impl Sv2Session {
         self.swap_upstream(default, Routing::Idle).await
     }
 
-    pub async fn set_default(self: &Arc<Self>, target: UpstreamTarget) -> anyhow::Result<()> {
-        {
-            self.inner.lock().await.default_target = target.clone();
-        }
-        self.swap_upstream(target, Routing::Idle).await
+    /// Drop the miner connection so it reconnects and re-resolves its upstream
+    /// from current state (the updated idle pool, or an active rental). The
+    /// caller must persist the new state (store/order) BEFORE calling this so the
+    /// reconnect lands on the right pool. Preferred over a live swap for
+    /// operator-initiated changes — a fresh handshake gives the miner the new
+    /// pool's extranonce/target cleanly instead of relying on a live re-point.
+    pub fn force_reconnect(&self) {
+        // `notify_one` stores a permit, so a signal fired while the serve loop is
+        // between selects (processing a frame) is not lost.
+        self.reconnect.notify_one();
     }
 
     async fn swap_upstream(
@@ -1657,6 +1669,7 @@ pub async fn handle_seller_miner_sv2(
         switch: Mutex::new(()),
         died_tx,
         orders: ctx.orders.clone(),
+        reconnect: Notify::new(),
         inner: Mutex::new(Inner {
             active: ActiveUpstream {
                 generation: 0,
@@ -1713,12 +1726,21 @@ pub async fn handle_seller_miner_sv2(
     //    upstream (channel-id remapped per channel).
     let result: anyhow::Result<()> = async {
         loop {
-            let mut frame = match down_read.read_frame().await {
-                Ok(f) => match wire::into_sv2(f) {
-                    Some(f) => f,
-                    None => continue,
+            let mut frame = tokio::select! {
+                biased;
+                // Operator-initiated pool change → close the connection so the
+                // miner reconnects and re-handshakes against the new upstream.
+                _ = session.reconnect.notified() => {
+                    info!(%peer, %worker, "forcing miner reconnect for pool change");
+                    break;
+                }
+                read = down_read.read_frame() => match read {
+                    Ok(f) => match wire::into_sv2(f) {
+                        Some(f) => f,
+                        None => continue,
+                    },
+                    Err(_) => break,
                 },
-                Err(_) => break,
             };
             let Some(mt) = wire::msg_type(&frame) else {
                 continue;
@@ -3011,6 +3033,73 @@ mod tests {
         assert_eq!(prefix, vec![0xCC; 8], "primary down → switched to fallback pool");
         assert_eq!(re_cid, down_cid);
         assert_eq!(sess.status().await.routing, "rented");
+    }
+
+    #[tokio::test]
+    async fn force_reconnect_drops_the_miner_connection() {
+        // An operator pool change (idle-pool edit / rent / revert) calls
+        // force_reconnect; the proxy must close the miner connection so it
+        // reconnects and re-handshakes against the new upstream — instead of a
+        // live re-point the miner might ignore and keep wasting shares on.
+        let pool = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool_addr = pool.local_addr().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(mock_pool(pool, vec![0xAB; 8], 9, NoiseKeys::generate(), tx));
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let orders = crate::orders::OrderStore::new(db.clone());
+        let ctx = ProxyContext {
+            default_target: None,
+            registry: registry.clone(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: orders.clone(),
+        };
+        register_rig(&ctx.sellers, "bc1qSELLER.rig1", ext_target(&pool_addr.to_string(), "acctA")).await;
+        let keys = NoiseKeys::generate();
+        tokio::spawn(async move {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+        });
+
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+
+        // Grab the live session and force a reconnect.
+        let sess = loop {
+            if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        sess.force_reconnect();
+
+        // The miner's connection must close (drain any queued frames first).
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if read_one(&mut miner.read).await.is_err() {
+                    return true;
+                }
+            }
+        })
+        .await
+        .expect("force_reconnect should close the miner connection within 5s");
+        assert!(closed);
+        // And the session is deregistered after the connection tears down.
+        let gone = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registry.get_all("bc1qSELLER.rig1").await.is_empty() {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session should deregister after a forced reconnect");
+        assert!(gone);
     }
 
     #[tokio::test]

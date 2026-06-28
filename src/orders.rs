@@ -438,10 +438,12 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
             for o in orders.take_expired(now_ms()).await {
                 let sessions = registry.get_all(&o.worker).await;
                 if !sessions.is_empty() {
+                    // The order is already marked ended, so a reconnect resolves
+                    // back to the idle pool. Force it rather than a live re-point.
                     for session in &sessions {
-                        let _ = session.revert().await;
+                        session.force_reconnect();
                     }
-                    info!(order = %o.id, worker = %o.worker, sessions = sessions.len(), "rental finished → reverted to default");
+                    info!(order = %o.id, worker = %o.worker, sessions = sessions.len(), "rental finished → miners reconnecting to default");
                 }
             }
         }
