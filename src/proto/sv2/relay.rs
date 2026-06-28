@@ -1023,7 +1023,7 @@ struct Sv1UpState {
 /// Connect an SV1 pool and run `configure`(version-rolling) → `subscribe` →
 /// `authorize`, capturing the extranonce, the negotiated version mask, and the
 /// handshake notifications (initial difficulty + first job).
-async fn connect_sv1_upstream(target: &UpstreamTarget) -> anyhow::Result<Sv1UpConn> {
+async fn connect_sv1_upstream(target: &UpstreamTarget, user_identity: &str) -> anyhow::Result<Sv1UpConn> {
     let tcp = TcpStream::connect(&target.url)
         .await
         .with_context(|| format!("connect sv1 upstream {}", target.url))?;
@@ -1047,7 +1047,11 @@ async fn connect_sv1_upstream(target: &UpstreamTarget) -> anyhow::Result<Sv1UpCo
     let (en1_hex, extranonce2_size) =
         parse_subscribe_sv1(&sub_resp).ok_or_else(|| anyhow!("bad subscribe result"))?;
 
-    let auth = RpcMessage::request(json!(3), "mining.authorize", json!([target.user, target.password]));
+    // Authorize with the SAME worker name we submit shares under (see
+    // `upstream_worker`). Strict pools (e.g. ckpool) reject submits whose worker
+    // differs from the authorized one ("Worker mismatch"); the payout address is
+    // the part before the first '.', so this keeps the payout correct.
+    let auth = RpcMessage::request(json!(3), "mining.authorize", json!([user_identity, target.password]));
     w.write_all(auth.to_line().as_bytes()).await?;
     let _ = sv1_read_response(&mut read, &mut prelude).await?;
 
@@ -1386,7 +1390,7 @@ impl Sv2Session {
                 if let Ok(Err(e)) = &res {
                     debug!(url = %target.url, error = %e, "upstream not SV2; trying SV1 translation");
                 }
-                let conn = connect_sv1_upstream(&target).await?;
+                let conn = connect_sv1_upstream(&target, &up_ident).await?;
                 self.install_sv1_translate_initial(conn, spec, up_ident, target, routing).await
             }
         }
@@ -1522,7 +1526,7 @@ impl Sv2Session {
             }
         };
         let extended = spec.is_extended();
-        let conn = connect_sv1_upstream(&target)
+        let conn = connect_sv1_upstream(&target, &up_ident)
             .await
             .map_err(|e| anyhow!("switch to {}: {e}", target.url))?;
         let initial_target = translate::target_from_difficulty(conn.initial_diff).to_vec();
@@ -3553,6 +3557,9 @@ mod tests {
             tokio::spawn(async move {
                 let (r, mut w) = sock.into_split();
                 let mut lines = BufReader::new(r).lines();
+                // Strict like ckpool: the submit worker must equal the authorized
+                // worker, else "Worker mismatch" — catches the authorize≠submit bug.
+                let mut authorized_worker: Option<String> = None;
                 while let Ok(Some(line)) = lines.next_line().await {
                     let Ok(v) = serde_json::from_str::<Value>(&line) else {
                         continue;
@@ -3576,11 +3583,19 @@ mod tests {
                             let _ = w.write_all(format!("{notify}\n").as_bytes()).await;
                         }
                         "mining.authorize" => {
+                            authorized_worker = v.get("params").and_then(|p| p.as_array()).and_then(|a| a.first()).and_then(|x| x.as_str()).map(String::from);
                             let reply = json!({"id": id, "result": true, "error": Value::Null});
                             let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
                         }
                         "mining.submit" => {
                             let p = v.get("params").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+                            let submit_worker = p.first().and_then(|x| x.as_str());
+                            if authorized_worker.as_deref() != submit_worker {
+                                let _ = accepted.send(false);
+                                let reply = json!({"id": id, "result": Value::Null, "error": [24, "Worker mismatch", Value::Null]});
+                                let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                                continue;
+                            }
                             let en2 = p.get(2).and_then(|x| x.as_str()).map(hex_bytes).unwrap_or_default();
                             let ntime = p.get(3).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
                             let nonce = p.get(4).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);

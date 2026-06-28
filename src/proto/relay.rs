@@ -426,8 +426,9 @@ struct Sv2RawUpstream {
 }
 
 /// Connect to `target`, auto-detecting SV1 (passthrough) vs SV2 (translate).
-/// `user_identity` is the account the SV2 Extended channel is opened under
-/// (ignored for SV1, which authorizes with the target's own credentials).
+/// `user_identity` is the worker the upstream is authorized + submitted under
+/// (SV1 authorize, or the SV2 Extended channel's account) — they must match so
+/// strict pools (e.g. ckpool) don't reject submits as "Worker mismatch".
 async fn connect_raw(
     target: &UpstreamTarget,
     configure: Option<&RpcMessage>,
@@ -435,13 +436,12 @@ async fn connect_raw(
 ) -> anyhow::Result<RawUpstream> {
     #[cfg(not(feature = "sv2"))]
     {
-        let _ = user_identity;
-        return Ok(RawUpstream::Sv1(connect_upstream(target, configure).await?));
+        return Ok(RawUpstream::Sv1(connect_upstream(target, configure, user_identity).await?));
     }
     // Native first: try SV1 (reusing its socket on success); if the pool doesn't
     // answer as SV1, it's an SV2 buyer pool → open an Extended channel + translate.
     #[cfg(feature = "sv2")]
-    match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_upstream(target, configure))
+    match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_upstream(target, configure, user_identity))
         .await
     {
         Ok(Ok(conn)) => Ok(RawUpstream::Sv1(conn)),
@@ -859,6 +859,7 @@ struct UpstreamConn {
 async fn connect_upstream(
     target: &UpstreamTarget,
     configure: Option<&RpcMessage>,
+    user_identity: &str,
 ) -> anyhow::Result<UpstreamConn> {
     let stream = TcpStream::connect(&target.url).await?;
     let _ = stream.set_nodelay(true);
@@ -877,7 +878,9 @@ async fn connect_upstream(
     let (extranonce1, extranonce2_size) =
         parse_subscribe_result(&sub_resp).ok_or_else(|| anyhow::anyhow!("bad subscribe result"))?;
 
-    let auth = RpcMessage::request(json!(2), "mining.authorize", json!([target.user, target.password]));
+    // Authorize with the worker we submit under (matches the submit's worker so
+    // strict pools don't reject every share as "Worker mismatch").
+    let auth = RpcMessage::request(json!(2), "mining.authorize", json!([user_identity, target.password]));
     w.write_all(auth.to_line().as_bytes()).await?;
     let _ = read_response(&mut reader, &mut prelude).await?; // authorize reply (value ignored for now)
 
@@ -1455,7 +1458,7 @@ mod tests {
             password: "x".into(),
             authority_pubkey: None,
         };
-        let conn = connect_upstream(&target_a, None).await.unwrap();
+        let conn = connect_upstream(&target_a, None, &target_a.user).await.unwrap();
         let (to_miner, _to_miner_rx) = mpsc::unbounded_channel::<String>();
         let (to_up, up_rx) = mpsc::unbounded_channel::<String>();
         let up_writer = spawn_writer(conn.write, up_rx);
