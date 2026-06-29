@@ -1,6 +1,6 @@
 [package]
 name = "stratum-rental-proxy"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Blitzpool Contributors <https://yourdevice.ch>"]
 description = "Stratum hashrate-rental proxy: sellers' miners run on their own default pool until rented, then are server-side rerouted to the buyer's target — no miner reconfiguration. Speaks Stratum V1 and V2, with a bidirectional SV1<->SV2 translator so a miner of either protocol can mine against a pool of either protocol."
