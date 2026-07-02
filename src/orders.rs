@@ -70,6 +70,11 @@ pub struct Order {
     /// Auto-revert deadline (epoch ms). `0` = open-ended (no auto-revert).
     pub until_ms: i64,
     pub status: OrderStatus,
+    /// When the order left `active` (ended or cancelled), epoch ms. `0` while
+    /// still active, or unknown for rows that ended before the `ended_ms`
+    /// migration.
+    #[serde(default)]
+    pub ended_ms: i64,
     /// Delivered work measured by the proxy over this rental, in diff-1 share
     /// units (Σ of accepted-share difficulty). Hashes = `delivered_work * 2^32`;
     /// average delivered hashrate = `delivered_work * 2^32 / elapsed_seconds`.
@@ -138,6 +143,7 @@ struct OrderRow {
     created_ms: i64,
     until_ms: i64,
     status: String,
+    ended_ms: i64,
     delivered_work: f64,
     accepted_shares: i64,
     submitted_shares: i64,
@@ -165,6 +171,7 @@ impl OrderRow {
             created_ms: self.created_ms,
             until_ms: self.until_ms,
             status: OrderStatus::from_db(&self.status),
+            ended_ms: self.ended_ms,
             delivered_work: self.delivered_work,
             accepted_shares: self.accepted_shares as u64,
             submitted_shares: self.submitted_shares as u64,
@@ -281,6 +288,7 @@ impl OrderStore {
             created_ms: now,
             until_ms,
             status,
+            ended_ms: 0,
             delivered_work: 0.0,
             accepted_shares: 0,
             submitted_shares: 0,
@@ -294,7 +302,7 @@ impl OrderStore {
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
+             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
              price_per_th_day, budget FROM orders WHERE id = ?",
             id
         )
@@ -310,8 +318,27 @@ impl OrderStore {
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
+             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
              price_per_th_day, budget FROM orders"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(OrderRow::into_order)
+        .collect()
+    }
+
+    /// All orders for a worker, oldest first — the rental history the
+    /// marketplace rig chart renders as bands.
+    pub async fn list_for_worker(&self, worker: &str) -> Vec<Order> {
+        sqlx::query_as!(
+            OrderRow,
+            "SELECT id, worker, target_url, target_user, target_password, target_authority, \
+             fallback_url, fallback_user, fallback_password, fallback_authority, \
+             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
+             price_per_th_day, budget FROM orders WHERE worker = ? ORDER BY created_ms ASC",
+            worker
         )
         .fetch_all(&self.pool)
         .await
@@ -327,7 +354,7 @@ impl OrderStore {
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
+             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
              price_per_th_day, budget FROM orders \
              WHERE worker = ? AND status = 'active' AND (until_ms = 0 OR until_ms > ?)",
             worker,
@@ -388,11 +415,17 @@ impl OrderStore {
     /// Cancel an order; returns it (status updated) so the caller can revert.
     pub async fn cancel(&self, id: &str) -> Option<Order> {
         let existing = self.get(id).await?;
-        let _ = sqlx::query!("UPDATE orders SET status = 'cancelled' WHERE id = ?", id)
-            .execute(&self.pool)
-            .await;
+        let now = now_ms();
+        let _ = sqlx::query!(
+            "UPDATE orders SET status = 'cancelled', ended_ms = ? WHERE id = ?",
+            now,
+            id
+        )
+        .execute(&self.pool)
+        .await;
         Some(Order {
             status: OrderStatus::Cancelled,
+            ended_ms: now,
             ..existing
         })
     }
@@ -405,7 +438,7 @@ impl OrderStore {
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, \
+             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
              price_per_th_day, budget FROM orders WHERE status = 'active'"
         )
         .fetch_all(&self.pool)
@@ -416,11 +449,16 @@ impl OrderStore {
         for o in active.into_iter().map(OrderRow::into_order) {
             let deadline_passed = o.until_ms > 0 && o.until_ms <= now;
             if deadline_passed || o.funding_exhausted() {
-                let _ = sqlx::query!("UPDATE orders SET status = 'ended' WHERE id = ?", o.id)
-                    .execute(&self.pool)
-                    .await;
+                let _ = sqlx::query!(
+                    "UPDATE orders SET status = 'ended', ended_ms = ? WHERE id = ?",
+                    now,
+                    o.id
+                )
+                .execute(&self.pool)
+                .await;
                 finished.push(Order {
                     status: OrderStatus::Ended,
+                    ended_ms: now,
                     ..o
                 });
             }
@@ -478,6 +516,37 @@ mod tests {
         let cancelled = store.cancel(&o.id).await.unwrap();
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
         assert!(store.active_for_worker("w1", now_ms()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_and_expiry_stamp_ended_ms_and_list_for_worker() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        // Cancel stamps ended_ms.
+        let o1 = store
+            .create("wend".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let c = store.cancel(&o1.id).await.unwrap();
+        assert!(c.ended_ms > 0, "cancel sets ended_ms");
+        assert_eq!(c.status, OrderStatus::Cancelled);
+
+        // A second order (allowed now the first is cancelled) with a passed
+        // deadline is ended by take_expired, which also stamps ended_ms.
+        let o2 = store
+            .create("wend".into(), target(), None, now_ms() - 1000, 1.0, 0.0)
+            .await
+            .unwrap();
+        let expired = store.take_expired(now_ms()).await;
+        assert!(
+            expired.iter().any(|o| o.id == o2.id && o.ended_ms > 0),
+            "take_expired sets ended_ms"
+        );
+
+        // Both orders come back for the worker, oldest first, all ended.
+        let all = store.list_for_worker("wend").await;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|o| o.worker == "wend" && o.ended_ms > 0));
+        assert_eq!(all[0].id, o1.id, "oldest first");
     }
 
     #[tokio::test]

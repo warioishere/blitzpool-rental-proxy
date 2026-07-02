@@ -12,6 +12,7 @@ mod api;
 mod config;
 mod control;
 mod db;
+mod hashrate;
 mod orders;
 mod proto;
 mod registry;
@@ -59,9 +60,13 @@ async fn main() -> anyhow::Result<()> {
 
     let sellers = store::SellerStore::new(pool.clone());
     let orders = orders::OrderStore::new(pool.clone());
+    let hashrate = hashrate::HashrateStore::new(pool.clone());
 
     // Auto-revert expired rentals.
     orders::spawn_expiry(orders.clone(), registry.clone());
+
+    // Sample each rig's delivered hashrate into 10-min slots (marketplace chart).
+    hashrate::spawn_sampler(registry.clone(), sellers.clone(), hashrate.clone());
 
     // HTTP control API — the proxy is fully steerable here; the web UI calls it.
     // Every endpoint except /api/health requires this bearer token; unset means
@@ -81,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
             registry: registry.clone(),
             sellers: sellers.clone(),
             orders: orders.clone(),
+            hashrate: hashrate.clone(),
             api_token: api_token.clone(),
         };
         tokio::spawn(async move {

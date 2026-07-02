@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT slot_ms, hashrate_ths, online FROM rig_hashrate_samples WHERE worker = ? AND slot_ms >= ? ORDER BY slot_ms ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "slot_ms",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "hashrate_ths",
+        "ordinal": 1,
+        "type_info": "Float"
+      },
+      {
+        "name": "online",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d628cd1f496fc73769489f0645f6c7c24c59419e5624fba4bdb72ac6acd4334a"
+}

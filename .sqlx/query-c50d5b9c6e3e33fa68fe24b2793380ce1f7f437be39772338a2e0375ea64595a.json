@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, created_ms, until_ms, status, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE id = ?",
+  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders",
   "describe": {
     "columns": [
       {
@@ -69,33 +69,38 @@
         "type_info": "Text"
       },
       {
-        "name": "delivered_work",
+        "name": "ended_ms",
         "ordinal": 13,
+        "type_info": "Integer"
+      },
+      {
+        "name": "delivered_work",
+        "ordinal": 14,
         "type_info": "Float"
       },
       {
         "name": "accepted_shares",
-        "ordinal": 14,
-        "type_info": "Integer"
-      },
-      {
-        "name": "submitted_shares",
         "ordinal": 15,
         "type_info": "Integer"
       },
       {
-        "name": "price_per_th_day",
+        "name": "submitted_shares",
         "ordinal": 16,
+        "type_info": "Integer"
+      },
+      {
+        "name": "price_per_th_day",
+        "ordinal": 17,
         "type_info": "Float"
       },
       {
         "name": "budget",
-        "ordinal": 17,
+        "ordinal": 18,
         "type_info": "Float"
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 0
     },
     "nullable": [
       false,
@@ -115,8 +120,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "554dedef834502a5f70154f7e6cde3d3bd45eaa4ec6fef578ce0508a52cc1110"
+  "hash": "c50d5b9c6e3e33fa68fe24b2793380ce1f7f437be39772338a2e0375ea64595a"
 }

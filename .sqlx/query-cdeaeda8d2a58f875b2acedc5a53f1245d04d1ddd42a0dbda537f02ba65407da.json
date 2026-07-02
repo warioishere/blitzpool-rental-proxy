@@ -1,0 +1,128 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "worker",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_url",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_user",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_password",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_authority",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "fallback_url",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "fallback_user",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "fallback_password",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "fallback_authority",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_ms",
+        "ordinal": 10,
+        "type_info": "Integer"
+      },
+      {
+        "name": "until_ms",
+        "ordinal": 11,
+        "type_info": "Integer"
+      },
+      {
+        "name": "status",
+        "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "ended_ms",
+        "ordinal": 13,
+        "type_info": "Integer"
+      },
+      {
+        "name": "delivered_work",
+        "ordinal": 14,
+        "type_info": "Float"
+      },
+      {
+        "name": "accepted_shares",
+        "ordinal": 15,
+        "type_info": "Integer"
+      },
+      {
+        "name": "submitted_shares",
+        "ordinal": 16,
+        "type_info": "Integer"
+      },
+      {
+        "name": "price_per_th_day",
+        "ordinal": 17,
+        "type_info": "Float"
+      },
+      {
+        "name": "budget",
+        "ordinal": 18,
+        "type_info": "Float"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "cdeaeda8d2a58f875b2acedc5a53f1245d04d1ddd42a0dbda537f02ba65407da"
+}

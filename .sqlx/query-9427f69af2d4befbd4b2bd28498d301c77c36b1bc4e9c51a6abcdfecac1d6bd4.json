@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO rig_hashrate_samples (worker, slot_ms, hashrate_ths, online) VALUES (?, ?, ?, ?) ON CONFLICT(worker, slot_ms) DO UPDATE SET hashrate_ths = excluded.hashrate_ths, online = excluded.online",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "9427f69af2d4befbd4b2bd28498d301c77c36b1bc4e9c51a6abcdfecac1d6bd4"
+}

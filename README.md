@@ -88,4 +88,4 @@ A new upstream hands out a different extranonce + difficulty. Two cases:
 
 ## Status
 
-Early scaffolding. Not production-ready.
+Beta. Deployed and running, but still maturing — expect rough edges.

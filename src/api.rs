@@ -27,7 +27,8 @@ use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::orders::{now_ms, OrderStore};
+use crate::hashrate::HashrateStore;
+use crate::orders::{now_ms, OrderStatus, OrderStore};
 use crate::registry::Registry;
 use crate::session::UpstreamTarget;
 use crate::store::{Rig, SellerStore};
@@ -37,6 +38,7 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     pub sellers: Arc<SellerStore>,
     pub orders: Arc<OrderStore>,
+    pub hashrate: Arc<HashrateStore>,
     /// Bearer token required on every endpoint except `/api/health`. Empty =
     /// not configured → the API fails closed (rejects all). See [`require_bearer`].
     pub api_token: Arc<str>,
@@ -55,6 +57,7 @@ pub fn router(state: AppState) -> Router {
             put(set_seller).delete(delete_seller),
         )
         .route("/api/sellers/{worker}/rentable", post(set_rentable))
+        .route("/api/sellers/{worker}/history", get(get_seller_history))
         .route("/api/orders", get(list_orders).post(create_order))
         .route("/api/orders/{id}", get(get_order).delete(cancel_order))
         .route_layer(middleware::from_fn_with_state(
@@ -137,6 +140,68 @@ async fn get_session(
         Some(status) => Ok(Json(json!(status))),
         None => Err((StatusCode::NOT_FOUND, "worker not connected".into())),
     }
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    /// How many days of history (1..=7, default 7) — the chart's 1d/3d/7d toggle.
+    #[serde(default)]
+    days: Option<i64>,
+}
+
+/// Per-rig history for the marketplace rig chart: 10-min delivered-hashrate
+/// slots, the rental bands (each order's start → end), and the advertised
+/// reference line. Offline is carried per slot (`online = false`); "not rented"
+/// is simply the absence of a covering rental band.
+async fn get_seller_history(
+    State(s): State<AppState>,
+    Path(worker): Path<String>,
+    Query(q): Query<HistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let rig = s
+        .sellers
+        .get(&worker)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, "rig not found".to_string()))?;
+    let days = q.days.unwrap_or(7).clamp(1, 7);
+    let now = now_ms();
+    let since = now - days * 86_400_000;
+
+    let samples = s.hashrate.since(&worker, since).await;
+
+    let rentals: Vec<Value> = s
+        .orders
+        .list_for_worker(&worker)
+        .await
+        .into_iter()
+        .filter_map(|o| {
+            // Band end: now for a live rental; the exact end for one that ended
+            // after the migration; else best-effort (deadline, then start).
+            let end = match &o.status {
+                OrderStatus::Active => now,
+                _ if o.ended_ms > 0 => o.ended_ms,
+                _ if o.until_ms > 0 => o.until_ms,
+                _ => o.created_ms,
+            };
+            if end < since {
+                return None; // finished before the visible window
+            }
+            Some(json!({
+                "id": o.id,
+                "start_ms": o.created_ms,
+                "end_ms": end,
+                "status": o.status,
+            }))
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "worker": worker,
+        "advertised_ths": rig.advertised_ths,
+        "days": days,
+        "samples": samples,
+        "rentals": rentals,
+    })))
 }
 
 /// Force every connected miner of a rig to reconnect; returns the count. Each
@@ -531,7 +596,8 @@ mod tests {
         router(AppState {
             registry: Registry::new(),
             sellers: SellerStore::new(pool.clone()),
-            orders: crate::orders::OrderStore::new(pool),
+            orders: crate::orders::OrderStore::new(pool.clone()),
+            hashrate: HashrateStore::new(pool),
             api_token: token.into(),
         })
     }
@@ -548,6 +614,7 @@ mod tests {
             registry: Registry::new(),
             sellers: SellerStore::new(pool.clone()),
             orders: orders.clone(),
+            hashrate: HashrateStore::new(pool.clone()),
             api_token: TOKEN.into(),
         });
         (app, orders)

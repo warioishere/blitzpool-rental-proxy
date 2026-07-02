@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM rig_hashrate_samples WHERE slot_ms < ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "bd6291d73925236b2a9011d694fd1b2fb06461700335d14d3f64f8391c267df8"
+}
