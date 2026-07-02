@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -461,13 +461,18 @@ pub struct Sv2Session {
     died_tx: mpsc::UnboundedSender<u64>,
     /// For crediting measured delivered work to the active rental order.
     orders: Arc<OrderStore>,
-    /// Fired by [`Sv2Session::force_reconnect`] to drop the miner connection so
-    /// it reconnects and re-resolves its upstream from current state. Used for
+    /// Fired by [`Sv2Session::force_reconnect`] to drop the miner connections so
+    /// they reconnect and re-resolve their upstream from current state. Used for
     /// operator-initiated pool changes (idle-pool edit, rent start, rent
     /// end/cancel) where a live re-point would risk the miner mining on a stale
     /// extranonce. Automatic upstream failover does NOT use this (it re-points in
     /// place) so a flapping pool can't storm the miner with reconnects.
-    reconnect: Notify,
+    ///
+    /// A `watch` epoch, not a `Notify`: EVERY bundled member holds its own
+    /// receiver, so one signal drops all of them (`notify_one` woke exactly one
+    /// member of a multi-miner rig), and the retained epoch means a member busy
+    /// processing a frame between selects still sees the bump on its next poll.
+    reconnect: watch::Sender<u64>,
 }
 
 impl Sv2Session {
@@ -507,16 +512,56 @@ impl Sv2Session {
         self.swap_upstream(default, Routing::Idle).await
     }
 
-    /// Drop the miner connection so it reconnects and re-resolves its upstream
-    /// from current state (the updated idle pool, or an active rental). The
-    /// caller must persist the new state (store/order) BEFORE calling this so the
-    /// reconnect lands on the right pool. Preferred over a live swap for
-    /// operator-initiated changes — a fresh handshake gives the miner the new
-    /// pool's extranonce/target cleanly instead of relying on a live re-point.
+    /// Drop ALL bundled miner connections so they reconnect and re-resolve
+    /// their upstream from current state (the updated idle pool, or an active
+    /// rental). The caller must persist the new state (store/order) BEFORE
+    /// calling this so the reconnects land on the right pool. Preferred over a
+    /// live swap for operator-initiated changes — a fresh handshake gives the
+    /// miner the new pool's extranonce/target cleanly instead of relying on a
+    /// live re-point.
     pub fn force_reconnect(&self) {
-        // `notify_one` stores a permit, so a signal fired while the serve loop is
-        // between selects (processing a frame) is not lost.
-        self.reconnect.notify_one();
+        // The bumped epoch is retained by the watch channel, so a member whose
+        // serve loop is between selects (processing a frame) still sees it —
+        // and every member has its own receiver, so all of them break.
+        self.reconnect.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
+    /// Per-member reconnect-signal receiver for the serve loop. Subscribe
+    /// BEFORE resolving order state: a change that fires after subscription is
+    /// seen by `changed()`, and one that fired before was already persisted in
+    /// the order store, so the fresh resolve right after subscription sees it.
+    fn subscribe_reconnect(&self) -> watch::Receiver<u64> {
+        self.reconnect.subscribe()
+    }
+
+    /// Align the shared upstream with the current order state before bundling
+    /// a new member. A live rig can sit on a stale upstream across a rent or
+    /// cancel: the other members hold the rig alive while one reconnects, and
+    /// an attach bundles onto whatever the rig currently mines — the order
+    /// resolve at connect time only ever picked the upstream for FRESH rigs.
+    /// No-op when already aligned; if the swap fails the attach proceeds on
+    /// the current upstream (supervisor failover / the next reconnect
+    /// converges).
+    async fn reconcile_routing(self: &Arc<Self>, desired: Option<&crate::orders::Order>) {
+        let current = match &self.inner.lock().await.routing {
+            Routing::Rented { order_id, .. } => Some(order_id.clone()),
+            Routing::Idle => None,
+        };
+        match (desired, current) {
+            (Some(o), current) if current.as_deref() != Some(o.id.as_str()) => {
+                info!(order = %o.id, "attach: rig on stale upstream — switching to the active rental");
+                if let Err(e) = self.switch_to_order(o.id.clone()).await {
+                    warn!(order = %o.id, error = %e, "attach: switch to rental failed; bundling on current upstream");
+                }
+            }
+            (None, Some(stale)) => {
+                info!(order = %stale, "attach: rig still on an ended rental — reverting to the idle pool");
+                if let Err(e) = self.revert().await {
+                    warn!(error = %e, "attach: revert to idle failed; bundling on current upstream");
+                }
+            }
+            _ => {}
+        }
     }
 
     async fn swap_upstream(
@@ -1710,18 +1755,31 @@ pub async fn handle_seller_miner_sv2(
     let _hold = gate.lock().await;
 
     let attached = match ctx.sv2_rigs.get(&worker).await {
-        Some(rig) => rig
-            .attach_member(to_miner.clone(), &spec)
-            .await
-            .map(|member| (rig, member)),
+        Some(rig) => {
+            // Subscribe FIRST: a pool change firing from here on breaks the
+            // serve loop below, and one that fired earlier was persisted in the
+            // order store before the signal — the reconcile resolve sees it.
+            let reconnect_rx = rig.subscribe_reconnect();
+            // Re-resolve NOW (the resolve at the top of this function predates
+            // the subscription) and align the rig's shared upstream with it, so
+            // this member can't bundle onto a stale pre-rent/post-cancel pool.
+            let desired = ctx
+                .orders
+                .active_for_worker(&worker, crate::orders::now_ms())
+                .await;
+            rig.reconcile_routing(desired.as_ref()).await;
+            rig.attach_member(to_miner.clone(), &spec)
+                .await
+                .map(|member| (rig, member, reconnect_rx))
+        }
         None => None,
     };
 
-    let (session, member_id) = match attached {
-        Some((rig, member)) => {
+    let (session, member_id, mut reconnect_rx) = match attached {
+        Some((rig, member, reconnect_rx)) => {
             drop(_hold);
             info!(%peer, %worker, member, "sv2 miner bundled onto existing rig");
-            (rig, member)
+            (rig, member, reconnect_rx)
         }
         None => {
             // Build the session with a placeholder upstream, then connect +
@@ -1733,7 +1791,7 @@ pub async fn handle_seller_miner_sv2(
                 switch: Mutex::new(()),
                 died_tx,
                 orders: ctx.orders.clone(),
-                reconnect: Notify::new(),
+                reconnect: watch::channel(0).0,
                 inner: Mutex::new(Inner {
                     active: ActiveUpstream {
                         generation: 0,
@@ -1764,6 +1822,11 @@ pub async fn handle_seller_miner_sv2(
                     idle_token: 0,
                 }),
             });
+
+            // Subscribe before the registry insert below: `reconnect_all` can
+            // only reach this session once it's registered, so no pool-change
+            // signal can slip between registration and our subscription.
+            let reconnect_rx = session.subscribe_reconnect();
 
             // This connection is the rig's first member; its sink owns the
             // initial channel and receives that channel's per-channel frames.
@@ -1820,7 +1883,7 @@ pub async fn handle_seller_miner_sv2(
                     info!(%peer, %worker, member = member_id, upstream = %open_target.url, "sv2 relay established (idle)")
                 }
             }
-            (session, member_id)
+            (session, member_id, reconnect_rx)
         }
     };
 
@@ -1832,7 +1895,7 @@ pub async fn handle_seller_miner_sv2(
                 biased;
                 // Operator-initiated pool change → close the connection so the
                 // miner reconnects and re-handshakes against the new upstream.
-                _ = session.reconnect.notified() => {
+                _ = reconnect_rx.changed() => {
                     info!(%peer, %worker, "forcing miner reconnect for pool change");
                     break;
                 }

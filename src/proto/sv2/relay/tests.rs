@@ -3118,3 +3118,192 @@ async fn sv2_standard_miner_onto_sv1_pool_is_cryptographically_valid() {
     .unwrap();
     assert_eq!(ok_cid, channel_id);
 }
+
+#[tokio::test]
+async fn force_reconnect_drops_all_bundled_members() {
+    // A rent/cancel calls force_reconnect ONCE on the shared rig session, and
+    // EVERY bundled member connection must drop. With a per-rig Notify +
+    // notify_one, exactly one of N miners reconnected and the rest kept mining
+    // on the stale pool (a 3-miner rig switched with "switched":1,"of":1).
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_a,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        a_tx,
+    ));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: crate::orders::OrderStore::new(db.clone()),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.farm",
+        ext_target(&a_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    // Three miners, one worker name → one rig, three bundled members.
+    let mut miners = Vec::new();
+    for _ in 0..3 {
+        let mut m = MockMiner::connect(proxy_addr).await.unwrap();
+        m.setup().await.unwrap();
+        let (_cid, p) = m.open("bc1qSELLER.farm", 1).await.unwrap();
+        assert_eq!(p, vec![0xAA; 8], "all members on seller default pool A");
+        miners.push(m);
+    }
+    let sessions = loop {
+        let s = registry.get_all("bc1qSELLER.farm").await;
+        if s.len() == 1 {
+            break s;
+        }
+        tokio::task::yield_now().await;
+    };
+
+    sessions[0].force_reconnect();
+
+    for (i, m) in miners.iter_mut().enumerate() {
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if read_one(&mut m.read).await.is_err() {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(closed, "bundled member {i} must be dropped by force_reconnect");
+    }
+}
+
+#[tokio::test]
+async fn reattach_reconciles_rig_onto_active_rental_pool() {
+    // A member reconnecting while its rig stays alive (another member keeps it
+    // up) must NOT bundle onto the rig's stale upstream. The attach path
+    // re-resolves the active order and swaps the shared upstream first — which
+    // also re-points every still-connected member.
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_addr = pool_b.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+    let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_a,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        a_tx,
+    ));
+    tokio::spawn(mock_pool_multi(
+        pool_b,
+        vec![0xBB; 8],
+        99,
+        NoiseKeys::generate(),
+        b_tx,
+    ));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.farm",
+        ext_target(&a_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    // Two bundled members, both on the idle pool A.
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (_c1, p1) = m1.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(p1, vec![0xAA; 8]);
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    m2.setup().await.unwrap();
+    let (_c2, p2) = m2.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(p2, vec![0xAA; 8]);
+    loop {
+        if registry.get_all("bc1qSELLER.farm").await.len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // Rent the rig — deliberately WITHOUT signalling the members (the field
+    // failure: the reconnect signal reached one member at most). The order is
+    // persisted; the rig still mines on pool A.
+    orders
+        .create(
+            "bc1qSELLER.farm".to_string(),
+            ext_target(&b_addr.to_string(), "acctB"),
+            None,
+            crate::orders::now_ms() + 60_000,
+            1.0,
+            1.0,
+        )
+        .await
+        .unwrap();
+
+    // One member drops and comes back (rig stays alive through the other).
+    drop(m2);
+    let mut m3 = MockMiner::connect(proxy_addr).await.unwrap();
+    m3.setup().await.unwrap();
+    let (_c3, p3) = m3.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(
+        p3,
+        vec![0xBB; 8],
+        "reattaching member must land on the rented pool B, not the stale A"
+    );
+
+    // The still-connected member rides the same shared upstream → re-pointed.
+    let (_rc, rp) = m1.read_until_set_extranonce().await.unwrap();
+    assert_eq!(rp, vec![0xBB; 8], "existing member re-pointed by the reconcile");
+
+    let st = registry
+        .aggregated_status("bc1qSELLER.farm")
+        .await
+        .unwrap();
+    assert_eq!(st.routing, "rented", "rig reads as rented after reconcile");
+}
