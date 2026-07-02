@@ -102,6 +102,11 @@ pub fn spawn_sampler(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(SLOT_MS as u64));
+        // `interval`'s first tick fires immediately; skip it so we never record a
+        // cold slot right after (re)start — the per-rig hashrate window has no
+        // shares yet and would read 0 h/s → a false-offline slot. The first real
+        // sample lands one slot later, on a warm window.
+        tick.tick().await;
         loop {
             tick.tick().await;
             let now = now_ms();
