@@ -596,9 +596,13 @@ impl Sv2Session {
         };
         // user_identity on the new pool: its account + the miner's worker, tagged.
         let up_ident = crate::proto::relay::upstream_worker(&target.user, &label);
-        if specs.is_empty() {
-            bail!("no channels to switch");
-        }
+        // Zero channels is NOT an error: a rig can be swapped while its only
+        // member is mid-reconnect — the empty grace-window hull between the last
+        // member leaving and the next attaching. We still connect the new upstream
+        // and install it as `active` + set `routing` below (the re-open and
+        // re-point loops are no-ops on empty `specs`), so the member that attaches
+        // next opens its first channel straight on the new pool instead of
+        // bundling back onto the old (idle) one — the single-device rent bug.
 
         // Native first: re-open on SV2; if the new pool doesn't answer as SV2,
         // it's an SV1 buyer pool → translate the switch onto it.

@@ -3307,3 +3307,120 @@ async fn reattach_reconciles_rig_onto_active_rental_pool() {
         .unwrap();
     assert_eq!(st.routing, "rented", "rig reads as rented after reconcile");
 }
+
+#[tokio::test]
+async fn reattach_into_empty_grace_hull_routes_to_active_rental() {
+    // Single-device rig: on rent its ONLY member force-reconnects, so between the
+    // member leaving and reconnecting the rig is an empty grace-window hull (no
+    // channels). The reconnecting member must still land on the rented pool B —
+    // the field bug bundled it back onto idle A because the switch found "no
+    // channels to move" and gave up.
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_addr = pool_b.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+    let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_a,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        a_tx,
+    ));
+    tokio::spawn(mock_pool_multi(
+        pool_b,
+        vec![0xBB; 8],
+        99,
+        NoiseKeys::generate(),
+        b_tx,
+    ));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    // Keep a handle to the rig registry so we can wait for the *empty hull* state
+    // (default 30s grace keeps it alive well across the reconnect).
+    let sv2_rigs: Arc<Sv2RigRegistry> = Default::default();
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: sv2_rigs.clone(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.solo",
+        ext_target(&a_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    // The single member, mining idle on pool A.
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (_c1, p1) = m1.open("bc1qSELLER.solo", 1).await.unwrap();
+    assert_eq!(p1, vec![0xAA; 8]);
+    loop {
+        if registry.get_all("bc1qSELLER.solo").await.len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // Rent → pool B (persisted; no live signal, mirroring the field path).
+    orders
+        .create(
+            "bc1qSELLER.solo".to_string(),
+            ext_target(&b_addr.to_string(), "acctB"),
+            None,
+            crate::orders::now_ms() + 60_000,
+            1.0,
+            1.0,
+        )
+        .await
+        .unwrap();
+
+    // Drop the only member → wait for the empty grace hull (present, memberless):
+    // this is the exact state the switch used to give up on with "no channels".
+    drop(m1);
+    loop {
+        let empty = match sv2_rigs.get("bc1qSELLER.solo").await {
+            Some(rig) => rig.inner.lock().await.members.is_empty(),
+            None => false,
+        };
+        if empty {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // Reconnect into the empty hull — must land on the rented pool B.
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    m2.setup().await.unwrap();
+    let (_c2, p2) = m2.open("bc1qSELLER.solo", 1).await.unwrap();
+    assert_eq!(
+        p2,
+        vec![0xBB; 8],
+        "reattach into the empty grace hull must route to the rented pool B, not idle A"
+    );
+
+    let st = registry
+        .aggregated_status("bc1qSELLER.solo")
+        .await
+        .unwrap();
+    assert_eq!(st.routing, "rented", "rig reads as rented after the reattach");
+}
