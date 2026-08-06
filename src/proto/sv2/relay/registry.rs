@@ -82,7 +82,9 @@ impl Sv2RigRegistry {
     /// The per-worker gate is intentionally kept.
     async fn remove(&self, worker: &str, rig: &Arc<Sv2Session>) {
         let mut m = self.rigs.lock().await;
-        if m.get(worker).is_some_and(|existing| Arc::ptr_eq(existing, rig)) {
+        if m.get(worker)
+            .is_some_and(|existing| Arc::ptr_eq(existing, rig))
+        {
             m.remove(worker);
         }
     }

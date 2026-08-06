@@ -53,10 +53,9 @@ async fn mock_pool(
 ) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream =
-        accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
-            .await
-            .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+        .await
+        .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (read, write) = stream.into_split();
     serve_pool_conn(read, write, prefix, base_cid, submits).await
 }
@@ -228,8 +227,7 @@ impl MockMiner {
         self.send_open(worker, request_id).await?;
         loop {
             let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f)
-                == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
+            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
             {
                 let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
                 return Ok((info.up_channel_id, info.extranonce_prefix));
@@ -254,8 +252,7 @@ impl MockMiner {
             .map_err(|e| anyhow!("{e:?}"))?;
         loop {
             let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f)
-                == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
+            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
             {
                 let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
                 return Ok((info.up_channel_id, info.extranonce_prefix));
@@ -349,8 +346,7 @@ impl MockMiner {
         self.send_open(worker, request_id).await?;
         loop {
             let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f)
-                == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
+            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
             {
                 let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
                 return Ok((
@@ -624,10 +620,9 @@ async fn mock_pool_stall(
 ) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream =
-        accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
-            .await
-            .map_err(|e| anyhow!("{e:?}"))?;
+    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+        .await
+        .map_err(|e| anyhow!("{e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
@@ -932,10 +927,9 @@ async fn unregistered_worker_is_rejected() {
 async fn mock_pool_group(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream =
-        accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
-            .await
-            .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+        .await
+        .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
@@ -1057,16 +1051,12 @@ async fn group_broadcast_job_reaches_miner() {
 /// A pool that completes the channel open (cid 99) and then *immediately*
 /// broadcasts a `NewExtendedMiningJob` addressed to that channel — like a real
 /// pool bootstrapping a freshly opened channel right after its OpenSuccess.
-async fn mock_pool_job_after_open(
-    listener: TcpListener,
-    keys: NoiseKeys,
-) -> anyhow::Result<()> {
+async fn mock_pool_job_after_open(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream =
-        accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
-            .await
-            .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+        .await
+        .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
@@ -1199,10 +1189,9 @@ async fn switch_delivers_new_upstream_initial_job() {
 async fn mock_pool_drop_once(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream =
-        accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
-            .await
-            .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+        .await
+        .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
@@ -1319,8 +1308,7 @@ async fn mid_rental_failover_to_fallback_on_primary_drop() {
     let mut got_fb = false;
     for _ in 0..50 {
         let res =
-            tokio::time::timeout(Duration::from_secs(5), miner.read_until_set_extranonce())
-                .await;
+            tokio::time::timeout(Duration::from_secs(5), miner.read_until_set_extranonce()).await;
         let Ok(Ok((_, prefix))) = res else { break };
         if prefix == vec![0xCC; 8] {
             got_fb = true;
@@ -1755,7 +1743,11 @@ async fn same_worker_miners_form_one_rig_switched_together() {
         }
         tokio::task::yield_now().await;
     };
-    assert_eq!(sessions.len(), 1, "two same-rig miners → one shared session");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "two same-rig miners → one shared session"
+    );
 
     // Rent the rig: switching the single session re-points BOTH members.
     sessions[0]
@@ -1840,8 +1832,7 @@ async fn bundled_member_can_leave_and_rejoin_without_dropping_the_rig() {
 
     // Miner 2 keeps mining on the shared upstream: its share still reaches A.
     m2.submit(cid2, 1).await.unwrap();
-    a_rx
-        .recv()
+    a_rx.recv()
         .await
         .expect("miner 2 share reaches pool A after miner 1 left");
 
@@ -1856,7 +1847,11 @@ async fn bundled_member_can_leave_and_rejoin_without_dropping_the_rig() {
     let mut m3 = MockMiner::connect(proxy_addr).await.unwrap();
     m3.setup().await.unwrap();
     let (_cid3, p3) = m3.open("bc1qSELLER.farm", 1).await.unwrap();
-    assert_eq!(p3, vec![0xAA; 8], "rejoining miner lands on the shared pool A");
+    assert_eq!(
+        p3,
+        vec![0xAA; 8],
+        "rejoining miner lands on the shared pool A"
+    );
     assert_eq!(
         registry.get_all("bc1qSELLER.farm").await.len(),
         1,
@@ -1938,7 +1933,11 @@ async fn three_same_rig_miners_bundle_and_switch_together() {
         }
         tokio::task::yield_now().await;
     };
-    assert_eq!(sessions.len(), 1, "three same-rig miners → one shared session");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "three same-rig miners → one shared session"
+    );
 
     // Rent: switching the single session re-points ALL three members.
     sessions[0]
@@ -2145,7 +2144,11 @@ async fn reconnect_within_grace_reuses_the_warm_rig() {
     let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
     m2.setup().await.unwrap();
     let (c2, p2) = m2.open("bc1qSELLER.farm", 1).await.unwrap();
-    assert_eq!(p2, vec![0xAA; 8], "reconnect attaches to the warm pool A upstream");
+    assert_eq!(
+        p2,
+        vec![0xAA; 8],
+        "reconnect attaches to the warm pool A upstream"
+    );
 
     // Past the grace window the rig is still alive (the reaper saw a member).
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -2156,8 +2159,7 @@ async fn reconnect_within_grace_reuses_the_warm_rig() {
     );
     // And the reused upstream still works: m2's share reaches pool A.
     m2.submit(c2, 1).await.unwrap();
-    a_rx
-        .recv()
+    a_rx.recv()
         .await
         .expect("share over the reused warm upstream reaches pool A");
 }
@@ -2173,10 +2175,9 @@ async fn mock_pool_mixed(
 ) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream =
-        accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
-            .await
-            .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+        .await
+        .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
@@ -2195,16 +2196,15 @@ async fn mock_pool_mixed(
                     continue;
                 };
                 // Extended channel 10, grouped under group id 77.
-                let success = Mining::OpenExtendedMiningChannelSuccess(
-                    OpenExtendedMiningChannelSuccess {
+                let success =
+                    Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
                         request_id: open.spec.request_id(),
                         channel_id: 10,
                         target: U256::try_from(diff1_target()).unwrap(),
                         extranonce_size: 8,
                         extranonce_prefix: B032::try_from(vec![0xAA; 8]).unwrap(),
                         group_channel_id: 77,
-                    },
-                );
+                    });
                 write
                     .write_frame(wire::frame_from(AnyMessage::Mining(success)))
                     .await
@@ -2218,10 +2218,8 @@ async fn mock_pool_mixed(
                     version: 0x2000_0000,
                     version_rolling_allowed: true,
                     merkle_path: empty_path.into(),
-                    coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![])
-                        .unwrap(),
-                    coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![])
-                        .unwrap(),
+                    coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                    coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
                 };
                 write
                     .write_frame(wire::frame_from(AnyMessage::Mining(
@@ -2235,15 +2233,14 @@ async fn mock_pool_mixed(
                     continue;
                 };
                 // Standard channel 20, UNGROUPED (group_channel_id 0).
-                let success = Mining::OpenStandardMiningChannelSuccess(
-                    OpenStandardMiningChannelSuccess {
+                let success =
+                    Mining::OpenStandardMiningChannelSuccess(OpenStandardMiningChannelSuccess {
                         request_id: U32AsRef::from(open.spec.request_id()),
                         channel_id: 20,
                         target: U256::try_from(diff1_target()).unwrap(),
                         extranonce_prefix: B032::try_from(vec![0xBB; 8]).unwrap(),
                         group_channel_id: 0,
-                    },
-                );
+                    });
                 write
                     .write_frame(wire::frame_from(AnyMessage::Mining(success)))
                     .await
@@ -2827,24 +2824,21 @@ async fn validating_sv1_pool(listener: TcpListener, accepted: mpsc::UnboundedSen
                         let mut full_en = en1.clone();
                         full_en.extend_from_slice(&en2);
                         let empty: Vec<Vec<u8>> = vec![];
-                        let valid =
-                            match merkle_root_from_path(&coinb1, &coinb2, &full_en, &empty) {
-                                Some(root) => {
-                                    let version = (VERSION & !MASK) | (vbits & MASK);
-                                    let mut header = Vec::with_capacity(80);
-                                    header.extend_from_slice(&version.to_le_bytes());
-                                    header.extend_from_slice(&pv);
-                                    header.extend_from_slice(&root);
-                                    header.extend_from_slice(&ntime.to_le_bytes());
-                                    header.extend_from_slice(&NBITS.to_le_bytes());
-                                    header.extend_from_slice(&nonce.to_le_bytes());
-                                    le_leq(
-                                        &sha256d::Hash::hash(&header).to_byte_array(),
-                                        &share_target,
-                                    )
-                                }
-                                None => false,
-                            };
+                        let valid = match merkle_root_from_path(&coinb1, &coinb2, &full_en, &empty)
+                        {
+                            Some(root) => {
+                                let version = (VERSION & !MASK) | (vbits & MASK);
+                                let mut header = Vec::with_capacity(80);
+                                header.extend_from_slice(&version.to_le_bytes());
+                                header.extend_from_slice(&pv);
+                                header.extend_from_slice(&root);
+                                header.extend_from_slice(&ntime.to_le_bytes());
+                                header.extend_from_slice(&NBITS.to_le_bytes());
+                                header.extend_from_slice(&nonce.to_le_bytes());
+                                le_leq(&sha256d::Hash::hash(&header).to_byte_array(), &share_target)
+                            }
+                            None => false,
+                        };
                         let _ = accepted.send(valid);
                         let reply = json!({"id": id, "result": valid, "error": Value::Null});
                         let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
@@ -3074,11 +3068,9 @@ async fn sv2_standard_miner_onto_sv1_pool_is_cryptographically_valid() {
     let (channel_id, prefix) = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let mut f = read_one(&mut miner.read).await?;
-            if wire::msg_type(&f)
-                == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
+            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
             {
-                let info =
-                    parse_open_success(&mut f).ok_or_else(|| anyhow!("bad open success"))?;
+                let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad open success"))?;
                 return Ok::<_, anyhow::Error>((info.up_channel_id, info.extranonce_prefix));
             }
         }
@@ -3194,7 +3186,10 @@ async fn force_reconnect_drops_all_bundled_members() {
         })
         .await
         .unwrap_or(false);
-        assert!(closed, "bundled member {i} must be dropped by force_reconnect");
+        assert!(
+            closed,
+            "bundled member {i} must be dropped by force_reconnect"
+        );
     }
 }
 
@@ -3299,12 +3294,13 @@ async fn reattach_reconciles_rig_onto_active_rental_pool() {
 
     // The still-connected member rides the same shared upstream → re-pointed.
     let (_rc, rp) = m1.read_until_set_extranonce().await.unwrap();
-    assert_eq!(rp, vec![0xBB; 8], "existing member re-pointed by the reconcile");
+    assert_eq!(
+        rp,
+        vec![0xBB; 8],
+        "existing member re-pointed by the reconcile"
+    );
 
-    let st = registry
-        .aggregated_status("bc1qSELLER.farm")
-        .await
-        .unwrap();
+    let st = registry.aggregated_status("bc1qSELLER.farm").await.unwrap();
     assert_eq!(st.routing, "rented", "rig reads as rented after reconcile");
 }
 
@@ -3418,11 +3414,11 @@ async fn reattach_into_empty_grace_hull_routes_to_active_rental() {
         "reattach into the empty grace hull must route to the rented pool B, not idle A"
     );
 
-    let st = registry
-        .aggregated_status("bc1qSELLER.solo")
-        .await
-        .unwrap();
-    assert_eq!(st.routing, "rented", "rig reads as rented after the reattach");
+    let st = registry.aggregated_status("bc1qSELLER.solo").await.unwrap();
+    assert_eq!(
+        st.routing, "rented",
+        "rig reads as rented after the reattach"
+    );
 }
 
 // ── the SV2 probe: "down" is not "speaks SV1" ────────────────────────

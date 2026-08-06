@@ -72,8 +72,8 @@ pub(crate) use codec::{
 
 /// Same-rig bundle registry + idle reaper (split out for navigability).
 mod registry;
-pub use registry::Sv2RigRegistry;
 use registry::reap_idle_rig;
+pub use registry::Sv2RigRegistry;
 
 /// How long the proxy's Noise certificate (responder side) is valid, seconds.
 const CERT_VALIDITY: u64 = 3600;
@@ -589,7 +589,8 @@ impl Sv2Session {
         // The bumped epoch is retained by the watch channel, so a member whose
         // serve loop is between selects (processing a frame) still sees it —
         // and every member has its own receiver, so all of them break.
-        self.reconnect.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        self.reconnect
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
     /// Per-member reconnect-signal receiver for the serve loop. Subscribe
@@ -1127,11 +1128,7 @@ async fn connect_sv1_upstream(
     let cfg_resp = sv1_read_response(&mut read, &mut prelude).await?;
     let version_mask = parse_version_mask(&cfg_resp);
 
-    let sub = RpcMessage::request(
-        json!(2),
-        "mining.subscribe",
-        json!(["bp-proxy"]),
-    );
+    let sub = RpcMessage::request(json!(2), "mining.subscribe", json!(["bp-proxy"]));
     w.write_all(sub.to_line().as_bytes()).await?;
     let sub_resp = sv1_read_response(&mut read, &mut prelude).await?;
     let (en1_hex, extranonce2_size) =

@@ -140,7 +140,10 @@ mod tests {
         let a = hs.since("rigA", 0).await;
         assert_eq!(a.len(), 2, "rigB is a different worker");
         assert_eq!(a[0].slot_ms, 1_000_000);
-        assert!((a[0].hashrate_ths - 120.0).abs() < 1e-9, "upsert overwrote slot");
+        assert!(
+            (a[0].hashrate_ths - 120.0).abs() < 1e-9,
+            "upsert overwrote slot"
+        );
         assert!(a[0].online);
         assert_eq!(a[1].slot_ms, 1_600_000);
         assert!(!a[1].online, "0 h/s slot is offline");

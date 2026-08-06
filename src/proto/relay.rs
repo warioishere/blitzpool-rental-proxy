@@ -939,11 +939,7 @@ async fn connect_upstream(
         let _ = read_response(&mut reader, &mut prelude).await?; // discard upstream configure reply
     }
 
-    let sub = RpcMessage::request(
-        json!(1),
-        "mining.subscribe",
-        json!(["bp-proxy"]),
-    );
+    let sub = RpcMessage::request(json!(1), "mining.subscribe", json!(["bp-proxy"]));
     w.write_all(sub.to_line().as_bytes()).await?;
     let sub_resp = read_response(&mut reader, &mut prelude).await?;
     let (extranonce1, extranonce2_size) =

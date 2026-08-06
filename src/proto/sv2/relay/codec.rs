@@ -115,7 +115,10 @@ pub(super) fn open_success_downstream(
     Ok(wire::frame_from(AnyMessage::Mining(msg)))
 }
 
-pub(super) fn set_extranonce_prefix(channel_id: u32, prefix: Vec<u8>) -> anyhow::Result<EitherFrame> {
+pub(super) fn set_extranonce_prefix(
+    channel_id: u32,
+    prefix: Vec<u8>,
+) -> anyhow::Result<EitherFrame> {
     let m = SetExtranoncePrefix {
         channel_id,
         extranonce_prefix: B032::try_from(prefix).map_err(|_| anyhow!("bad extranonce"))?,
@@ -153,7 +156,9 @@ pub(super) fn close_channel_upstream(channel_id: u32) -> anyhow::Result<EitherFr
         reason_code: Str0255::try_from("member disconnected".to_string())
             .map_err(|_| anyhow!("reason too long"))?,
     };
-    Ok(wire::frame_from(AnyMessage::Mining(Mining::CloseChannel(m))))
+    Ok(wire::frame_from(AnyMessage::Mining(Mining::CloseChannel(
+        m,
+    ))))
 }
 
 // ── message parsers (copy fields out as owned) ──────────────────────
