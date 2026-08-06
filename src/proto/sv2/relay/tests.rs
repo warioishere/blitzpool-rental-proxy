@@ -3424,3 +3424,94 @@ async fn reattach_into_empty_grace_hull_routes_to_active_rental() {
         .unwrap();
     assert_eq!(st.routing, "rented", "rig reads as rented after the reattach");
 }
+
+// ── the SV2 probe: "down" is not "speaks SV1" ────────────────────────
+//
+// The probe answers two questions at once and only one is about protocols.
+// While they shared an arm, a pool RESTART read as "this pool speaks SV1" and
+// bought the rig a permanent downgrade to translation — nothing ever re-probes
+// SV2. These pin the split on real sockets.
+
+/// An address with nothing behind it: bind, read the port, drop the listener,
+/// so the port is real but closed — what a restarting pool looks like.
+async fn dead_addr() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    drop(l);
+    addr.to_string()
+}
+
+#[tokio::test]
+async fn a_pool_that_is_down_is_not_mistaken_for_an_sv1_pool() {
+    let target = ext_target(&dead_addr().await, "u");
+    match probe_sv2(&target).await {
+        Err(ProbeFailure::Unreachable(_)) => {}
+        Err(ProbeFailure::NotSv2(e)) => {
+            panic!("a closed port must not read as an SV1 pool — that downgrade is permanent: {e}")
+        }
+        Ok(_) => panic!("nothing is listening; the probe cannot succeed"),
+    }
+}
+
+#[tokio::test]
+async fn a_pool_that_answers_but_never_speaks_sv2_is_translated() {
+    // Accepts, then says nothing: an SV1 pool making no sense of the Noise
+    // bytes. It ANSWERED, so this is a protocol verdict and translation is right.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let held = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(sock);
+    });
+
+    let target = ext_target(&addr, "u");
+    match probe_sv2(&target).await {
+        Err(ProbeFailure::NotSv2(_)) => {}
+        Err(ProbeFailure::Unreachable(e)) => {
+            panic!("the pool accepted the connection, so it is reachable: {e}")
+        }
+        Ok(_) => panic!("a silent peer cannot complete the SV2 setup"),
+    }
+    held.abort();
+}
+
+#[tokio::test]
+async fn a_pool_that_hangs_up_mid_handshake_is_translated() {
+    // Accepts and closes at once — the other shape of "not SV2", and it must
+    // not be confused with an absent pool either.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let held = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        drop(sock);
+    });
+
+    let target = ext_target(&addr, "u");
+    match probe_sv2(&target).await {
+        Err(ProbeFailure::NotSv2(_)) => {}
+        Err(ProbeFailure::Unreachable(e)) => panic!("it accepted the connection first: {e}"),
+        Ok(_) => panic!("a peer that hangs up cannot complete the SV2 setup"),
+    }
+    held.abort();
+}
+
+#[tokio::test]
+async fn a_real_sv2_pool_still_probes_clean() {
+    // The positive control: without it, "everything fails the probe" would read
+    // the same as "these three fail the probe".
+    let keys = NoiseKeys::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let pool = tokio::spawn(mock_pool(listener, vec![0xAA; 8], 1, keys.clone(), tx));
+
+    let mut target = ext_target(&addr, "u");
+    target.authority_pubkey = Some(keys.public_b58());
+    match probe_sv2(&target).await {
+        Ok(_) => {}
+        Err(ProbeFailure::Unreachable(e)) => panic!("the mock pool is listening: {e}"),
+        Err(ProbeFailure::NotSv2(e)) => panic!("the mock pool speaks SV2: {e}"),
+    }
+    pool.abort();
+}

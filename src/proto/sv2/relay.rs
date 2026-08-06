@@ -143,10 +143,76 @@ async fn read_one(read: &mut Read) -> anyhow::Result<Sv2Frame> {
 
 /// Connect an upstream, run SetupConnection, return the (post-setup) halves and
 /// the upstream's negotiated flags.
+/// Why an SV2 probe did not produce an upstream — and the distinction is the
+/// whole point.
+///
+/// The probe answers two different questions at once, and only one of them is
+/// about protocols. Collapsing them is what made a pool RESTART look like a
+/// pool that speaks SV1: the downgrade to translation is permanent (nothing
+/// re-probes SV2), so a rig that happened to retry inside the restart window
+/// stayed translated for the rest of its session.
+pub(crate) enum ProbeFailure {
+    /// No TCP connection could be established. The pool is down, restarting or
+    /// unroutable, and it has said NOTHING about which protocol it speaks.
+    /// Answering that with a protocol downgrade is a category error — the
+    /// caller must keep retrying instead.
+    Unreachable(anyhow::Error),
+    /// The pool accepted the connection but did not complete the SV2 setup: no
+    /// Noise handshake, a refusal, or silence until the probe timeout. That IS
+    /// a statement about the protocol, so translation is the right answer.
+    NotSv2(anyhow::Error),
+}
+
+/// Probe `target` for SV2, classifying a failure by [`ProbeFailure`].
+///
+/// The timeout lives inside so a pool that accepts TCP and then goes quiet is
+/// judged on what it already told us (it answered) rather than on which layer
+/// happened to run out of time.
+pub(crate) async fn probe_sv2(target: &UpstreamTarget) -> Result<(Read, Write, u32), ProbeFailure> {
+    let connected = tokio::time::timeout(
+        translate::UPSTREAM_PROBE_TIMEOUT,
+        TcpStream::connect(&target.url),
+    )
+    .await;
+    let tcp = match connected {
+        Ok(Ok(tcp)) => tcp,
+        // Refused, unroutable, or not even accepting inside the probe window:
+        // the pool is not there. Not a protocol verdict.
+        Ok(Err(e)) => {
+            return Err(ProbeFailure::Unreachable(
+                anyhow::Error::new(e).context(format!("connect upstream {}", target.url)),
+            ))
+        }
+        Err(_) => {
+            return Err(ProbeFailure::Unreachable(anyhow!(
+                "connect upstream {} timed out",
+                target.url
+            )))
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+    // Past the TCP connect every failure IS a protocol statement: the pool is
+    // there, and it did not speak SV2.
+    match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, setup_over(tcp, target)).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(e)) => Err(ProbeFailure::NotSv2(e)),
+        Err(_) => Err(ProbeFailure::NotSv2(anyhow!(
+            "upstream {} accepted the connection but did not complete the SV2 setup",
+            target.url
+        ))),
+    }
+}
+
 pub(crate) async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, u32)> {
     let tcp = TcpStream::connect(&target.url)
         .await
         .with_context(|| format!("connect upstream {}", target.url))?;
+    setup_over(tcp, target).await
+}
+
+/// The SV2 setup on an already-connected socket: Noise, then `SetupConnection`
+/// until its Success.
+async fn setup_over(tcp: TcpStream, target: &UpstreamTarget) -> anyhow::Result<(Read, Write, u32)> {
     let _ = tcp.set_nodelay(true);
     let authority = super::keys::parse_authority(&target.authority_pubkey)?;
     let stream = connect_with_noise::<Msg>(tcp, authority)
@@ -605,18 +671,16 @@ impl Sv2Session {
         // bundling back onto the old (idle) one — the single-device rent bug.
 
         // Native first: re-open on SV2; if the new pool doesn't answer as SV2,
-        // it's an SV1 buyer pool → translate the switch onto it.
-        let (mut read, mut write, _flags) = match tokio::time::timeout(
-            translate::UPSTREAM_PROBE_TIMEOUT,
-            connect_setup(&target),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            res => {
-                if let Ok(Err(e)) = &res {
-                    debug!(url = %target.url, error = %e, "upstream not SV2; switching via SV1 translation");
-                }
+        // it's an SV1 buyer pool → translate the switch onto it. But an
+        // unreachable pool is NOT an SV1 pool: fail, so the supervisor keeps
+        // retrying on SV2 instead of downgrading for the rest of the session.
+        let (mut read, mut write, _flags) = match probe_sv2(&target).await {
+            Ok(c) => c,
+            Err(ProbeFailure::Unreachable(e)) => {
+                return Err(e.context("upstream unreachable; not downgrading to SV1"))
+            }
+            Err(ProbeFailure::NotSv2(e)) => {
+                debug!(url = %target.url, error = %e, "upstream not SV2; switching via SV1 translation");
                 return self
                     .swap_to_sv1_translate(target, routing, generation, up_ident)
                     .await;
@@ -1458,16 +1522,18 @@ impl Sv2Session {
         let up_ident = crate::proto::relay::upstream_worker(&target.user, worker);
         // Native first: try SV2 (reusing its socket on success); if the pool
         // doesn't answer as SV2, it's an SV1 buyer pool → translate.
-        match tokio::time::timeout(translate::UPSTREAM_PROBE_TIMEOUT, connect_setup(&target)).await
-        {
-            Ok(Ok((read, write, _flags))) => {
+        // An unreachable pool says nothing about protocols, so it must not buy
+        // the miner a permanent downgrade — fail, and let the connect retry.
+        match probe_sv2(&target).await {
+            Ok((read, write, _flags)) => {
                 self.install_sv2_initial(read, write, spec, up_ident, target, routing, member)
                     .await
             }
-            res => {
-                if let Ok(Err(e)) = &res {
-                    debug!(url = %target.url, error = %e, "upstream not SV2; trying SV1 translation");
-                }
+            Err(ProbeFailure::Unreachable(e)) => {
+                Err(e.context("upstream unreachable; not downgrading to SV1"))
+            }
+            Err(ProbeFailure::NotSv2(e)) => {
+                debug!(url = %target.url, error = %e, "upstream not SV2; trying SV1 translation");
                 let conn = connect_sv1_upstream(&target, &up_ident).await?;
                 self.install_sv1_translate_initial(conn, spec, up_ident, target, routing, member)
                     .await
