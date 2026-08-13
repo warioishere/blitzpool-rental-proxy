@@ -163,6 +163,30 @@ pub(crate) enum ProbeFailure {
     NotSv2(anyhow::Error),
 }
 
+impl ProbeFailure {
+    /// The single place a failed probe is judged. `Err` = propagate, the pool is
+    /// not there and must not buy the miner a protocol downgrade; `Ok` = the pool
+    /// answered and did not speak SV2, so the caller may translate.
+    ///
+    /// Both probe sites (initial connect and upstream swap) asked this question
+    /// with their own copy of the match. That is precisely how the bug this enum
+    /// exists for was written: one collect-all arm, duplicated, treating "down"
+    /// and "speaks SV1" alike. With the judgement here, a third failure class
+    /// forces a change in exactly one exhaustive match, and the sites keep only
+    /// what legitimately differs — what they DO to translate.
+    fn allow_translation(self, url: &str) -> anyhow::Result<()> {
+        match self {
+            ProbeFailure::Unreachable(e) => {
+                Err(e.context("upstream unreachable; not downgrading to SV1"))
+            }
+            ProbeFailure::NotSv2(e) => {
+                debug!(url = %url, error = %e, "upstream not SV2; using SV1 translation");
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Probe `target` for SV2, classifying a failure by [`ProbeFailure`].
 ///
 /// The timeout lives inside so a pool that accepts TCP and then goes quiet is
@@ -243,11 +267,19 @@ async fn setup_over(tcp: TcpStream, target: &UpstreamTarget) -> anyhow::Result<(
 /// atomically swaps `active`, so miner traffic is never routed to a channel that
 /// isn't open yet. The fresh-open path (initial + additional channels) instead
 /// finalizes through the steady reader; this is only used by [`Sv2Session::swap_upstream`].
+/// Open one channel on an already-set-up upstream connection.
+///
+/// `deferred` collects every frame that arrives before this channel's
+/// `OpenSuccess` and does not belong to the open itself — see the arm below for
+/// why those exist and why they must not be dropped. The caller passes the SAME
+/// vec through a whole re-open loop, so the frames stay in arrival order, and
+/// hands it to the steady reader afterwards.
 pub(crate) async fn open_on(
     read: &mut Read,
     write: &mut Write,
     spec: &OpenSpec,
     account: &str,
+    deferred: &mut Vec<Sv2Frame>,
 ) -> anyhow::Result<ChannelInfo> {
     write
         .write_frame(open_channel_upstream(spec, account, spec.request_id())?)
@@ -264,15 +296,31 @@ pub(crate) async fn open_on(
             Some(mining::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR) => {
                 bail!("upstream rejected OpenMiningChannel")
             }
-            other => {
-                // Per the SV2 spec the pool assigns the channel in its
-                // OpenSuccess before it can address any job/prev-hash to it, so
-                // nothing channel-scoped legitimately precedes the success here.
-                // The pool's initial NewExtendedMiningJob + SetNewPrevHash arrive
-                // *after* it and are read by the steady upstream reader — the same
-                // `read` half (with its buffered frames) is handed to it, so they
-                // are not lost. A frame before the success is unexpected; skip it.
-                tracing::warn!(mt = ?other, "sv2 open_on: unexpected frame before OpenSuccess; skipping");
+            _ => {
+                // A frame for a channel opened EARLIER on this connection.
+                //
+                // The old reasoning here was that nothing can legitimately
+                // precede the success, because the pool cannot address a channel
+                // before it has assigned it. True for ONE channel — and this
+                // function runs once per channel on the SAME connection. The pool
+                // sends each channel's first NewExtendedMiningJob (31) +
+                // SetNewPrevHash (32) straight after ITS OpenSuccess, which is
+                // while we are already waiting for the NEXT channel's success.
+                //
+                // They cannot be routed yet: the up→down channel map is only
+                // complete once every channel is open. So they are buffered here
+                // and replayed by the steady reader, which is the same path they
+                // would have taken had they arrived a moment later.
+                //
+                // Dropping them (which this did until 2026-08-13) left every
+                // channel but the last one with no job after a reconnect. Those
+                // miners kept hashing their pre-reconnect job under an extranonce
+                // prefix the pool had since reassigned, so every share came back
+                // job-not-found or difficulty-too-low — measured on prod as
+                // ~200 rejects/min per rig until the proxy was restarted, and
+                // amplified by the pool's vardiff dropping the target (1024 → 4)
+                // because it saw no accepted shares.
+                deferred.push(f);
                 continue;
             }
         }
@@ -289,12 +337,25 @@ fn spawn_writer(mut half: Write, mut rx: mpsc::UnboundedReceiver<EitherFrame>) -
     })
 }
 
+/// Spawn the steady reader for an upstream connection.
+///
+/// `deferred` are frames already read off this connection during the channel
+/// re-open loop ([`open_on`]). They are replayed FIRST, before anything still in
+/// the socket, so a channel's initial job/prev-hash cannot be overtaken by a
+/// later one for the same channel. Replaying them from inside this task (rather
+/// than from the swap path) is also what keeps them from being dropped as stale:
+/// the task takes `inner` per frame, so its first frame lands only after the
+/// caller has released the lock with `active.generation` already set.
 fn spawn_upstream_reader(
     session: Arc<Sv2Session>,
     generation: u64,
     mut read: Read,
+    deferred: Vec<Sv2Frame>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        for frame in deferred {
+            session.on_upstream_frame(generation, frame).await;
+        }
         while let Ok(frame) = read.read_frame().await {
             if let Some(sv2) = wire::into_sv2(frame) {
                 session.on_upstream_frame(generation, sv2).await;
@@ -337,7 +398,33 @@ async fn supervise_upstream(session: Arc<Sv2Session>, mut died_rx: mpsc::Unbound
             };
             match res {
                 Ok(()) => {
-                    info!(gen, "sv2 upstream re-established after drop");
+                    // Drop the miners so they come back on a fresh channel,
+                    // rather than leaving them live-re-pointed onto the new
+                    // upstream.
+                    //
+                    // This is the rule the operator paths already follow — see
+                    // `api::reconnect_all` and the rental-expiry sweep, both of
+                    // which force a reconnect precisely because "miners ignore a
+                    // mid-session extranonce change and keep wasting shares".
+                    // Recovery after a dropped upstream is the same situation and
+                    // was the one path still re-pointing in place.
+                    //
+                    // A re-point cannot carry everything the miner needs:
+                    // `SetExtranoncePrefix` changes the prefix but SV2 has no way
+                    // to change the extranonce *size* a channel was opened with,
+                    // and a re-opened channel gets whatever the pool assigns this
+                    // time. Measured on prod 2026-08-13: after a pool restart the
+                    // re-pointed rig produced only hash-0 shares
+                    // (`difficulty-too-low (0.000000)`) plus `job-not-found`,
+                    // ~200/min, until the proxy was restarted by hand — a
+                    // restart being exactly the reconnect this now does by
+                    // itself. The cost is one reconnect per miner; the old
+                    // behaviour cost every share until someone noticed.
+                    session.force_reconnect();
+                    info!(
+                        gen,
+                        "sv2 upstream re-established after drop — reconnecting miners"
+                    );
                     break;
                 }
                 Err(e) => {
@@ -436,6 +523,40 @@ struct Inner {
 }
 
 impl Inner {
+    /// Swap in a new active upstream: abort the outgoing reader/writer and
+    /// install the new pair under `generation`.
+    ///
+    /// Every install path goes through here — SV2 initial, SV2 swap,
+    /// SV1-translate initial, SV1-translate swap. They differ in how the reader
+    /// is built (native vs translating) and in nothing else, and the three steps
+    /// below were written out four times before this existed.
+    ///
+    /// Taking `&mut self` is the load-bearing part, not ceremony: it can only be
+    /// called with the `inner` lock held. [`Sv2Session::on_upstream_frame`] drops
+    /// any frame whose generation != `active.generation`, while a spawned reader
+    /// starts pulling immediately — so spawning the reader and installing
+    /// `active` under ONE continuous hold of the lock is what keeps the new
+    /// pool's first job from being discarded as stale. Callers must therefore
+    /// spawn the reader inside the same lock scope as this call.
+    fn install_active(
+        &mut self,
+        generation: u64,
+        target: UpstreamTarget,
+        to_up: mpsc::UnboundedSender<EitherFrame>,
+        reader: JoinHandle<()>,
+        writer: JoinHandle<()>,
+    ) {
+        self.active.reader.abort();
+        self.active.writer.abort();
+        self.active = ActiveUpstream {
+            generation,
+            target,
+            to_up,
+            reader,
+            writer,
+        };
+    }
+
     fn up_for_down(&self, down_cid: u32) -> Option<u32> {
         self.channels
             .iter()
@@ -677,11 +798,8 @@ impl Sv2Session {
         // retrying on SV2 instead of downgrading for the rest of the session.
         let (mut read, mut write, _flags) = match probe_sv2(&target).await {
             Ok(c) => c,
-            Err(ProbeFailure::Unreachable(e)) => {
-                return Err(e.context("upstream unreachable; not downgrading to SV1"))
-            }
-            Err(ProbeFailure::NotSv2(e)) => {
-                debug!(url = %target.url, error = %e, "upstream not SV2; switching via SV1 translation");
+            Err(f) => {
+                f.allow_translation(&target.url)?;
                 return self
                     .swap_to_sv1_translate(target, routing, generation, up_ident)
                     .await;
@@ -690,8 +808,12 @@ impl Sv2Session {
         let mut new_channels = Vec::with_capacity(specs.len());
         let mut up_to_down = std::collections::HashMap::new();
         let mut repoint = Vec::with_capacity(specs.len());
+        // Frames the pool sends for an already-opened channel while we are still
+        // opening the next one — its initial job + prev-hash. Accumulated across
+        // the whole loop and handed to the steady reader below.
+        let mut deferred: Vec<Sv2Frame> = Vec::new();
         for (down_cid, owner, spec) in &specs {
-            let info = open_on(&mut read, &mut write, spec, &up_ident)
+            let info = open_on(&mut read, &mut write, spec, &up_ident, &mut deferred)
                 .await
                 .map_err(|e| anyhow!("switch reopen channel {down_cid}: {e}"))?;
             up_to_down.insert(info.up_channel_id, *down_cid);
@@ -723,24 +845,11 @@ impl Sv2Session {
 
         let abandoned: Vec<(u32, u32)> = {
             let mut i = self.inner.lock().await;
-            // Spawn the new upstream's reader/writer while holding the lock and
-            // install `active` (carrying the new generation) before releasing it.
-            // The reader tags each frame with `generation`, and `on_upstream_frame`
-            // drops frames whose generation != the active one. Spawning inside the
-            // lock means the reader cannot process the new pool's initial job /
-            // prev-hash until `active.generation` already equals `generation`, so
-            // that first job is never dropped as "stale".
+            // Reader spawned inside the lock — see `Inner::install_active` for
+            // why that ordering is required.
             let writer = spawn_writer(write, up_rx);
-            let reader = spawn_upstream_reader(self.clone(), generation, read);
-            i.active.reader.abort();
-            i.active.writer.abort();
-            i.active = ActiveUpstream {
-                generation,
-                target: target.clone(),
-                to_up,
-                reader,
-                writer,
-            };
+            let reader = spawn_upstream_reader(self.clone(), generation, read, deferred);
+            i.install_active(generation, target.clone(), to_up, reader, writer);
             i.channels = new_channels;
             i.up_to_down = up_to_down;
             // In-flight opens were sent to the old upstream; abandon them and
@@ -1526,11 +1635,8 @@ impl Sv2Session {
                 self.install_sv2_initial(read, write, spec, up_ident, target, routing, member)
                     .await
             }
-            Err(ProbeFailure::Unreachable(e)) => {
-                Err(e.context("upstream unreachable; not downgrading to SV1"))
-            }
-            Err(ProbeFailure::NotSv2(e)) => {
-                debug!(url = %target.url, error = %e, "upstream not SV2; trying SV1 translation");
+            Err(f) => {
+                f.allow_translation(&target.url)?;
                 let conn = connect_sv1_upstream(&target, &up_ident).await?;
                 self.install_sv1_translate_initial(conn, spec, up_ident, target, routing, member)
                     .await
@@ -1554,16 +1660,12 @@ impl Sv2Session {
         let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
         let writer = spawn_writer(write, up_rx);
         let mut i = self.inner.lock().await;
-        let reader = spawn_upstream_reader(self.clone(), 0, read);
-        i.active.reader.abort();
-        i.active.writer.abort();
-        i.active = ActiveUpstream {
-            generation: 0,
-            target,
-            to_up,
-            reader,
-            writer,
-        };
+        // Nothing to replay: this path installs the FIRST channel of a fresh
+        // connection, so no earlier channel exists whose job could have arrived
+        // while it was opening. Every later channel is opened by the miner and
+        // handled by this reader.
+        let reader = spawn_upstream_reader(self.clone(), 0, read, Vec::new());
+        i.install_active(0, target, to_up, reader, writer);
         i.routing = routing;
         i.translating = false;
         let up_req = i.next_up_req;
@@ -1624,26 +1726,17 @@ impl Sv2Session {
         let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
         {
             let mut i = self.inner.lock().await;
-            // Spawn the reader inside the lock so the new generation is in place
-            // before its first job/diff line is processed.
+            // Reader spawned inside the lock — see `Inner::install_active`.
+            let generation = i.active.generation;
             let reader = spawn_sv1_translate_reader(
                 self.clone(),
-                i.active.generation,
+                generation,
                 conn.read,
                 state,
                 down_cid,
                 conn.prelude,
             );
-            i.active.reader.abort();
-            i.active.writer.abort();
-            let generation = i.active.generation;
-            i.active = ActiveUpstream {
-                generation,
-                target,
-                to_up,
-                reader,
-                writer,
-            };
+            i.install_active(generation, target, to_up, reader, writer);
             i.channels = vec![Channel {
                 down_channel_id: down_cid,
                 up_channel_id: down_cid,
@@ -1699,6 +1792,7 @@ impl Sv2Session {
         let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
         let abandoned: Vec<(u32, u32)> = {
             let mut i = self.inner.lock().await;
+            // Reader spawned inside the lock — see `Inner::install_active`.
             let reader = spawn_sv1_translate_reader(
                 self.clone(),
                 generation,
@@ -1707,15 +1801,7 @@ impl Sv2Session {
                 down_cid,
                 conn.prelude,
             );
-            i.active.reader.abort();
-            i.active.writer.abort();
-            i.active = ActiveUpstream {
-                generation,
-                target: target.clone(),
-                to_up,
-                reader,
-                writer,
-            };
+            i.install_active(generation, target.clone(), to_up, reader, writer);
             i.channels = vec![Channel {
                 down_channel_id: down_cid,
                 up_channel_id: down_cid,

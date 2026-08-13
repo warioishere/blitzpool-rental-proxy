@@ -3,8 +3,11 @@
 //! re-points it to mock pool B without the miner reconnecting.
 
 use super::*;
-use stratum_core::binary_sv2::B032;
-use stratum_core::mining_sv2::{SubmitSharesExtended, SubmitSharesSuccess, UpdateChannel};
+use std::collections::HashSet;
+use stratum_core::binary_sv2::{Seq0255, Sv2Option, B032, B064K};
+use stratum_core::mining_sv2::{
+    NewExtendedMiningJob, SetNewPrevHash, SubmitSharesExtended, SubmitSharesSuccess, UpdateChannel,
+};
 use tokio::net::TcpListener;
 
 fn ext_target(url: &str, user: &str) -> UpstreamTarget {
@@ -37,6 +40,40 @@ async fn register_rig(sellers: &crate::store::SellerStore, worker: &str, idle: U
 fn diff1_target() -> Vec<u8> {
     // The difficulty-1 target in the current (bdiff) convention.
     translate::target_from_difficulty(1.0).to_vec()
+}
+
+/// The job + prev-hash a pool sends **immediately after** an OpenSuccess, so
+/// the newly-opened channel has something to hash on.
+///
+/// The mock pool has to do this to be a pool at all, and until 2026-08-13 it did
+/// not: it opened channels and then went silent. That is why no test could see
+/// `open_on` dropping the frames of an already-opened channel while the next one
+/// was still opening — the fixture never produced them. A harness that models a
+/// silent pool cannot fail on a bug about what a talking pool sends.
+fn initial_job_frames(channel_id: u32, job_id: u32) -> [EitherFrame; 2] {
+    let job = NewExtendedMiningJob {
+        channel_id,
+        job_id,
+        // Future job: it becomes mineable with the SetNewPrevHash below, which
+        // is the order a real pool uses at channel open.
+        min_ntime: Sv2Option::new(None),
+        version: 0x2000_0000,
+        version_rolling_allowed: true,
+        merkle_path: Seq0255::new(Vec::<U256>::new()).expect("empty merkle path"),
+        coinbase_tx_prefix: B064K::try_from(vec![0x01u8; 8]).expect("prefix fits"),
+        coinbase_tx_suffix: B064K::try_from(vec![0x02u8; 8]).expect("suffix fits"),
+    };
+    let prev = SetNewPrevHash {
+        channel_id,
+        job_id,
+        prev_hash: U256::from([0x11u8; 32]),
+        min_ntime: 1,
+        nbits: 0x1702_353d,
+    };
+    [
+        wire::frame_from(AnyMessage::Mining(Mining::NewExtendedMiningJob(job))),
+        wire::frame_from(AnyMessage::Mining(Mining::SetNewPrevHash(prev))),
+    ]
 }
 
 /// A mock SV2 pool: one connection, tagging its `extranonce_prefix`. Assigns
@@ -140,6 +177,13 @@ async fn serve_pool_conn(
                     )?)
                     .await
                     .map_err(|e| anyhow!("{e:?}"))?;
+                // A real pool follows the success with the channel's first job
+                // and prev-hash, before it has any reason to wait for the next
+                // open. On a multi-channel re-open that lands in the middle of
+                // the NEXT channel's handshake — which is the whole point.
+                for f in initial_job_frames(cid, cid) {
+                    write.write_frame(f).await.map_err(|e| anyhow!("{e:?}"))?;
+                }
             }
             Some(mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED) => {
                 let Some(cid) = wire::read_channel_id(&mut f) else {
@@ -182,6 +226,12 @@ async fn serve_pool_conn(
 struct MockMiner {
     read: Read,
     write: Write,
+    /// Frames read while waiting for a channel-open success that were not that
+    /// success — a real miner acts on them, so the fixture must not eat them.
+    /// Opening channel N+1 is exactly when channel N's first job arrives, and a
+    /// test client that discarded those could not tell a delivered job from a
+    /// dropped one. Drained by [`MockMiner::channels_with_a_job`].
+    stash: Vec<Sv2Frame>,
 }
 
 impl MockMiner {
@@ -192,7 +242,11 @@ impl MockMiner {
             .await
             .map_err(|e| anyhow!("miner noise: {e:?}"))?;
         let (read, write) = stream.into_split();
-        Ok(Self { read, write })
+        Ok(Self {
+            read,
+            write,
+            stash: Vec::new(),
+        })
     }
 
     async fn setup(&mut self) -> anyhow::Result<()> {
@@ -222,17 +276,25 @@ impl MockMiner {
             .map_err(|e| anyhow!("{e:?}"))
     }
 
-    /// Open an Extended channel; returns `(downstream_channel_id, prefix)`.
-    async fn open(&mut self, worker: &str, request_id: u32) -> anyhow::Result<(u32, Vec<u8>)> {
-        self.send_open(worker, request_id).await?;
+    /// Read until the open success of `want_mt`, stashing everything else.
+    ///
+    /// The one loop behind `open` / `open_full` / `open_standard`, which each
+    /// had their own copy differing only in the message type they waited for and
+    /// the part of [`ChannelInfo`] they returned.
+    async fn await_open_success(&mut self, want_mt: u8) -> anyhow::Result<ChannelInfo> {
         loop {
             let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
-            {
-                let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
-                return Ok((info.up_channel_id, info.extranonce_prefix));
+            if wire::msg_type(&f) == Some(want_mt) {
+                return parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"));
             }
+            self.stash.push(f);
         }
+    }
+
+    /// Open an Extended channel; returns `(downstream_channel_id, prefix)`.
+    async fn open(&mut self, worker: &str, request_id: u32) -> anyhow::Result<(u32, Vec<u8>)> {
+        let (cid, _group, prefix) = self.open_full(worker, request_id).await?;
+        Ok((cid, prefix))
     }
 
     /// Open a Standard channel; returns `(downstream_channel_id, prefix)`.
@@ -250,14 +312,10 @@ impl MockMiner {
             .write_frame(open_channel_upstream(&spec, worker, request_id)?)
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
-        loop {
-            let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
-            {
-                let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
-                return Ok((info.up_channel_id, info.extranonce_prefix));
-            }
-        }
+        let info = self
+            .await_open_success(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
+            .await?;
+        Ok((info.up_channel_id, info.extranonce_prefix))
     }
 
     async fn update_channel(&mut self, channel_id: u32) -> anyhow::Result<()> {
@@ -344,18 +402,47 @@ impl MockMiner {
         request_id: u32,
     ) -> anyhow::Result<(u32, u32, Vec<u8>)> {
         self.send_open(worker, request_id).await?;
-        loop {
-            let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
-            {
-                let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
-                return Ok((
-                    info.up_channel_id,
-                    info.group_channel_id,
-                    info.extranonce_prefix,
-                ));
+        let info = self
+            .await_open_success(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
+            .await?;
+        Ok((
+            info.up_channel_id,
+            info.group_channel_id,
+            info.extranonce_prefix,
+        ))
+    }
+
+    /// Collect the downstream channel ids that receive a `NewExtendedMiningJob`,
+    /// until `want` distinct ids have been seen or `within` elapses. Returns
+    /// whatever was collected — the caller asserts, so a missing job fails the
+    /// test with the set it did see instead of hanging.
+    async fn channels_with_a_job(
+        &mut self,
+        want: usize,
+        within: std::time::Duration,
+    ) -> HashSet<u32> {
+        let mut seen = HashSet::new();
+        for mut f in std::mem::take(&mut self.stash) {
+            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB) {
+                if let Some(job) = parse_new_extended_job(&mut f) {
+                    seen.insert(job.channel_id);
+                }
             }
         }
+        let _ = tokio::time::timeout(within, async {
+            while seen.len() < want {
+                let Ok(mut f) = read_one(&mut self.read).await else {
+                    break;
+                };
+                if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB) {
+                    if let Some(job) = parse_new_extended_job(&mut f) {
+                        seen.insert(job.channel_id);
+                    }
+                }
+            }
+        })
+        .await;
+        seen
     }
 
     /// Read until SetExtranoncePrefix; returns `(channel_id, prefix)`.
@@ -3510,4 +3597,100 @@ async fn a_real_sv2_pool_still_probes_clean() {
         Err(ProbeFailure::NotSv2(e)) => panic!("the mock pool speaks SV2: {e}"),
     }
     pool.abort();
+}
+
+/// A pool restart re-opens every channel of a rig on one connection. The pool
+/// sends each channel's first job right after ITS OpenSuccess — i.e. while the
+/// proxy is already waiting for the NEXT channel's success. Those frames must
+/// reach the miners.
+///
+/// Until 2026-08-13 `open_on` dropped them as "unexpected", so every channel but
+/// the last kept hashing its pre-reconnect job under an extranonce prefix the
+/// pool had reassigned. Measured on prod: ~200 rejected shares/min per rig
+/// (`job-not-found` / `difficulty-too-low`) until the proxy was restarted.
+///
+/// The assertion is per channel, not a count: with three channels, the old code
+/// still delivered ONE job (the last channel's, read by the steady reader), so
+/// "at least one job arrived" would have passed on the bug.
+#[tokio::test]
+async fn upstream_reopen_delivers_a_job_to_every_channel() {
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_addr = pool_b.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel();
+    let (b_tx, _b_rx) = mpsc::unbounded_channel();
+    let pool_keys = NoiseKeys::generate();
+    tokio::spawn(mock_pool(pool_a, vec![0xAA; 4], 7, pool_keys.clone(), a_tx));
+    tokio::spawn(mock_pool(
+        pool_b,
+        vec![0xBB; 4],
+        99,
+        pool_keys.clone(),
+        b_tx,
+    ));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let pool = crate::db::test_pool().await;
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(pool.clone()),
+        orders: crate::orders::OrderStore::new(pool.clone()),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.rig1",
+        ext_target(&a_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        let (sock, peer) = proxy.accept().await.unwrap();
+        let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+    });
+
+    let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+    miner.setup().await.unwrap();
+    // Three channels, like the three bitaxes bundled onto one rig on prod.
+    let (cid1, _) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+    let (cid2, _) = miner.open("bc1qSELLER.rig1", 2).await.unwrap();
+    let (cid3, _) = miner.open("bc1qSELLER.rig1", 3).await.unwrap();
+    let opened: HashSet<u32> = [cid1, cid2, cid3].into_iter().collect();
+    assert_eq!(opened.len(), 3, "three distinct downstream channels");
+
+    // Precondition, and the negative control's other half: on pool A every
+    // channel got its job the ordinary way (miner-driven opens, steady reader).
+    let on_a = miner
+        .channels_with_a_job(3, std::time::Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        on_a, opened,
+        "before any switch every channel must already have a job; got {on_a:?}"
+    );
+
+    // Now the case the bug lived in: ONE re-open loop over all three channels.
+    let sess = loop {
+        if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
+            break s;
+        }
+        tokio::task::yield_now().await;
+    };
+    sess.switch_to("o1".to_string(), ext_target(&b_addr.to_string(), "acctB"))
+        .await
+        .unwrap();
+
+    let on_b = miner
+        .channels_with_a_job(3, std::time::Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        on_b,
+        opened,
+        "every channel must get a job from the new upstream, not just the last \
+         one opened; missing {:?}",
+        opened.difference(&on_b).collect::<Vec<_>>()
+    );
 }

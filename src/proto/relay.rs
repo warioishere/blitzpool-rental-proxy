@@ -284,7 +284,17 @@ impl Session {
                 .to_miner
                 .send(RpcMessage::set_extranonce(&en1, en2).to_line());
         } else {
-            warn!(upstream = %target.url, "miner not extranonce-capable; live switch may need a reconnect");
+            // "May need a reconnect" was the whole of it: a warning, and then
+            // the miner was left running on an extranonce1 that no longer
+            // matches the upstream. Every share it submits from here on is
+            // built on the old prefix, so the pool rebuilds a different
+            // coinbase and rejects all of them — the SV1 half of what the SV2
+            // recovery path did until 2026-08-13.
+            //
+            // A non-capable miner cannot be told mid-session, so tell it the
+            // only way it understands: drop it and let it come back.
+            warn!(upstream = %target.url, "miner not extranonce-capable; reconnecting it onto the new upstream");
+            self.force_reconnect();
         }
         let prelude = std::mem::take(&mut self.inner.lock().await.pending_prelude);
         for line in prelude {
@@ -522,7 +532,19 @@ async fn connect_sv2_translate(
         max_target: vec![0xff; 32],
         min_extranonce_size: SV2_UP_MIN_EXTRANONCE,
     };
-    let info = open_on(&mut read, &mut write, &spec, user_identity).await?;
+    // This is the ONLY channel on a freshly-connected upstream, so no earlier
+    // channel exists whose job/prev-hash could arrive before this success —
+    // anything buffered here really is unexpected, unlike in the multi-channel
+    // re-open loop. Say so instead of dropping it in silence.
+    let mut unexpected = Vec::new();
+    let info = open_on(&mut read, &mut write, &spec, user_identity, &mut unexpected).await?;
+    if !unexpected.is_empty() {
+        warn!(
+            frames = unexpected.len(),
+            upstream = %target.url,
+            "sv2 translate open: unexpected frames before OpenSuccess; dropped"
+        );
+    }
     let extranonce1 = info.extranonce_prefix.to_lower_hex_string();
     let initial_diff = translate::difficulty_from_target(&info.target);
     Ok(RawUpstream::Sv2(Box::new(Sv2RawUpstream {
