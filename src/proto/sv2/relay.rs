@@ -1156,9 +1156,20 @@ impl Sv2Session {
             .filter(|c| c.owner == member)
             .map(|c| c.up_channel_id)
             .collect();
+        // A translated upstream has no SV2 channel to close: it is one SV1
+        // connection, and `swap_to_sv1_translate` collapsed the rig onto a
+        // single channel of its own making. Sending the built CloseChannel
+        // there panics the translate writer, which calls `payload()` on
+        // everything it is handed — `wire`'s contract is that only handshake
+        // and channel-open messages are built rather than re-emitted
+        // already-serialized. The two channel-OPEN paths already refuse a
+        // translated upstream; this is the same rule for the close.
+        let notify_upstream = !i.translating;
         for up in up_cids {
-            if let Ok(f) = close_channel_upstream(up) {
-                let _ = i.active.to_up.send(f);
+            if notify_upstream {
+                if let Ok(f) = close_channel_upstream(up) {
+                    let _ = i.active.to_up.send(f);
+                }
             }
             i.up_to_down.remove(&up);
         }

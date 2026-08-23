@@ -3834,3 +3834,125 @@ async fn a_rig_that_came_back_from_translation_bundles_again() {
          `translating` flag refused the bundle"
     );
 }
+
+/// A member leaving a TRANSLATED rig must not panic the upstream writer.
+///
+/// `detach_member` sends `close_channel_upstream` for each of the member's
+/// channels, and that frame is BUILT, not received — `wire`'s contract is that
+/// only handshake and channel-open messages are built as typed structs, every
+/// other frame is re-emitted already-serialized. The SV1 translate writer calls
+/// `payload()` on everything it is handed, which panics on a built frame.
+///
+/// Both channel-OPEN paths already refuse a translated upstream
+/// (`attach_member` returns `None`, the serve loop answers "additional channels
+/// are not supported on an SV1 upstream"). `detach_member` had no such guard.
+///
+/// Seen on prod 2026-08-23: the rig failed over to SV1, the miners were forced
+/// to reconnect, and the three `member left` lines are immediately followed by
+/// `Sv2Frame is not yet serialized.` on a tokio worker.
+///
+/// The writer runs in a spawned task, so its death is invisible to the test
+/// harness — the assertion goes through a panic hook instead, chained so a
+/// concurrent test still prints its own.
+#[tokio::test]
+async fn a_member_leaving_a_translated_rig_does_not_panic_the_writer() {
+    let sv2_idle = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let idle_addr = sv2_idle.local_addr().unwrap();
+    let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        sv2_idle,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        idle_tx,
+    ));
+    let sv1_buyer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sv1_addr = sv1_buyer.local_addr().unwrap();
+    let (sub_tx, _sub_rx) = mpsc::unbounded_channel::<()>();
+    tokio::spawn(mock_sv1_pool_translate(sv1_buyer, sub_tx));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.farm",
+        ext_target(&idle_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    m1.open("bc1qSELLER.farm", 1).await.unwrap();
+    let sess = loop {
+        if let Some(s) = registry.get_all("bc1qSELLER.farm").await.into_iter().next() {
+            break s;
+        }
+        tokio::task::yield_now().await;
+    };
+    let crate::control::AnySession::Sv2(rig) = sess.clone() else {
+        panic!("the rig must be an SV2 session");
+    };
+
+    // Rent onto the SV1 pool → the member's channel now sits on a translated
+    // upstream, which is the only state in which the close frame is mishandled.
+    let buyer = ext_target(&sv1_addr.to_string(), "acctBuyer");
+    let order = orders
+        .create("bc1qSELLER.farm".into(), buyer.clone(), None, 0, 0.0, 0.0)
+        .await
+        .unwrap();
+    sess.switch_to(order.id.clone(), buyer).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(15), m1.read_until_set_extranonce())
+        .await
+        .expect("set_extranonce after the translated switch")
+        .unwrap();
+    assert!(
+        rig.is_translating().await,
+        "precondition: the rig must be translating when the member leaves"
+    );
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = seen.clone();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        sink.lock().unwrap().push(info.to_string());
+        prev(info);
+    }));
+
+    // The member owning the translated rig's only channel leaves.
+    drop(m1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = std::panic::take_hook();
+
+    let hits: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.contains("Sv2Frame is not yet serialized"))
+        .cloned()
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "detaching a member from a translated rig panicked the upstream writer: {hits:?}"
+    );
+}
