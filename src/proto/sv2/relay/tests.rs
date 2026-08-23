@@ -3694,3 +3694,143 @@ async fn upstream_reopen_delivers_a_job_to_every_channel() {
         opened.difference(&on_b).collect::<Vec<_>>()
     );
 }
+
+/// A rig that failed over to SV1 and came straight back to SV2 must accept
+/// bundling again.
+///
+/// `attach_member` refuses while the rig is `translating`, and rightly so — a
+/// translated rig speaks one SV1 connection and cannot multiplex a second
+/// member onto it. But the flag has to come back DOWN when the rig returns to
+/// SV2, and only `connect_and_install_initial` ever cleared it, which runs for
+/// a brand-new session and never for a swap.
+///
+/// Measured on prod 2026-08-23: a pool restart made the rig fail over to SV1
+/// for 31 ms, then straight back to SV2. Three same-rig miners reconnected two
+/// seconds later, were each refused by the stale flag, and came up as three
+/// standalone sessions — the rig stayed split until they reconnected again.
+#[tokio::test]
+async fn a_rig_that_came_back_from_translation_bundles_again() {
+    // Idle pool speaks SV2 → the rig registers as the bundle target, as on prod.
+    let sv2_idle = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let idle_addr = sv2_idle.local_addr().unwrap();
+    let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        sv2_idle,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        idle_tx,
+    ));
+
+    // The pool it fails over to speaks SV1 → that swap translates.
+    let sv1_pool = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sv1_addr = sv1_pool.local_addr().unwrap();
+    let (sub_tx, _sub_rx) = mpsc::unbounded_channel::<()>();
+    tokio::spawn(mock_sv1_pool_translate(sv1_pool, sub_tx));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.farm",
+        ext_target(&idle_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (cid1, p1) = m1.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(p1, vec![0xAA; 8], "first member is on the SV2 idle pool");
+    let sess = loop {
+        if let Some(s) = registry.get_all("bc1qSELLER.farm").await.into_iter().next() {
+            break s;
+        }
+        tokio::task::yield_now().await;
+    };
+    let crate::control::AnySession::Sv2(rig) = sess.clone() else {
+        panic!("the rig must be an SV2 session");
+    };
+
+    // Away to SV1 …
+    let sv1_target = ext_target(&sv1_addr.to_string(), "acctSv1");
+    let order = orders
+        .create(
+            "bc1qSELLER.farm".into(),
+            sv1_target.clone(),
+            None,
+            0,
+            0.0,
+            0.0,
+        )
+        .await
+        .unwrap();
+    sess.switch_to(order.id.clone(), sv1_target).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(15), m1.read_until_set_extranonce())
+        .await
+        .expect("set_extranonce after the translated switch")
+        .unwrap();
+    // Precondition — without it the swap back would prove nothing, because a
+    // rig that never translated has nothing to clear.
+    assert!(
+        rig.is_translating().await,
+        "precondition: the failover must actually have translated the rig"
+    );
+
+    // … and straight back to the SV2 idle pool, as the prod failover did.
+    // Cancel first: a still-active order would send the NEXT miner straight to
+    // the buyer's pool, so the test would be measuring the wrong upstream.
+    orders.cancel(&order.id).await;
+    rig.revert().await.unwrap();
+    let (re_cid, re_prefix) =
+        tokio::time::timeout(Duration::from_secs(15), m1.read_until_set_extranonce())
+            .await
+            .expect("set_extranonce after the swap back to SV2")
+            .unwrap();
+    assert_eq!(re_cid, cid1, "channel id stable across the swap");
+    assert_eq!(
+        re_prefix,
+        vec![0xAA; 8],
+        "back on the SV2 pool's extranonce"
+    );
+    assert!(
+        !rig.is_translating().await,
+        "a rig back on a native SV2 upstream must not still call itself translating"
+    );
+
+    // A second same-rig miner must now bundle onto that rig, not build its own.
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    m2.setup().await.unwrap();
+    let (_cid2, p2) = m2.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(
+        p2,
+        vec![0xAA; 8],
+        "the second member shares the rig's SV2 upstream"
+    );
+    assert_eq!(
+        registry.get_all("bc1qSELLER.farm").await.len(),
+        1,
+        "both miners are one rig; a second registry entry means the stale \
+         `translating` flag refused the bundle"
+    );
+}

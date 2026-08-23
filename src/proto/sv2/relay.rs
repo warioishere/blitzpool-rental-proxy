@@ -860,6 +860,15 @@ impl Sv2Session {
                 .map(|(request_id, (member, _))| (member, request_id))
                 .collect();
             i.routing = routing;
+            // Back on a native SV2 upstream: this rig can multiplex again.
+            // `swap_to_sv1_translate` sets this flag and only
+            // `connect_and_install_initial` ever cleared it — which runs for a
+            // fresh session, never for a swap. Left stale, `attach_member`
+            // refuses every same-rig miner and the rig silently splits into
+            // standalone sessions. Reaching here means `probe_sv2` accepted the
+            // target: the SV1 case returned through `swap_to_sv1_translate`
+            // above.
+            i.translating = false;
             abandoned
         };
 
