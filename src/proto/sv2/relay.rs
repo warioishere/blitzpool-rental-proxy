@@ -460,6 +460,17 @@ struct Channel {
     /// pool's per-channel frames route back to the right miner when several
     /// same-rig miners share this upstream.
     owner: u32,
+    /// The upstream `group_channel_id` this channel was placed in, or 0 when
+    /// ungrouped. A pool may run SEVERAL groups on one connection — ours groups
+    /// Extended channels by full extranonce size, so miners asking for different
+    /// sizes land in different groups. A group-broadcast job is only valid for
+    /// the channels of ITS group, which is why this is per channel and not per
+    /// connection.
+    up_group_id: u32,
+    /// The downstream group id the miner was told in its OpenSuccess. Stable
+    /// across upstream swaps (the miner cannot be told a new one), so a re-issued
+    /// upstream group id is mapped back onto this.
+    down_group_id: u32,
 }
 
 struct Inner {
@@ -467,17 +478,24 @@ struct Inner {
     generation_counter: u64,
     /// All open channels on this connection (one per rig chain, usually one).
     channels: Vec<Channel>,
-    /// upstream channel_id → downstream channel_id (for upstream→miner frames).
-    /// Holds both real channel ids AND the group_channel_id of grouped Extended
-    /// channels, so the pool's group-broadcast jobs (NewExtendedMiningJob +
-    /// SetNewPrevHash addressed to the group id) are remapped to the miner too.
+    /// upstream channel_id → downstream channel_id, for REAL channels only.
+    /// Group ids are deliberately NOT in here: a group frame does not go to one
+    /// channel, it goes to every member of that group, and each of those needs
+    /// the frame rewritten to ITS own downstream group id. See
+    /// [`Inner::group_recipients`].
     up_to_down: std::collections::HashMap<u32, u32>,
-    /// Stable downstream id we assigned to this connection's Extended group, if
-    /// any. Only Extended channels are grouped (per the SV2 spec), and a single
-    /// 1:1 miner connection has at most one group — every Extended channel/reopen
-    /// on it maps its (re-issued) upstream group_channel_id to this one id, which
-    /// the miner learned from its OpenExtendedMiningChannelSuccess.
-    group_down_id: Option<u32>,
+    /// upstream `group_channel_id` → the downstream group id we handed the
+    /// miners of that group.
+    ///
+    /// This used to be a single `Option<u32>` on the assumption that "a 1:1 miner
+    /// connection has at most one group". That held for one miner per upstream
+    /// and was never revisited when same-rig miners started sharing one upstream:
+    /// with mixed firmware asking for different extranonce sizes, the pool opens
+    /// a SECOND group on the same connection, and collapsing both onto one
+    /// downstream id made every member receive both groups' jobs — a job built
+    /// for the wrong extranonce layout, which the miner then hashes and the pool
+    /// rejects.
+    group_down: std::collections::HashMap<u32, u32>,
     /// proxy-assigned upstream request_id → (member, spec) for opens awaiting the
     /// upstream's success. Keyed by the UNIQUE upstream request_id (not the
     /// miner's, which can collide across members on a shared upstream); the member
@@ -564,6 +582,7 @@ impl Inner {
             .map(|c| c.up_channel_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_channel(
         &mut self,
         down_cid: u32,
@@ -571,6 +590,8 @@ impl Inner {
         spec: OpenSpec,
         difficulty: f64,
         owner: u32,
+        up_group_id: u32,
+        down_group_id: u32,
     ) {
         self.up_to_down.insert(up_cid, down_cid);
         self.channels.push(Channel {
@@ -579,7 +600,35 @@ impl Inner {
             spec,
             difficulty,
             owner,
+            up_group_id,
+            down_group_id,
         });
+    }
+
+    /// Who a frame addressed to upstream group `up_cid` must reach: one
+    /// `(down_group_id, member)` pair per distinct downstream group in that
+    /// upstream group, deduplicated so a member holding two channels of the same
+    /// group is written to once.
+    ///
+    /// Empty means `up_cid` is not a group on this connection — the caller then
+    /// treats the frame as per-channel. Standard channels are never grouped
+    /// (`up_group_id == 0`), so they can't be picked up here.
+    fn group_recipients(&self, up_cid: u32) -> Vec<(u32, u32)> {
+        if up_cid == 0 {
+            return Vec::new();
+        }
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for c in self
+            .channels
+            .iter()
+            .filter(|c| c.up_group_id == up_cid && c.spec.is_extended())
+        {
+            let pair = (c.down_group_id, c.owner);
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+        out
     }
 
     /// Register a downstream miner connection as a member of this rig, returning
@@ -609,26 +658,25 @@ impl Inner {
 
     /// Map an Extended channel's upstream `group_channel_id` into the downstream
     /// id namespace and return the downstream group id the miner should see in
-    /// its OpenSuccess. The first grouped Extended channel allocates a stable
-    /// downstream id; every later channel/reopen on this connection maps its
-    /// (re-issued) upstream group id onto that same id. Returns `up_group_id`
-    /// unchanged for non-Extended or ungrouped (`group_channel_id == 0`)
-    /// channels, leaving Standard channels untouched.
+    /// its OpenSuccess.
+    ///
+    /// One downstream id PER upstream group: channels the pool put in different
+    /// groups must stay in different groups downstream, or their jobs get
+    /// crossed. Re-opens of the same upstream group reuse the id the miners of
+    /// that group already know. Returns `up_group_id` unchanged for non-Extended
+    /// or ungrouped (`group_channel_id == 0`) channels, leaving Standard channels
+    /// untouched.
     fn map_group(&mut self, up_group_id: u32, is_extended: bool) -> u32 {
         if !is_extended || up_group_id == 0 {
             return up_group_id;
         }
-        let down = match self.group_down_id {
-            Some(d) => d,
-            None => {
-                let id = self.next_down_cid;
-                self.next_down_cid += 1;
-                self.group_down_id = Some(id);
-                id
-            }
-        };
-        self.up_to_down.insert(up_group_id, down);
-        down
+        if let Some(&down) = self.group_down.get(&up_group_id) {
+            return down;
+        }
+        let id = self.next_down_cid;
+        self.next_down_cid += 1;
+        self.group_down.insert(up_group_id, id);
+        id
     }
 }
 
@@ -761,22 +809,24 @@ impl Sv2Session {
         // strictly one after another (the last to acquire wins). Released on
         // return.
         let _switch = self.switch.lock().await;
-        // Snapshot the channels to re-open (down_channel_id + spec) + worker +
-        // the stable downstream group id (the miner already knows it, so the new
-        // upstream's re-issued group id must map back onto it).
-        let (specs, generation, label, group_down_id, members) = {
+        // Snapshot the channels to re-open (down_channel_id + spec) + worker.
+        // Each channel carries the downstream group id its miner already knows —
+        // the new upstream re-issues its own group ids, and each must be mapped
+        // back onto the one the miner of THAT channel was told. Carried per
+        // channel rather than once per connection: the pool may run several
+        // groups here, and the swap must not merge them.
+        let (specs, generation, label, members) = {
             let mut i = self.inner.lock().await;
             i.generation_counter += 1;
-            let specs: Vec<(u32, u32, OpenSpec)> = i
+            let specs: Vec<(u32, u32, OpenSpec, u32)> = i
                 .channels
                 .iter()
-                .map(|c| (c.down_channel_id, c.owner, c.spec.clone()))
+                .map(|c| (c.down_channel_id, c.owner, c.spec.clone(), c.down_group_id))
                 .collect();
             (
                 specs,
                 i.generation_counter,
                 i.label.clone(),
-                i.group_down_id,
                 // Members don't change across an upstream swap; snapshot their
                 // sinks (cheap Sender clones) to re-point each one after.
                 i.members.clone(),
@@ -807,28 +857,36 @@ impl Sv2Session {
         };
         let mut new_channels = Vec::with_capacity(specs.len());
         let mut up_to_down = std::collections::HashMap::new();
+        let mut group_down = std::collections::HashMap::new();
         let mut repoint = Vec::with_capacity(specs.len());
         // Frames the pool sends for an already-opened channel while we are still
         // opening the next one — its initial job + prev-hash. Accumulated across
         // the whole loop and handed to the steady reader below.
         let mut deferred: Vec<Sv2Frame> = Vec::new();
-        for (down_cid, owner, spec) in &specs {
+        for (down_cid, owner, spec, down_group_id) in &specs {
             let info = open_on(&mut read, &mut write, spec, &up_ident, &mut deferred)
                 .await
                 .map_err(|e| anyhow!("switch reopen channel {down_cid}: {e}"))?;
             up_to_down.insert(info.up_channel_id, *down_cid);
-            // Remap the new pool's group id onto the stable downstream group id
-            // so group-broadcast jobs keep reaching the miner after the switch.
-            if spec.is_extended() && info.group_channel_id != 0 {
-                match group_down_id {
-                    Some(g) => {
-                        up_to_down.insert(info.group_channel_id, g);
-                    }
-                    None => warn!(
+            // Remap the new pool's group id onto the downstream group id THIS
+            // channel's miner already knows, so its group-broadcast jobs keep
+            // reaching it after the switch. Two channels the old pool had in
+            // different groups keep two ids even if the new pool merges them:
+            // each miner still only hears about its own.
+            let up_group_id = if spec.is_extended() {
+                info.group_channel_id
+            } else {
+                0
+            };
+            if up_group_id != 0 {
+                if *down_group_id == 0 {
+                    warn!(
                         worker = %label,
                         down_cid,
-                        "extended channel grouped on new upstream but no stable group id from open — group jobs may be dropped"
-                    ),
+                        "extended channel grouped on new upstream but was ungrouped before — group jobs may be dropped"
+                    );
+                } else {
+                    group_down.insert(up_group_id, *down_group_id);
                 }
             }
             new_channels.push(Channel {
@@ -837,6 +895,8 @@ impl Sv2Session {
                 spec: spec.clone(),
                 difficulty: difficulty_from_target(&info.target),
                 owner: *owner,
+                up_group_id,
+                down_group_id: *down_group_id,
             });
             repoint.push((*down_cid, *owner, info.extranonce_prefix, info.target));
         }
@@ -852,6 +912,7 @@ impl Sv2Session {
             i.install_active(generation, target.clone(), to_up, reader, writer);
             i.channels = new_channels;
             i.up_to_down = up_to_down;
+            i.group_down = group_down;
             // In-flight opens were sent to the old upstream; abandon them and
             // tell the requesting member so it can reopen (rather than hang).
             let abandoned: Vec<(u32, u32)> = i
@@ -915,8 +976,23 @@ impl Sv2Session {
                     let down_cid = i.next_down_cid;
                     i.next_down_cid += 1;
                     let diff = difficulty_from_target(&info.target);
-                    i.register_channel(down_cid, info.up_channel_id, spec.clone(), diff, member);
+                    // Group first: the channel records the pair, so a later
+                    // group-broadcast can find its members without a second map.
                     let down_group_id = i.map_group(info.group_channel_id, spec.is_extended());
+                    let up_group_id = if spec.is_extended() {
+                        info.group_channel_id
+                    } else {
+                        0
+                    };
+                    i.register_channel(
+                        down_cid,
+                        info.up_channel_id,
+                        spec.clone(),
+                        diff,
+                        member,
+                        up_group_id,
+                        down_group_id,
+                    );
                     if let Ok(reply) =
                         open_success_downstream(&spec, down_cid, down_group_id, &info)
                     {
@@ -1047,28 +1123,31 @@ impl Sv2Session {
             }
         }
 
-        // Forward with the channel id remapped. A frame addressed to the group id
-        // (the pool's group-broadcast job + prev-hash) is fanned out to every
-        // member of the rig; a per-channel frame routes only to its owner.
-        if let Some(&down_cid) = i.up_to_down.get(&up_cid) {
-            wire::rewrite_channel_id(&mut frame, down_cid);
-            if Some(down_cid) == i.group_down_id {
-                // Group-broadcast job: only members with an Extended channel are in
-                // the group. Standard members are ungrouped — their work arrives
-                // per channel — and must NOT get a group-addressed NewExtendedMiningJob
-                // (a header-only device can't process it). Fan out to grouped members.
-                let grouped: std::collections::HashSet<u32> = i
-                    .channels
-                    .iter()
-                    .filter(|c| c.spec.is_extended())
-                    .map(|c| c.owner)
-                    .collect();
-                for m in &grouped {
-                    if let Some(sink) = i.members.get(m) {
-                        let _ = sink.send(frame.clone().into());
-                    }
+        // Forward with the channel id remapped. A frame addressed to a group id
+        // (the pool's group-broadcast job + prev-hash) goes to the members of THAT
+        // group; a per-channel frame routes only to its owner.
+        let recipients = i.group_recipients(up_cid);
+        if !recipients.is_empty() {
+            // Group-broadcast job. Only Extended channels are grouped — Standard
+            // members are ungrouped, get their work per channel, and must NOT
+            // receive a group-addressed NewExtendedMiningJob (a header-only device
+            // cannot process it); `group_recipients` filters them out.
+            //
+            // One write per distinct downstream group, not one per rig: a member
+            // whose channel sits in a different group must not see this job at
+            // all. It is built for its own group's extranonce layout, so the
+            // wrong member would hash a coinbase it reconstructs differently and
+            // every share it finds would be rejected.
+            for (down_group_id, member) in recipients {
+                if let Some(sink) = i.members.get(&member) {
+                    let mut f = frame.clone();
+                    wire::rewrite_channel_id(&mut f, down_group_id);
+                    let _ = sink.send(f.into());
                 }
-            } else if let Some(sink) = i.member_sink_for_up(up_cid) {
+            }
+        } else if let Some(&down_cid) = i.up_to_down.get(&up_cid) {
+            wire::rewrite_channel_id(&mut frame, down_cid);
+            if let Some(sink) = i.member_sink_for_up(up_cid) {
                 let _ = sink.send(frame.into());
             } else {
                 debug!(up_cid, down_cid, "no member owns this channel; dropping");
@@ -1763,8 +1842,13 @@ impl Sv2Session {
                 spec,
                 difficulty: conn.initial_diff,
                 owner: member,
+                // A translated upstream is one SV1 connection collapsed onto a
+                // single synthesized channel: there is no SV2 group behind it.
+                up_group_id: 0,
+                down_group_id: 0,
             }];
             i.up_to_down = HashMap::from([(down_cid, down_cid)]);
+            i.group_down.clear();
             i.pending.clear();
             i.routing = routing;
             i.translating = true;
@@ -1828,8 +1912,12 @@ impl Sv2Session {
                 spec,
                 difficulty: conn.initial_diff,
                 owner,
+                // See the sibling path: no SV2 group behind a translated upstream.
+                up_group_id: 0,
+                down_group_id: 0,
             }];
             i.up_to_down = HashMap::from([(down_cid, down_cid)]);
+            i.group_down.clear();
             let abandoned: Vec<(u32, u32)> = i
                 .pending
                 .drain()
@@ -1976,7 +2064,7 @@ pub async fn handle_seller_miner_sv2(
                     generation_counter: 0,
                     channels: Vec::new(),
                     up_to_down: std::collections::HashMap::new(),
-                    group_down_id: None,
+                    group_down: std::collections::HashMap::new(),
                     pending: std::collections::HashMap::new(),
                     next_down_cid: 1,
                     next_up_req: 1,

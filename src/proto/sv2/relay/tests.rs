@@ -264,16 +264,48 @@ impl MockMiner {
 
     /// Send an OpenExtendedMiningChannel without waiting for the success.
     async fn send_open(&mut self, worker: &str, request_id: u32) -> anyhow::Result<()> {
+        self.send_open_sized(worker, request_id, 8).await
+    }
+
+    /// As [`Self::send_open`], with the miner's `min_extranonce_size` spelled
+    /// out. Real firmware versions differ here (2 vs 6 bytes on a Bitaxe), and
+    /// a pool that groups Extended channels by extranonce size then puts them
+    /// in DIFFERENT groups on the same connection.
+    async fn send_open_sized(
+        &mut self,
+        worker: &str,
+        request_id: u32,
+        min_extranonce_size: u16,
+    ) -> anyhow::Result<()> {
         let spec = OpenSpec::Extended {
             request_id,
             nominal_hash_rate: 1.0e12,
             max_target: vec![0xffu8; 32],
-            min_extranonce_size: 8,
+            min_extranonce_size,
         };
         self.write
             .write_frame(open_channel_upstream(&spec, worker, request_id)?)
             .await
             .map_err(|e| anyhow!("{e:?}"))
+    }
+
+    /// [`Self::open_full`] with an explicit `min_extranonce_size`.
+    async fn open_full_sized(
+        &mut self,
+        worker: &str,
+        request_id: u32,
+        min_extranonce_size: u16,
+    ) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        self.send_open_sized(worker, request_id, min_extranonce_size)
+            .await?;
+        let info = self
+            .await_open_success(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
+            .await?;
+        Ok((
+            info.up_channel_id,
+            info.group_channel_id,
+            info.extranonce_prefix,
+        ))
     }
 
     /// Read until the open success of `want_mt`, stashing everything else.
@@ -1132,6 +1164,179 @@ async fn group_broadcast_job_reaches_miner() {
     assert_eq!(
         job_cid, down_group,
         "group-broadcast job remapped to the downstream group id"
+    );
+}
+
+const GROUP_SMALL: u32 = 77;
+const GROUP_LARGE: u32 = 88;
+
+/// A mock pool that groups Extended channels BY EXTRANONCE SIZE — what the real
+/// pool does (`groups.group_for_size`). Two same-rig miners asking for different
+/// sizes therefore land in TWO groups on the SAME upstream connection. After
+/// both are open it broadcasts one job, addressed to the small group only.
+async fn mock_pool_two_groups(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
+    let (sock, _) = listener.accept().await?;
+    let _ = sock.set_nodelay(true);
+    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+        .await
+        .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+    let (mut read, mut write) = stream.into_split();
+    loop {
+        let f = read_one(&mut read).await?;
+        if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+            break;
+        }
+    }
+    write
+        .write_frame(setup_success(0))
+        .await
+        .map_err(|e| anyhow!("{e:?}"))?;
+    let mut next_cid = 10u32;
+    let mut opened = 0u32;
+    while let Ok(mut f) = read_one(&mut read).await {
+        if wire::msg_type(&f) != Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
+            continue;
+        }
+        let Some(open) = parse_miner_open(&mut f) else {
+            continue;
+        };
+        let size = match &open.spec {
+            OpenSpec::Extended {
+                min_extranonce_size,
+                ..
+            } => *min_extranonce_size,
+            _ => continue,
+        };
+        let group = if size <= 2 { GROUP_SMALL } else { GROUP_LARGE };
+        let cid = next_cid;
+        next_cid += 1;
+        let success = Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+            request_id: open.spec.request_id(),
+            channel_id: cid,
+            target: U256::try_from(diff1_target()).unwrap(),
+            extranonce_size: size,
+            extranonce_prefix: B032::try_from(vec![0xCC; 8]).unwrap(),
+            group_channel_id: group,
+        });
+        write
+            .write_frame(wire::frame_from(AnyMessage::Mining(success)))
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
+        opened += 1;
+        if opened == 2 {
+            let empty_path: Vec<U256> = vec![];
+            let job = mining::NewExtendedMiningJob {
+                channel_id: GROUP_SMALL,
+                job_id: 1,
+                min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                version: 0x2000_0000,
+                version_rolling_allowed: true,
+                merkle_path: empty_path.into(),
+                coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+            };
+            write
+                .write_frame(wire::frame_from(AnyMessage::Mining(
+                    Mining::NewExtendedMiningJob(job),
+                )))
+                .await
+                .map_err(|e| anyhow!("{e:?}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// A group-broadcast job must reach ONLY the members of that group.
+///
+/// Observed on a live rig: a Bitaxe on firmware 2.15.1 asks for a 2-byte
+/// extranonce where 2.14 asks for 6, so the pool put them in different groups on
+/// the shared upstream. The proxy collapsed every upstream group onto ONE
+/// downstream id and fanned every group job to every Extended member, so each
+/// miner also received the other group's job — built for an extranonce layout
+/// its channel does not have. It hashed that and the pool rejected the result
+/// (`job-not-found`, then `difficulty-too-low` once the ids lined up again).
+///
+/// Both assertions fail without the fix: the two miners were handed the same
+/// downstream group id, and the job leaked into the second miner.
+#[tokio::test]
+async fn a_group_job_reaches_only_the_members_of_its_own_group() {
+    let pool = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = pool.local_addr().unwrap();
+    tokio::spawn(mock_pool_two_groups(pool, NoiseKeys::generate()));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: crate::orders::OrderStore::new(db.clone()),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.mixed",
+        ext_target(&addr.to_string(), "acct"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    // Two same-rig miners, different extranonce appetites — the 2.15.1/2.14 mix.
+    let mut small = MockMiner::connect(proxy_addr).await.unwrap();
+    small.setup().await.unwrap();
+    let (_cid_s, group_s, _) = small
+        .open_full_sized("bc1qSELLER.mixed", 1, 2)
+        .await
+        .unwrap();
+
+    let mut large = MockMiner::connect(proxy_addr).await.unwrap();
+    large.setup().await.unwrap();
+    let (_cid_l, group_l, _) = large
+        .open_full_sized("bc1qSELLER.mixed", 1, 6)
+        .await
+        .unwrap();
+
+    // Two upstream groups must stay two downstream groups. Collapsing them is
+    // what let a job cross over in the first place.
+    assert_ne!(
+        group_s, group_l,
+        "channels the pool put in different groups must keep different downstream group ids"
+    );
+
+    // The job addressed to the small group reaches its member, remapped.
+    let job_cid = tokio::time::timeout(
+        Duration::from_secs(5),
+        small.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+    )
+    .await
+    .expect("group job never reached the member it belongs to")
+    .unwrap();
+    assert_eq!(
+        job_cid, group_s,
+        "job remapped to that group's downstream id"
+    );
+
+    // And must not reach the other group's member at all.
+    let leaked = tokio::time::timeout(
+        Duration::from_secs(2),
+        large.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+    )
+    .await;
+    assert!(
+        leaked.is_err(),
+        "a job for the other group leaked to this miner — it would hash the wrong coinbase"
     );
 }
 
