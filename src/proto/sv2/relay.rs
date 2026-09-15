@@ -34,7 +34,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use stratum_core::bitcoin::hashes::hex::FromHex;
 
@@ -79,6 +79,11 @@ pub use registry::Sv2RigRegistry;
 const CERT_VALIDITY: u64 = 3600;
 /// SV2 protocol version the proxy speaks.
 const SV2_VERSION: u16 = 2;
+/// After this many failed rental switches in a row the retry logs at ERROR
+/// once (roughly 90 s in), so a rig quietly mining for its seller while an
+/// order runs shows up in the journal as more than a WARN per attempt.
+const SWITCH_RETRY_ESCALATE_AFTER: u32 = 8;
+
 /// Default window to keep a rig's upstream warm after its last member leaves, so
 /// a quick reconnect re-attaches without a fresh Noise handshake + channel reopen.
 const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
@@ -708,6 +713,10 @@ pub struct Sv2Session {
     /// member of a multi-miner rig), and the retained epoch means a member busy
     /// processing a frame between selects still sees the bump on its next poll.
     reconnect: watch::Sender<u64>,
+    /// Single-flight guard for [`Sv2Session::spawn_switch_retry`]: the task
+    /// holds it for its lifetime, so several members attaching in the same
+    /// second (one failed switch each) start one retry, not one per member.
+    retry_switch: Arc<Mutex<()>>,
 }
 
 impl Sv2Session {
@@ -775,9 +784,13 @@ impl Sv2Session {
     /// cancel: the other members hold the rig alive while one reconnects, and
     /// an attach bundles onto whatever the rig currently mines — the order
     /// resolve at connect time only ever picked the upstream for FRESH rigs.
-    /// No-op when already aligned; if the swap fails the attach proceeds on
-    /// the current upstream (supervisor failover / the next reconnect
-    /// converges).
+    /// No-op when already aligned. If the swap fails the attach proceeds on
+    /// the current upstream and [`Sv2Session::spawn_switch_retry`] keeps
+    /// trying: nothing else would. The supervisor only wakes when the ACTIVE
+    /// upstream dies, and here the active upstream is the seller's healthy
+    /// pool, so a rental that failed to connect once stayed unrouted for the
+    /// whole order (2026-09-13: three miners, one unreachable second, zero
+    /// shares delivered until the buyer cancelled).
     async fn reconcile_routing(self: &Arc<Self>, desired: Option<&crate::orders::Order>) {
         let current = match &self.inner.lock().await.routing {
             Routing::Rented { order_id, .. } => Some(order_id.clone()),
@@ -787,7 +800,8 @@ impl Sv2Session {
             (Some(o), current) if current.as_deref() != Some(o.id.as_str()) => {
                 info!(order = %o.id, "attach: rig on stale upstream — switching to the active rental");
                 if let Err(e) = self.switch_to_order(o.id.clone()).await {
-                    warn!(order = %o.id, error = %e, "attach: switch to rental failed; bundling on current upstream");
+                    warn!(order = %o.id, error = %e, "attach: switch to rental failed; bundling on current upstream, retrying in the background");
+                    self.spawn_switch_retry(o.worker.clone());
                 }
             }
             (None, Some(stale)) => {
@@ -798,6 +812,63 @@ impl Sv2Session {
             }
             _ => {}
         }
+    }
+
+    /// Keep converging onto the rig's active rental after a failed switch.
+    /// Each round re-resolves the order, so a cancel, expiry or exhausted
+    /// budget ends the loop, and a switch another path completed meanwhile is
+    /// seen on `routing` and not repeated. Holds a `Weak` so a torn-down rig
+    /// is not kept alive by its own retry.
+    fn spawn_switch_retry(self: &Arc<Self>, worker: String) {
+        let Ok(guard) = self.retry_switch.clone().try_lock_owned() else {
+            return; // a retry for this rig is already running
+        };
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let _guard = guard;
+            let mut backoff = Duration::from_millis(500);
+            let mut failures = 0u32;
+            loop {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                let Some(session) = weak.upgrade() else {
+                    return;
+                };
+                let Some(order) = session
+                    .orders
+                    .active_for_worker(&worker, crate::orders::now_ms())
+                    .await
+                else {
+                    info!(%worker, "attach retry: no active rental any more; giving up");
+                    return;
+                };
+                let current = match &session.inner.lock().await.routing {
+                    Routing::Rented { order_id, .. } => Some(order_id.clone()),
+                    Routing::Idle => None,
+                };
+                if current.as_deref() == Some(order.id.as_str()) {
+                    return; // converged elsewhere
+                }
+                match session.switch_to_order(order.id.clone()).await {
+                    Ok(()) => {
+                        // Same rule as the supervisor's recovery: the members
+                        // were live on the old upstream, so drop them for a
+                        // fresh handshake instead of a re-point.
+                        session.force_reconnect();
+                        info!(order = %order.id, failures, "attach retry: rig switched to the active rental");
+                        return;
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        if failures == SWITCH_RETRY_ESCALATE_AFTER {
+                            error!(order = %order.id, error = %e, failures, "attach retry: rental switch keeps failing; rig still mines for the seller");
+                        } else {
+                            warn!(order = %order.id, error = %e, failures, "attach retry: rental switch failed; backing off");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async fn swap_upstream(
@@ -2053,6 +2124,7 @@ pub async fn handle_seller_miner_sv2(
                 died_tx,
                 orders: ctx.orders.clone(),
                 reconnect: watch::channel(0).0,
+                retry_switch: Arc::new(Mutex::new(())),
                 inner: Mutex::new(Inner {
                     active: ActiveUpstream {
                         generation: 0,

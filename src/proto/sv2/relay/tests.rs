@@ -4161,3 +4161,120 @@ async fn a_member_leaving_a_translated_rig_does_not_panic_the_writer() {
         "detaching a member from a translated rig panicked the upstream writer: {hits:?}"
     );
 }
+
+#[tokio::test]
+async fn a_failed_attach_switch_is_retried_until_the_rental_pool_answers() {
+    // 2026-09-13 in the field: three members attached in the same second, the
+    // one TCP connect to the rental pool failed, and the rig mined for its
+    // seller until the buyer cancelled. The attach must keep retrying while
+    // the order is active, and land the rig on the rental once the pool is
+    // reachable again.
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_a,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        a_tx,
+    ));
+    // Pool B: reserve an address, then close it so the first switch hits a
+    // dead port (ProbeFailure::Unreachable, not NotSv2).
+    let b_addr = dead_addr().await;
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.farm",
+        ext_target(&a_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    // First member brings the rig up on the idle pool A.
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (_c1, p1) = m1.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(p1, vec![0xAA; 8]);
+    loop {
+        if registry.get_all("bc1qSELLER.farm").await.len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // Rent it onto B while B is down.
+    orders
+        .create(
+            "bc1qSELLER.farm".to_string(),
+            ext_target(&b_addr, "acctB"),
+            None,
+            crate::orders::now_ms() + 60_000,
+            1.0,
+            1.0,
+        )
+        .await
+        .unwrap();
+
+    // Second member attaches: the reconcile switch fails, it bundles on A.
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    m2.setup().await.unwrap();
+    let (_c2, p2) = m2.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(p2, vec![0xAA; 8], "with B down the attach bundles on A");
+    let st = registry.aggregated_status("bc1qSELLER.farm").await.unwrap();
+    assert_eq!(st.routing, "idle", "precondition: the switch to B failed");
+
+    // B comes up on the reserved address.
+    let pool_b = TcpListener::bind(&b_addr).await.unwrap();
+    let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_b,
+        vec![0xBB; 8],
+        99,
+        NoiseKeys::generate(),
+        b_tx,
+    ));
+
+    // The retry lands the rig on B without any member reconnecting.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = registry.aggregated_status("bc1qSELLER.farm").await.unwrap();
+        if st.routing == "rented" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rig never switched to the rental after B came up (routing={})",
+            st.routing
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A member coming back after the forced reconnect lands on B.
+    let mut m3 = MockMiner::connect(proxy_addr).await.unwrap();
+    m3.setup().await.unwrap();
+    let (_c3, p3) = m3.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(p3, vec![0xBB; 8], "reattaching member lands on the rental");
+}
