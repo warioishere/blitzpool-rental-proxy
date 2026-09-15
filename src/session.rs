@@ -9,6 +9,40 @@ use std::time::{Duration, Instant};
 /// Difficulty-1 share = 2^32 hashes.
 const DIFF1_HASHES: f64 = 4_294_967_296.0;
 
+/// Turn a pool address the way buyers and sellers type it into the `host:port`
+/// the relays connect with. Miner menus teach `stratum+tcp://host:port`, and
+/// that prefix used to reach the resolver verbatim: `TcpStream::connect` took
+/// the whole string as the host name and failed every time. A rental declared
+/// that way ran 2026-09-13 for 38 minutes at zero delivery (`stratum+tcp://
+/// stratum.braiins.com:3333`), while every earlier order had been typed bare.
+///
+/// Only the plain-TCP schemes are stripped; anything else (`stratum+ssl://`,
+/// `ssl://`, `http://`) names a transport the proxy cannot speak and is refused
+/// here, at the API, instead of failing quietly at the next connect.
+pub fn normalize_pool_url(raw: &str) -> anyhow::Result<String> {
+    let s = raw.trim();
+    let s = ["stratum+tcp://", "tcp://"]
+        .iter()
+        .find_map(|p| {
+            s.get(..p.len())
+                .filter(|head| head.eq_ignore_ascii_case(p))
+                .map(|_| &s[p.len()..])
+        })
+        .unwrap_or(s);
+    if s.contains("://") {
+        anyhow::bail!(
+            "pool url {raw:?}: only plain tcp is routable (host:port or stratum+tcp://host:port)"
+        );
+    }
+    let Some((host, port)) = s.rsplit_once(':') else {
+        anyhow::bail!("pool url {raw:?} needs host:port");
+    };
+    if host.is_empty() || host.contains('/') || port.parse::<u16>().is_err() {
+        anyhow::bail!("pool url {raw:?} is not host:port");
+    }
+    Ok(s.to_string())
+}
+
 /// An upstream the proxy connects to as a client (a pool).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpstreamTarget {
@@ -145,5 +179,47 @@ mod tests {
         // Span is capped at the 600s window, so divide the in-window sum by 600.
         let expected = sum_in_window * DIFF1_HASHES / 600.0;
         assert!((w.hashes_per_second_at(now) - expected).abs() < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod pool_url_tests {
+    use super::normalize_pool_url;
+
+    #[test]
+    fn the_scheme_miner_menus_teach_is_stripped() {
+        // The exact string of the 2026-09-13 order.
+        assert_eq!(
+            normalize_pool_url("stratum+tcp://stratum.braiins.com:3333").unwrap(),
+            "stratum.braiins.com:3333"
+        );
+        assert_eq!(normalize_pool_url("TCP://pool:3333").unwrap(), "pool:3333");
+        assert_eq!(normalize_pool_url("  pool:3333 ").unwrap(), "pool:3333");
+    }
+
+    #[test]
+    fn a_bare_host_port_passes_unchanged() {
+        assert_eq!(
+            normalize_pool_url("blitzpool.yourdevice.ch:3333").unwrap(),
+            "blitzpool.yourdevice.ch:3333"
+        );
+        assert_eq!(normalize_pool_url("127.0.0.1:1").unwrap(), "127.0.0.1:1");
+    }
+
+    #[test]
+    fn transports_the_proxy_cannot_speak_are_refused() {
+        for bad in [
+            "stratum+ssl://pool:3333",
+            "ssl://pool:3333",
+            "http://pool:3333",
+            "pool",
+            "pool:",
+            ":3333",
+            "pool:99999",
+            "stratum+tcp://pool:3333/",
+            "",
+        ] {
+            assert!(normalize_pool_url(bad).is_err(), "{bad:?} must be refused");
+        }
     }
 }

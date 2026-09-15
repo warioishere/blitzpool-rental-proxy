@@ -124,6 +124,11 @@ pub async fn serve(addr: String, state: AppState) -> anyhow::Result<()> {
 
 type ApiError = (StatusCode, String);
 
+/// [`crate::session::normalize_pool_url`] as an API rejection.
+fn pool_url(raw: &str) -> Result<String, ApiError> {
+    crate::session::normalize_pool_url(raw).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
 async fn health() -> Json<Value> {
     Json(json!({"ok": true, "service": "stratum-rental-proxy"}))
 }
@@ -327,7 +332,7 @@ async fn set_seller(
     Json(req): Json<SellerReq>,
 ) -> Result<Json<Value>, ApiError> {
     let target = UpstreamTarget {
-        url: req.url,
+        url: pool_url(&req.url)?,
         user: req.user,
         password: req.pass,
         authority_pubkey: req.authority,
@@ -456,6 +461,14 @@ async fn create_order(
     State(s): State<AppState>,
     Json(req): Json<OrderReq>,
 ) -> Result<Json<Value>, ApiError> {
+    // Refuse a target the relays could never connect to before anything is
+    // stored: a bad url used to become a live order that mined for the seller.
+    let url = pool_url(&req.url)?;
+    let fallback_url = if req.fallback_url.trim().is_empty() {
+        None
+    } else {
+        Some(pool_url(&req.fallback_url)?)
+    };
     // A bounded rental's end time must be in the future (0 = open-ended). Without
     // this a past `until_ms` would slip through the max-duration check (negative
     // duration is not "too long") and create an already-expired order.
@@ -508,22 +521,18 @@ async fn create_order(
         return Err((StatusCode::CONFLICT, "rig is offline".into()));
     }
     let target = UpstreamTarget {
-        url: req.url,
+        url,
         user: req.user,
         password: req.pass,
         authority_pubkey: req.authority,
     };
     // Optional fallback pool (same protocol as the rig). Empty url = none.
-    let fallback = if req.fallback_url.trim().is_empty() {
-        None
-    } else {
-        Some(UpstreamTarget {
-            url: req.fallback_url,
-            user: req.fallback_user,
-            password: req.fallback_pass,
-            authority_pubkey: req.fallback_authority,
-        })
-    };
+    let fallback = fallback_url.map(|url| UpstreamTarget {
+        url,
+        user: req.fallback_user,
+        password: req.fallback_pass,
+        authority_pubkey: req.fallback_authority,
+    });
     let order = match s
         .orders
         .create(
@@ -742,6 +751,82 @@ mod tests {
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["online"], false);
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["hashrate_hs"], 0.0);
         assert_eq!(v["sellers"]["bc1qSELLER.rig1"]["rented"], false);
+    }
+
+    #[tokio::test]
+    async fn a_seller_pool_typed_with_the_miner_menu_scheme_is_stored_bare() {
+        let app = app().await;
+        let set = Request::put("/api/sellers/bc1qSELLER.rig1")
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(
+                r#"{"url":"stratum+tcp://poolA:3333","user":"acct","pass":"x"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(set).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/api/sellers")
+                    .header("authorization", BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["sellers"]["bc1qSELLER.rig1"]["default_pool"]["url"],
+            "poolA:3333"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_target_the_proxy_cannot_reach_is_refused_before_it_is_stored() {
+        // 2026-09-13: `stratum+tcp://…` reached the resolver verbatim and the
+        // order lived on, mining for the seller. A scheme the proxy cannot
+        // speak is refused at the API; the miner-menu scheme is accepted
+        // (this worker is offline, so the request then fails on THAT, proving
+        // the url check passed).
+        let app = app().await;
+        let post = |url: &str| {
+            Request::post("/api/orders")
+                .header("content-type", "application/json")
+                .header("authorization", BEARER)
+                .body(Body::from(format!(
+                    r#"{{"worker":"bc1qSELLER.rig1","url":"{url}","user":"b","pass":"x","until_ms":0}}"#
+                )))
+                .unwrap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(post("stratum+ssl://buyer:3333"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(resp).await.contains("only plain tcp"));
+
+        let resp = app
+            .clone()
+            .oneshot(post("stratum+tcp://stratum.braiins.com:3333"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("offline"));
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/orders")
+                    .header("authorization", BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["orders"].as_array().unwrap().len(), 0, "nothing stored");
     }
 
     #[tokio::test]
