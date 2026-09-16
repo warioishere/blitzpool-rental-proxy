@@ -124,6 +124,19 @@ pub async fn serve(addr: String, state: AppState) -> anyhow::Result<()> {
 
 type ApiError = (StatusCode, String);
 
+/// A rig with a live rental is frozen: its seller row is neither edited nor
+/// deleted until the order ends. Seen 2026-09-16: a seller re-registered his
+/// rig under a new name and deleted the old row mid-rental. The live session
+/// kept routing (it reads the row only at connect), but the rig vanished from
+/// the hashrate history and the next reconnect would have been refused as
+/// unregistered while the buyer's order was still running.
+async fn rented_guard(s: &AppState, worker: &str) -> Result<(), ApiError> {
+    if s.orders.active_for_worker(worker, now_ms()).await.is_some() {
+        return Err((StatusCode::CONFLICT, "rig is already rented".into()));
+    }
+    Ok(())
+}
+
 /// [`crate::session::normalize_pool_url`] as an API rejection.
 fn pool_url(raw: &str) -> Result<String, ApiError> {
     crate::session::normalize_pool_url(raw).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
@@ -331,6 +344,7 @@ async fn set_seller(
     Path(worker): Path<String>,
     Json(req): Json<SellerReq>,
 ) -> Result<Json<Value>, ApiError> {
+    rented_guard(&s, &worker).await?;
     let target = UpstreamTarget {
         url: pool_url(&req.url)?,
         user: req.user,
@@ -390,6 +404,7 @@ async fn delete_seller(
     State(s): State<AppState>,
     Path(worker): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    rented_guard(&s, &worker).await?;
     let removed = s
         .sellers
         .remove(&worker)
@@ -917,6 +932,42 @@ mod tests {
         let resp = app.oneshot(post).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert!(body_text(resp).await.contains("future"));
+    }
+
+    #[tokio::test]
+    async fn a_rented_rig_is_neither_edited_nor_deleted_until_the_order_ends() {
+        let (app, orders) = app_with_orders().await;
+        put_rig(&app, "bc1qA.rig1").await;
+        let order = orders
+            .create("bc1qA.rig1".to_string(), buyer_target(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
+
+        let put = || {
+            Request::put("/api/sellers/bc1qA.rig1")
+                .header("content-type", "application/json")
+                .header("authorization", BEARER)
+                .body(Body::from(r#"{"url":"poolB:3333","user":"acct"}"#))
+                .unwrap()
+        };
+        let del = || {
+            Request::delete("/api/sellers/bc1qA.rig1")
+                .header("authorization", BEARER)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = app.clone().oneshot(put()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("rented"));
+        let resp = app.clone().oneshot(del()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        orders.cancel(&order.id).await;
+        assert_eq!(
+            app.clone().oneshot(put()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(app.oneshot(del()).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

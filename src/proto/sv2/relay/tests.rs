@@ -4278,3 +4278,76 @@ async fn a_failed_attach_switch_is_retried_until_the_rental_pool_answers() {
     let (_c3, p3) = m3.open("bc1qSELLER.farm", 1).await.unwrap();
     assert_eq!(p3, vec![0xBB; 8], "reattaching member lands on the rental");
 }
+
+#[tokio::test]
+async fn a_worker_with_an_active_order_but_no_seller_row_is_admitted_onto_the_rental() {
+    // 2026-09-16: the seller deleted his rig row mid-rental. The live session
+    // carried on, but the next reconnect was refused as unregistered while the
+    // buyer's order still ran. Admission is order OR rig, as on SV1.
+    let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_addr = pool_b.local_addr().unwrap();
+    let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_b,
+        vec![0xBB; 8],
+        99,
+        NoiseKeys::generate(),
+        b_tx,
+    ));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    // Deliberately NO register_rig: only the order knows this worker.
+    let order = orders
+        .create(
+            "bc1qSELLER.farm".to_string(),
+            ext_target(&b_addr.to_string(), "acctB"),
+            None,
+            crate::orders::now_ms() + 60_000,
+            1.0,
+            1.0,
+        )
+        .await
+        .unwrap();
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (_c1, p1) = m1.open("bc1qSELLER.farm", 1).await.unwrap();
+    assert_eq!(
+        p1,
+        vec![0xBB; 8],
+        "admitted on the order, opened on the rental"
+    );
+    let st = registry.aggregated_status("bc1qSELLER.farm").await.unwrap();
+    assert_eq!(st.routing, "rented");
+
+    // Once the order is gone there is neither order nor rig: refused.
+    orders.cancel(&order.id).await;
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    let refused = match m2.setup().await {
+        Err(_) => true,
+        Ok(()) => m2.open("bc1qSELLER.farm", 1).await.is_err(),
+    };
+    assert!(refused, "without order or rig the worker is unregistered");
+}

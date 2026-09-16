@@ -521,7 +521,10 @@ struct Inner {
     /// Next member id to hand out.
     next_member_id: u32,
     routing: Routing,
-    default_target: UpstreamTarget,
+    /// The seller's idle pool at connect time. `None` for a rig admitted on its
+    /// active order alone (seller row deleted mid-rental): it has nowhere to
+    /// idle, so [`Sv2Session::revert`] drops its members instead of swapping.
+    default_target: Option<UpstreamTarget>,
     hashrate: HashrateWindow,
     /// Lifetime delivered work (diff-1 share units) + accepted shares.
     delivered_work: f64,
@@ -753,7 +756,19 @@ impl Sv2Session {
 
     pub async fn revert(self: &Arc<Self>) -> anyhow::Result<()> {
         let default = self.inner.lock().await.default_target.clone();
-        self.swap_upstream(default, Routing::Idle).await
+        match default {
+            Some(target) => self.swap_upstream(target, Routing::Idle).await,
+            None => {
+                // No idle pool to fall back to and the rental is over: staying
+                // on the buyer's pool would mine for the buyer unpaid. Drop
+                // the members; on reconnect they are refused unless a rig
+                // row or a new order exists by then.
+                let label = self.inner.lock().await.label.clone();
+                warn!(%label, "rig has no idle pool registered; disconnecting its miners instead of reverting");
+                self.force_reconnect();
+                Ok(())
+            }
+        }
     }
 
     /// Drop ALL bundled miner connections so they reconnect and re-resolve
@@ -2051,32 +2066,33 @@ pub async fn handle_seller_miner_sv2(
     let MinerOpen { spec, worker } =
         parse_miner_open(&mut open_frame).ok_or_else(|| anyhow!("expected OpenMiningChannel"))?;
 
-    // 4. Register-only: the worker MUST have a registered rig (its idle pool).
-    //    No rig → reject and close.
-    let idle_target = match ctx.sellers.default_pool(&worker).await {
-        Some(t) => t,
-        None => {
-            warn!(%peer, %worker, "rejected unregistered worker (register-only)");
-            bail!("unregistered worker {worker} — register the rig first");
-        }
-    };
+    // 4. Register-only: the worker is admitted when it has a registered rig
+    //    (its idle pool) OR an active order, the same rule the SV1 relay applies.
+    //    Requiring the rig row alone locked a rented rig out after its seller
+    //    deleted the row mid-rental (2026-09-16) while the buyer's order ran.
+    let idle_target = ctx.sellers.default_pool(&worker).await;
 
     // 5. Decide where the first channel opens: straight on the buyer's pool if a
     //    rental is already active (resume on reconnect without an open-then-switch
     //    round-trip), else the rig's idle pool. `default_target` stays the idle
-    //    pool either way, so a release/revert returns there.
+    //    pool, so a release/revert returns there; with none, the revert drops
+    //    the members instead.
     let active_order = ctx
         .orders
         .active_for_worker(&worker, crate::orders::now_ms())
         .await;
-    let (mut open_target, routing) = match &active_order {
-        Some(o) => (
+    let (mut open_target, routing) = match (&active_order, &idle_target) {
+        (Some(o), _) => (
             o.target.clone(),
             Routing::Rented {
                 order_id: o.id.clone(),
             },
         ),
-        None => (idle_target.clone(), Routing::Idle),
+        (None, Some(idle)) => (idle.clone(), Routing::Idle),
+        (None, None) => {
+            warn!(%peer, %worker, "rejected unregistered worker (register-only)");
+            bail!("unregistered worker {worker} — register the rig first");
+        }
     };
 
     // 6. Bundle onto this rig's existing SV2 upstream if one is live; else build a
