@@ -1438,7 +1438,9 @@ async fn connect_sv1_upstream(
         json!([user_identity, target.password]),
     );
     w.write_all(auth.to_line().as_bytes()).await?;
-    let _ = sv1_read_response(&mut read, &mut prelude).await?;
+    sv1_read_response(&mut read, &mut prelude)
+        .await?
+        .check_authorized()?;
 
     let initial_diff = prelude
         .iter()
@@ -1590,19 +1592,24 @@ fn spawn_sv1_translate_reader(
             handle_sv1_line(&session, generation, &state, down_cid, line.trim()).await;
         }
         let mut line = String::new();
-        loop {
+        let mut last = String::new();
+        let reason = loop {
             line.clear();
             match read.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break "closed by pool".to_string(),
+                Err(e) => break e.to_string(),
                 Ok(_) => {}
             }
             let l = line.trim();
             if l.is_empty() {
                 continue;
             }
+            last.clear();
+            last.extend(l.chars().take(300));
             handle_sv1_line(&session, generation, &state, down_cid, l).await;
-        }
+        };
         // Pool closed/errored (an intentional swap aborts this task first).
+        warn!(gen = generation, %reason, last_line = %last, "sv1 upstream connection ended");
         let _ = session.died_tx.send(generation);
     })
 }
@@ -1716,14 +1723,18 @@ async fn handle_sv1_line(
             };
             let f = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesSuccess(ok)));
             session.send_translate_frame(generation, f).await;
-        } else if let Ok(error_code) = Str0255::try_from("rejected".to_string()) {
-            let err = mining::SubmitSharesError {
-                channel_id: down_cid,
-                sequence_number: seq,
-                error_code,
-            };
-            let f = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesError(err)));
-            session.send_translate_frame(generation, f).await;
+        } else {
+            let reason = m.error.clone().unwrap_or(Value::Null);
+            warn!(error = %reason, "sv1 pool rejected a share");
+            if let Ok(error_code) = Str0255::try_from("rejected".to_string()) {
+                let err = mining::SubmitSharesError {
+                    channel_id: down_cid,
+                    sequence_number: seq,
+                    error_code,
+                };
+                let f = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesError(err)));
+                session.send_translate_frame(generation, f).await;
+            }
         }
     }
 }

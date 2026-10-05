@@ -31,6 +31,20 @@ impl RpcMessage {
         serde_json::from_str(line.trim())
     }
 
+    /// `Ok` only for a `mining.authorize` answered with `true`. A pool that
+    /// refuses the login can keep the connection open and reject every share,
+    /// which from the outside looks like a rig delivering nothing.
+    pub fn check_authorized(&self) -> anyhow::Result<()> {
+        if matches!(self.result, Some(Value::Bool(true))) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "pool refused mining.authorize (result={}, error={})",
+            self.result.as_ref().unwrap_or(&Value::Null),
+            self.error.as_ref().unwrap_or(&Value::Null)
+        )
+    }
+
     /// Serialize to a wire line *including* the trailing `\n`.
     pub fn to_line(&self) -> String {
         let mut s = serde_json::to_string(self).unwrap_or_else(|_| "{}".into());
@@ -74,6 +88,25 @@ impl RpcMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_true_authorize_result_counts_as_authorized() {
+        let ok = RpcMessage::parse(r#"{"id":3,"result":true,"error":null}"#).unwrap();
+        assert!(ok.check_authorized().is_ok());
+
+        let refused =
+            RpcMessage::parse(r#"{"id":3,"result":false,"error":[24,"Unauthorized worker",null]}"#)
+                .unwrap();
+        let err = refused.check_authorized().unwrap_err().to_string();
+        assert!(
+            err.contains("Unauthorized worker"),
+            "the pool's reason is kept: {err}"
+        );
+
+        let error_only =
+            RpcMessage::parse(r#"{"id":3,"result":null,"error":[20,"Other",null]}"#).unwrap();
+        assert!(error_only.check_authorized().is_err());
+    }
 
     #[test]
     fn parses_subscribe_request() {

@@ -975,7 +975,9 @@ async fn connect_upstream(
         json!([user_identity, target.password]),
     );
     w.write_all(auth.to_line().as_bytes()).await?;
-    let _ = read_response(&mut reader, &mut prelude).await?; // authorize reply (value ignored for now)
+    read_response(&mut reader, &mut prelude)
+        .await?
+        .check_authorized()?;
 
     Ok(UpstreamConn {
         reader,
