@@ -962,7 +962,7 @@ async fn delivered_work_is_credited_to_the_rental_order() {
         credited.submitted_shares, k,
         "submitted shares tracked on order"
     );
-    let expected = difficulty_from_target(&diff1_target()) * k as f64;
+    let expected = translate::difficulty_from_target(&diff1_target()) * k as f64;
     assert!(credited.delivered_work > 0.0, "delivered work measured");
     assert!(
         (credited.delivered_work - expected).abs() <= expected * 1e-6 + f64::MIN_POSITIVE,

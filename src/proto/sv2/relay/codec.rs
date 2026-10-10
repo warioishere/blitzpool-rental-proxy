@@ -223,24 +223,6 @@ pub(super) fn parse_open_error_request_id(frame: &mut Sv2Frame) -> Option<u32> {
     }
 }
 
-pub(super) fn parse_setup_success_flags(frame: &mut Sv2Frame) -> Option<u32> {
-    let mt = wire::msg_type(frame)?;
-    let payload = frame.payload();
-    match CommonMessages::try_from((mt, payload)).ok()? {
-        CommonMessages::SetupConnectionSuccess(s) => Some(s.flags),
-        _ => None,
-    }
-}
-
-pub(crate) fn parse_accepted_count(frame: &mut Sv2Frame) -> Option<u32> {
-    let mt = wire::msg_type(frame)?;
-    let payload = frame.payload();
-    match Mining::try_from((mt, payload)).ok()? {
-        Mining::SubmitSharesSuccess(s) => Some(s.new_submits_accepted_count),
-        _ => None,
-    }
-}
-
 /// `(last_sequence_number, new_submits_accepted_count)` of a `SubmitSharesSuccess`.
 pub(crate) fn parse_submit_success(frame: &mut Sv2Frame) -> Option<(u32, u32)> {
     let mt = wire::msg_type(frame)?;
@@ -294,10 +276,4 @@ pub(crate) fn parse_submit_error_seq(frame: &mut Sv2Frame) -> Option<u32> {
         Mining::SubmitSharesError(m) => Some(m.sequence_number),
         _ => None,
     }
-}
-
-/// Difficulty implied by a channel `target` (Bitcoin bdiff convention). The
-/// single source of truth is [`crate::proto::translate::difficulty_from_target`].
-pub(super) fn difficulty_from_target(target: &[u8]) -> f64 {
-    crate::proto::translate::difficulty_from_target(target)
 }

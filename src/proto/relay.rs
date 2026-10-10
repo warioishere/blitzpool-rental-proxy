@@ -524,7 +524,7 @@ async fn connect_sv2_translate(
     user_identity: &str,
 ) -> anyhow::Result<RawUpstream> {
     use crate::proto::sv2::relay::{connect_setup, open_on, OpenSpec};
-    let (mut read, mut write, _flags) = connect_setup(target).await?;
+    let (mut read, mut write) = connect_setup(target).await?;
     let spec = OpenSpec::Extended {
         request_id: 1,
         nominal_hash_rate: SV2_UP_NOMINAL_HASHRATE,
@@ -723,7 +723,7 @@ fn spawn_sv2_translate_reader(
     mut read: crate::proto::sv2::relay::Read,
     state: Arc<Mutex<Sv2UpState>>,
 ) -> JoinHandle<()> {
-    use crate::proto::sv2::relay::{
+    use crate::proto::sv2::relay::codec::{
         parse_new_extended_job, parse_set_new_prev_hash, parse_set_target, parse_submit_error_seq,
         parse_submit_success,
     };

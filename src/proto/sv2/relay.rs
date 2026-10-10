@@ -61,14 +61,8 @@ use crate::proto::adapter::{DownstreamAdapter, ProxyContext};
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 
 /// SV2 frame builders/parsers (split out for navigability).
-mod codec;
+pub(crate) mod codec;
 use codec::*;
-// The SV1 relay imports these parsers via the historical
-// `crate::proto::sv2::relay::parse_*` path; preserve it after the move.
-pub(crate) use codec::{
-    parse_new_extended_job, parse_set_new_prev_hash, parse_set_target, parse_submit_error_seq,
-    parse_submit_success,
-};
 
 /// Same-rig bundle registry + idle reaper (split out for navigability).
 mod registry;
@@ -146,8 +140,6 @@ async fn read_one(read: &mut Read) -> anyhow::Result<Sv2Frame> {
     wire::into_sv2(frame).ok_or_else(|| anyhow!("unexpected handshake frame post-handshake"))
 }
 
-/// Connect an upstream, run SetupConnection, return the (post-setup) halves and
-/// the upstream's negotiated flags.
 /// Why an SV2 probe did not produce an upstream — and the distinction is the
 /// whole point.
 ///
@@ -197,7 +189,7 @@ impl ProbeFailure {
 /// The timeout lives inside so a pool that accepts TCP and then goes quiet is
 /// judged on what it already told us (it answered) rather than on which layer
 /// happened to run out of time.
-pub(crate) async fn probe_sv2(target: &UpstreamTarget) -> Result<(Read, Write, u32), ProbeFailure> {
+pub(crate) async fn probe_sv2(target: &UpstreamTarget) -> Result<(Read, Write), ProbeFailure> {
     let connected = tokio::time::timeout(
         translate::UPSTREAM_PROBE_TIMEOUT,
         TcpStream::connect(&target.url),
@@ -232,7 +224,8 @@ pub(crate) async fn probe_sv2(target: &UpstreamTarget) -> Result<(Read, Write, u
     }
 }
 
-pub(crate) async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write, u32)> {
+/// Connect an upstream and run SetupConnection, returning the post-setup halves.
+pub(crate) async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Read, Write)> {
     let tcp = TcpStream::connect(&target.url)
         .await
         .with_context(|| format!("connect upstream {}", target.url))?;
@@ -241,7 +234,7 @@ pub(crate) async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Re
 
 /// The SV2 setup on an already-connected socket: Noise, then `SetupConnection`
 /// until its Success.
-async fn setup_over(tcp: TcpStream, target: &UpstreamTarget) -> anyhow::Result<(Read, Write, u32)> {
+async fn setup_over(tcp: TcpStream, target: &UpstreamTarget) -> anyhow::Result<(Read, Write)> {
     let _ = tcp.set_nodelay(true);
     let authority = super::keys::parse_authority(&target.authority_pubkey)?;
     let stream = connect_with_noise::<Msg>(tcp, authority)
@@ -253,10 +246,10 @@ async fn setup_over(tcp: TcpStream, target: &UpstreamTarget) -> anyhow::Result<(
         .await
         .map_err(|e| anyhow!("send SetupConnection: {e:?}"))?;
     loop {
-        let mut f = read_one(&mut read).await?;
+        let f = read_one(&mut read).await?;
         match wire::msg_type(&f) {
             Some(common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS) => {
-                return Ok((read, write, parse_setup_success_flags(&mut f).unwrap_or(0)));
+                return Ok((read, write));
             }
             Some(common::MESSAGE_TYPE_SETUP_CONNECTION_ERROR) => {
                 bail!("upstream rejected SetupConnection")
@@ -932,7 +925,7 @@ impl Sv2Session {
         // it's an SV1 buyer pool → translate the switch onto it. But an
         // unreachable pool is NOT an SV1 pool: fail, so the supervisor keeps
         // retrying on SV2 instead of downgrading for the rest of the session.
-        let (mut read, mut write, _flags) = match probe_sv2(&target).await {
+        let (mut read, mut write) = match probe_sv2(&target).await {
             Ok(c) => c,
             Err(f) => {
                 f.allow_translation(&target.url)?;
@@ -979,7 +972,7 @@ impl Sv2Session {
                 down_channel_id: *down_cid,
                 up_channel_id: info.up_channel_id,
                 spec: spec.clone(),
-                difficulty: difficulty_from_target(&info.target),
+                difficulty: translate::difficulty_from_target(&info.target),
                 owner: *owner,
                 up_group_id,
                 down_group_id: *down_group_id,
@@ -1061,7 +1054,7 @@ impl Sv2Session {
                 if let Some((member, spec)) = i.pending.remove(&info.request_id) {
                     let down_cid = i.next_down_cid;
                     i.next_down_cid += 1;
-                    let diff = difficulty_from_target(&info.target);
+                    let diff = translate::difficulty_from_target(&info.target);
                     // Group first: the channel records the pair, so a later
                     // group-broadcast can find its members without a second map.
                     let down_group_id = i.map_group(info.group_channel_id, spec.is_extended());
@@ -1158,7 +1151,7 @@ impl Sv2Session {
         // Vardiff: a new target changes this channel's share difficulty.
         if mt == mining::MESSAGE_TYPE_SET_TARGET {
             if let Some(target) = parse_set_target(&mut frame) {
-                let diff = difficulty_from_target(&target);
+                let diff = translate::difficulty_from_target(&target);
                 let mapped = i.up_to_down.get(&up_cid).copied();
                 debug!(
                     worker = %i.label,
@@ -1177,7 +1170,7 @@ impl Sv2Session {
         // difficulty (proxy-authoritative) and credit the active rental.
         let mut order_credit: Option<(String, f64, u64)> = None;
         if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {
-            let count = parse_accepted_count(&mut frame).unwrap_or(0);
+            let count = parse_submit_success(&mut frame).map_or(0, |(_, n)| n);
             let diff = i
                 .channels
                 .iter()
@@ -1827,7 +1820,7 @@ impl Sv2Session {
         // An unreachable pool says nothing about protocols, so it must not buy
         // the miner a permanent downgrade — fail, and let the connect retry.
         match probe_sv2(&target).await {
-            Ok((read, write, _flags)) => {
+            Ok((read, write)) => {
                 self.install_sv2_initial(read, write, spec, up_ident, target, routing, member)
                     .await
             }

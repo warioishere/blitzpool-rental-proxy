@@ -30,9 +30,7 @@ impl NoiseKeys {
         let parsed: Secp256k1SecretKey = s
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid SV2 secret key (expected base58)"))?;
-        Ok(Self {
-            secret: parsed.into_inner(),
-        })
+        Ok(Self { secret: parsed.0 })
     }
 
     /// Resolve the proxy's Noise authority key, in order of preference:
@@ -125,15 +123,6 @@ pub fn parse_authority(pubkey: &Option<String>) -> anyhow::Result<Option<Secp256
             Ok(Some(key))
         }
         None => Ok(None),
-    }
-}
-
-trait IntoInnerSecret {
-    fn into_inner(self) -> SecretKey;
-}
-impl IntoInnerSecret for Secp256k1SecretKey {
-    fn into_inner(self) -> SecretKey {
-        self.0
     }
 }
 

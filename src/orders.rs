@@ -182,24 +182,15 @@ impl OrderRow {
 }
 
 /// Why [`OrderStore::create`] could not record an order.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CreateOrderError {
     /// The worker already has an active order (one-active-per-worker guard).
+    #[error("worker already has an active order")]
     AlreadyActive,
     /// A database error.
+    #[error(transparent)]
     Db(sqlx::Error),
 }
-
-impl std::fmt::Display for CreateOrderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CreateOrderError::AlreadyActive => write!(f, "worker already has an active order"),
-            CreateOrderError::Db(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for CreateOrderError {}
 
 /// Per-order accounting buffered in memory between DB flushes.
 #[derive(Default, Clone, Copy)]
