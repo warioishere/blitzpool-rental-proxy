@@ -6,6 +6,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use tracing::{debug, warn};
+
+use crate::control::{accept_ratio, accept_ratio_low, SessionStatus};
+
 /// Difficulty-1 share = 2^32 hashes.
 const DIFF1_HASHES: f64 = 4_294_967_296.0;
 
@@ -68,6 +72,100 @@ pub enum Routing {
     /// order id is kept here to credit delivered work to the rental. The rental's
     /// deadline + budget live on the [`crate::orders::Order`].
     Rented { order_id: String },
+}
+
+impl Routing {
+    /// The order this hashrate is credited to, when rented.
+    pub fn order_id(&self) -> Option<&str> {
+        match self {
+            Routing::Idle => None,
+            Routing::Rented { order_id } => Some(order_id),
+        }
+    }
+}
+
+/// What one session has delivered: the live hashrate window, lifetime
+/// counters, and the accept-ratio health signal over them. Every relay path
+/// (SV1, SV2, and both translations) books through this one type.
+pub struct Delivery {
+    hashrate: HashrateWindow,
+    /// Lifetime delivered work, diff-1 share units (Σ accepted share difficulty).
+    delivered_work: f64,
+    accepted_shares: u64,
+    submitted_shares: u64,
+    /// Edge-trigger so the low-accept-ratio warning is logged once.
+    accept_low_logged: bool,
+}
+
+impl Delivery {
+    pub fn new() -> Self {
+        Self {
+            hashrate: HashrateWindow::new(Duration::from_secs(600)),
+            delivered_work: 0.0,
+            accepted_shares: 0,
+            submitted_shares: 0,
+            accept_low_logged: false,
+        }
+    }
+
+    /// Count a share the miner submitted. The accept ratio only falls on a
+    /// submit, so this is where its warning fires (once per session) — also
+    /// for a miner none of whose shares are ever accepted.
+    pub fn submitted(&mut self, worker: &str) {
+        self.submitted_shares += 1;
+        if !self.accept_low_logged && accept_ratio_low(self.accepted_shares, self.submitted_shares)
+        {
+            self.accept_low_logged = true;
+            warn!(
+                %worker,
+                accepted = self.accepted_shares,
+                submitted = self.submitted_shares,
+                ratio = accept_ratio(self.accepted_shares, self.submitted_shares),
+                "low accept ratio — possible pool under-reporting or misbehaving miner"
+            );
+        }
+    }
+
+    /// Credit `shares` accepted shares worth `work` diff-1 units in total.
+    /// Returns `false`, crediting nothing, when `work` is not positive: the
+    /// share difficulty is unknown, so there is no measured work to bill.
+    pub fn accepted(&mut self, work: f64, shares: u64, worker: &str) -> bool {
+        if work <= 0.0 {
+            return false;
+        }
+        self.hashrate.record(work);
+        self.delivered_work += work;
+        self.accepted_shares += shares;
+        debug!(%worker, shares, hashrate = self.hashrate.hashes_per_second(), "accepted shares");
+        true
+    }
+
+    /// Snapshot for the control API.
+    pub fn status(
+        &self,
+        worker: &str,
+        routing: &Routing,
+        upstream_url: &str,
+        protocol: &'static str,
+    ) -> SessionStatus {
+        SessionStatus {
+            worker: worker.to_string(),
+            routing: match routing {
+                Routing::Idle => "idle",
+                Routing::Rented { .. } => "rented",
+            }
+            .to_string(),
+            order_id: routing.order_id().map(str::to_string),
+            upstream_url: upstream_url.to_string(),
+            hashrate_hs: self.hashrate.hashes_per_second(),
+            delivered_work: self.delivered_work,
+            accepted_shares: self.accepted_shares,
+            submitted_shares: self.submitted_shares,
+            accept_ratio: accept_ratio(self.accepted_shares, self.submitted_shares),
+            accept_ratio_low: accept_ratio_low(self.accepted_shares, self.submitted_shares),
+            protocol,
+        }
+    }
 }
 
 /// Rolling window of accepted-share difficulty → hashrate estimate.
@@ -179,6 +277,40 @@ mod tests {
         // Span is capped at the 600s window, so divide the in-window sum by 600.
         let expected = sum_in_window * DIFF1_HASHES / 600.0;
         assert!((w.hashes_per_second_at(now) - expected).abs() < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_work_is_booked_and_reported() {
+        let mut d = Delivery::new();
+        d.submitted("w");
+        d.submitted("w");
+        assert!(d.accepted(512.0, 2, "w"));
+        let rented = Routing::Rented {
+            order_id: "o1".into(),
+        };
+        let st = d.status("w", &rented, "pool:3333", "sv2");
+        assert_eq!(st.delivered_work, 512.0);
+        assert_eq!(st.accepted_shares, 2);
+        assert_eq!(st.submitted_shares, 2);
+        assert_eq!(st.routing, "rented");
+        assert_eq!(st.order_id.as_deref(), Some("o1"));
+        assert!(st.hashrate_hs > 0.0);
+    }
+
+    #[test]
+    fn a_share_of_unknown_difficulty_books_nothing() {
+        let mut d = Delivery::new();
+        assert!(!d.accepted(0.0, 1, "w"));
+        let st = d.status("w", &Routing::Idle, "pool:3333", "sv1");
+        assert_eq!(st.accepted_shares, 0);
+        assert_eq!(st.delivered_work, 0.0);
+        assert_eq!(st.order_id, None);
+        assert_eq!(st.routing, "idle");
     }
 }
 

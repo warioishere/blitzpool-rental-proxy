@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 use super::sv1::{self, PoolConn, RpcMessage};
 use super::ProxyContext;
 use crate::control::{AnySession, SessionStatus};
-use crate::session::{HashrateWindow, Routing, UpstreamTarget};
+use crate::session::{Delivery, Routing, UpstreamTarget};
 
 // Translation path (combo 3: SV1 miner ↔ SV2 buyer pool).
 use crate::proto::sv2::wire;
@@ -108,14 +108,7 @@ struct Inner {
     current_difficulty: f64,
     /// submit id (serialized) → (generation, difficulty) for hashrate credit.
     pending: HashMap<String, (u64, f64)>,
-    hashrate: HashrateWindow,
-    /// Lifetime delivered work (diff-1 share units) + accepted shares.
-    delivered_work: f64,
-    accepted_shares: u64,
-    /// Shares the miner submitted (for the accept-ratio health/fraud signal).
-    submitted_shares: u64,
-    /// Edge-trigger so the low-accept-ratio warning is logged once.
-    accept_low_logged: bool,
+    delivery: Delivery,
     routing: Routing,
     default_target: UpstreamTarget,
     /// Miner's `mining.configure` (remembered to replay to each upstream).
@@ -298,7 +291,8 @@ impl Session {
     async fn on_upstream_msg(&self, generation: u64, msg: RpcMessage) -> Option<String> {
         let mut order_credit: Option<(String, f64)> = None;
         {
-            let mut i = self.inner.lock().await;
+            let mut guard = self.inner.lock().await;
+            let i = &mut *guard;
             if generation != i.active.generation {
                 return None; // stale upstream (already swapped away)
             }
@@ -318,27 +312,12 @@ impl Session {
                     // A response — credit accepted submits (diff-weighted).
                     let idk = id_key(&msg.id);
                     if let Some((g, diff)) = i.pending.remove(&idk) {
-                        if g == generation && matches!(&msg.result, Some(Value::Bool(true))) {
-                            i.hashrate.record(diff);
-                            i.delivered_work += diff;
-                            i.accepted_shares += 1;
-                            if let Routing::Rented { order_id, .. } = &i.routing {
-                                order_credit = Some((order_id.clone(), diff));
-                            }
-                            debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted share");
+                        if g == generation
+                            && matches!(&msg.result, Some(Value::Bool(true)))
+                            && i.delivery.accepted(diff, 1, &i.label)
+                        {
+                            order_credit = i.routing.order_id().map(|o| (o.to_string(), diff));
                         }
-                    }
-                    if !i.accept_low_logged
-                        && crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares)
-                    {
-                        i.accept_low_logged = true;
-                        warn!(
-                            worker = %i.label,
-                            accepted = i.accepted_shares,
-                            submitted = i.submitted_shares,
-                            ratio = crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
-                            "low accept ratio — possible pool under-reporting or misbehaving miner"
-                        );
                     }
                 }
                 _ => {}
@@ -356,7 +335,8 @@ impl Session {
     async fn on_miner_msg(self: &Arc<Self>, mut msg: RpcMessage) {
         let mut submit_order: Option<String> = None;
         {
-            let mut i = self.inner.lock().await;
+            let mut guard = self.inner.lock().await;
+            let i = &mut *guard;
             match msg.method.as_deref() {
                 Some("mining.authorize") => {
                     // The proxy authorizes upstream itself (with the pool/buyer
@@ -374,10 +354,8 @@ impl Session {
                     if !i.translating {
                         i.pending.insert(id_key(&msg.id), (g, diff));
                     }
-                    i.submitted_shares += 1;
-                    if let Routing::Rented { order_id, .. } = &i.routing {
-                        submit_order = Some(order_id.clone());
-                    }
+                    i.delivery.submitted(&i.label);
+                    submit_order = i.routing.order_id().map(str::to_string);
                     let up_worker = upstream_worker(&i.active.target.user, &i.label);
                     if let Some(arr) = msg.params.as_mut().and_then(|p| p.as_array_mut()) {
                         if let Some(first) = arr.first_mut() {
@@ -407,26 +385,8 @@ impl Session {
     /// Snapshot for the control API.
     pub async fn status(&self) -> SessionStatus {
         let i = self.inner.lock().await;
-        let (routing, order_id) = match &i.routing {
-            Routing::Idle => ("idle".to_string(), None),
-            Routing::Rented { order_id, .. } => ("rented".to_string(), Some(order_id.clone())),
-        };
-        SessionStatus {
-            worker: i.label.clone(),
-            routing,
-            order_id,
-            upstream_url: i.active.target.url.clone(),
-            hashrate_hs: i.hashrate.hashes_per_second(),
-            delivered_work: i.delivered_work,
-            accepted_shares: i.accepted_shares,
-            submitted_shares: i.submitted_shares,
-            accept_ratio: crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
-            accept_ratio_low: crate::control::accept_ratio_low(
-                i.accepted_shares,
-                i.submitted_shares,
-            ),
-            protocol: "sv1",
-        }
+        i.delivery
+            .status(&i.label, &i.routing, &i.active.target.url, "sv1")
     }
 }
 
@@ -849,34 +809,18 @@ impl Session {
     /// when rented, the order. Generation-guarded.
     async fn credit_translate_accepted(&self, generation: u64, count: u32) {
         let credit = {
-            let mut i = self.inner.lock().await;
+            let mut guard = self.inner.lock().await;
+            let i = &mut *guard;
             if generation != i.active.generation {
                 return;
             }
-            let diff = i.current_difficulty;
-            let work = diff * count as f64;
-            let mut credit = None;
-            if work > 0.0 {
-                i.hashrate.record(work);
-                i.delivered_work += work;
-                i.accepted_shares += count as u64;
-                if let Routing::Rented { order_id, .. } = &i.routing {
-                    credit = Some((order_id.clone(), work, count as u64));
-                }
-                debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted shares (translated)");
+            let work = i.current_difficulty * count as f64;
+            let shares = count as u64;
+            if i.delivery.accepted(work, shares, &i.label) {
+                i.routing.order_id().map(|o| (o.to_string(), work, shares))
+            } else {
+                None
             }
-            if !i.accept_low_logged
-                && crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares)
-            {
-                i.accept_low_logged = true;
-                warn!(
-                    worker = %i.label,
-                    accepted = i.accepted_shares,
-                    submitted = i.submitted_shares,
-                    "low accept ratio — possible pool under-reporting or misbehaving miner"
-                );
-            }
-            credit
         };
         if let Some((order_id, work, shares)) = credit {
             self.orders.add_work(&order_id, work, shares);
@@ -1045,11 +989,7 @@ pub async fn handle_seller_miner(
             generation_counter: 0,
             current_difficulty: 1.0,
             pending: HashMap::new(),
-            hashrate: HashrateWindow::new(Duration::from_secs(600)),
-            delivered_work: 0.0,
-            accepted_shares: 0,
-            submitted_shares: 0,
-            accept_low_logged: false,
+            delivery: Delivery::new(),
             routing: Routing::Idle,
             default_target: handshake_target.clone(),
             configure: None,
@@ -1410,11 +1350,7 @@ mod tests {
                 generation_counter: 0,
                 current_difficulty: 1.0,
                 pending: HashMap::new(),
-                hashrate: HashrateWindow::new(Duration::from_secs(600)),
-                delivered_work: 0.0,
-                accepted_shares: 0,
-                submitted_shares: 0,
-                accept_low_logged: false,
+                delivery: Delivery::new(),
                 routing: Routing::Idle,
                 default_target: target_a.clone(),
                 configure: None,

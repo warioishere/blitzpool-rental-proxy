@@ -58,7 +58,7 @@ use super::wire::{self, EitherFrame, Msg, Sv2Frame};
 use crate::control::{AnySession, SessionStatus};
 use crate::orders::OrderStore;
 use crate::proto::ProxyContext;
-use crate::session::{HashrateWindow, Routing, UpstreamTarget};
+use crate::session::{Delivery, Routing, UpstreamTarget};
 
 /// SV2 frame builders/parsers (split out for navigability).
 pub(crate) mod codec;
@@ -518,14 +518,7 @@ struct Inner {
     /// active order alone (seller row deleted mid-rental): it has nowhere to
     /// idle, so [`Sv2Session::revert`] drops its members instead of swapping.
     default_target: Option<UpstreamTarget>,
-    hashrate: HashrateWindow,
-    /// Lifetime delivered work (diff-1 share units) + accepted shares.
-    delivered_work: f64,
-    accepted_shares: u64,
-    /// Shares the miner submitted (for the accept-ratio health/fraud signal).
-    submitted_shares: u64,
-    /// Edge-trigger so the low-accept-ratio warning is logged once.
-    accept_low_logged: bool,
+    delivery: Delivery,
     label: String,
     /// True when the active upstream is an SV1 pool reached via translation (the
     /// buyer pool speaks SV1 behind this SV2 miner). Jobs/shares are converted;
@@ -1178,27 +1171,13 @@ impl Sv2Session {
                 .map(|c| c.difficulty)
                 .unwrap_or(0.0);
             let work = diff * count as f64;
-            if work > 0.0 {
-                i.hashrate.record(work);
-                i.delivered_work += work;
-                i.accepted_shares += count as u64;
-                if let Routing::Rented { order_id, .. } = &i.routing {
-                    order_credit = Some((order_id.clone(), work, count as u64));
-                }
-                debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted shares");
-            }
-            // Accept-ratio health/fraud signal (logged once).
-            if !i.accept_low_logged
-                && crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares)
-            {
-                i.accept_low_logged = true;
-                warn!(
-                    worker = %i.label,
-                    accepted = i.accepted_shares,
-                    submitted = i.submitted_shares,
-                    ratio = crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
-                    "low accept ratio — possible pool under-reporting or misbehaving miner"
-                );
+            let shares = count as u64;
+            let inner = &mut *i;
+            if inner.delivery.accepted(work, shares, &inner.label) {
+                order_credit = inner
+                    .routing
+                    .order_id()
+                    .map(|o| (o.to_string(), work, shares));
             }
         }
 
@@ -1243,26 +1222,8 @@ impl Sv2Session {
 
     pub async fn status(&self) -> SessionStatus {
         let i = self.inner.lock().await;
-        let (routing, order_id) = match &i.routing {
-            Routing::Idle => ("idle".to_string(), None),
-            Routing::Rented { order_id, .. } => ("rented".to_string(), Some(order_id.clone())),
-        };
-        SessionStatus {
-            worker: i.label.clone(),
-            routing,
-            order_id,
-            upstream_url: i.active.target.url.clone(),
-            hashrate_hs: i.hashrate.hashes_per_second(),
-            delivered_work: i.delivered_work,
-            accepted_shares: i.accepted_shares,
-            submitted_shares: i.submitted_shares,
-            accept_ratio: crate::control::accept_ratio(i.accepted_shares, i.submitted_shares),
-            accept_ratio_low: crate::control::accept_ratio_low(
-                i.accepted_shares,
-                i.submitted_shares,
-            ),
-            protocol: "sv2",
-        }
+        i.delivery
+            .status(&i.label, &i.routing, &i.active.target.url, "sv2")
     }
 
     async fn worker_label(&self) -> String {
@@ -1691,7 +1652,8 @@ impl Sv2Session {
     /// rented, the order. Generation-guarded.
     async fn credit_translate(&self, generation: u64, down_cid: u32) {
         let credit = {
-            let mut i = self.inner.lock().await;
+            let mut guard = self.inner.lock().await;
+            let i = &mut *guard;
             if generation != i.active.generation {
                 return;
             }
@@ -1701,28 +1663,11 @@ impl Sv2Session {
                 .find(|c| c.down_channel_id == down_cid)
                 .map(|c| c.difficulty)
                 .unwrap_or(0.0);
-            let mut credit = None;
-            if work > 0.0 {
-                i.hashrate.record(work);
-                i.delivered_work += work;
-                i.accepted_shares += 1;
-                if let Routing::Rented { order_id, .. } = &i.routing {
-                    credit = Some((order_id.clone(), work, 1u64));
-                }
-                debug!(worker = %i.label, hashrate = i.hashrate.hashes_per_second(), "accepted share (translated)");
+            if i.delivery.accepted(work, 1, &i.label) {
+                i.routing.order_id().map(|o| (o.to_string(), work, 1))
+            } else {
+                None
             }
-            if !i.accept_low_logged
-                && crate::control::accept_ratio_low(i.accepted_shares, i.submitted_shares)
-            {
-                i.accept_low_logged = true;
-                warn!(
-                    worker = %i.label,
-                    accepted = i.accepted_shares,
-                    submitted = i.submitted_shares,
-                    "low accept ratio — possible pool under-reporting or misbehaving miner"
-                );
-            }
-            credit
         };
         if let Some((order_id, work, shares)) = credit {
             self.orders.add_work(&order_id, work, shares);
@@ -2089,11 +2034,7 @@ pub async fn handle_seller_miner_sv2(
                     next_member_id: 1,
                     routing: routing.clone(),
                     default_target: idle_target.clone(),
-                    hashrate: HashrateWindow::new(Duration::from_secs(600)),
-                    delivered_work: 0.0,
-                    accepted_shares: 0,
-                    submitted_shares: 0,
-                    accept_low_logged: false,
+                    delivery: Delivery::new(),
                     label: worker.clone(),
                     translating: false,
                     supervisor: None,
@@ -2236,10 +2177,9 @@ pub async fn handle_seller_miner_sv2(
                     };
                     if let Some(up_cid) = i.up_for_down(down_cid) {
                         if is_submit {
-                            i.submitted_shares += 1;
-                            if let Routing::Rented { order_id, .. } = &i.routing {
-                                submit_order = Some(order_id.clone());
-                            }
+                            let inner = &mut *i;
+                            inner.delivery.submitted(&inner.label);
+                            submit_order = inner.routing.order_id().map(str::to_string);
                         }
                         wire::rewrite_channel_id(&mut frame, up_cid);
                         let _ = i.active.to_up.send(frame.into());
