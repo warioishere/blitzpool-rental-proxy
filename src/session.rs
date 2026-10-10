@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 use crate::control::{accept_ratio, accept_ratio_low, SessionStatus};
 
 /// Difficulty-1 share = 2^32 hashes.
-const DIFF1_HASHES: f64 = 4_294_967_296.0;
+pub const DIFF1_HASHES: f64 = 4_294_967_296.0;
 
 /// Turn a pool address the way buyers and sellers type it into the `host:port`
 /// the relays connect with. Miner menus teach `stratum+tcp://host:port`, and

@@ -222,14 +222,15 @@ async fn get_seller_history(
     })))
 }
 
-/// Force every connected miner of a rig to reconnect; returns the count. Each
-/// session re-resolves its upstream from current state on reconnect (a new
-/// rental's buyer pool, or the idle pool after a rental ends), so the caller
-/// MUST persist that state first. A clean reconnect — rather than a live
-/// re-point — avoids miners that ignore a mid-session extranonce change and
-/// keep wasting shares on the old pool.
-fn reconnect_all(sessions: &[crate::control::AnySession]) -> usize {
-    for sess in sessions {
+/// Force every connected miner of `worker` to reconnect; returns how many
+/// were connected. Each session re-resolves its upstream from current state on
+/// reconnect (a new rental's buyer pool, or the idle pool after a rental
+/// ends), so the caller MUST persist that state first. A clean reconnect —
+/// rather than a live re-point — avoids miners that ignore a mid-session
+/// extranonce change and keep wasting shares on the old pool.
+async fn reconnect_all(s: &AppState, worker: &str) -> usize {
+    let sessions = s.registry.get_all(worker).await;
+    for sess in &sessions {
         sess.force_reconnect();
     }
     sessions.len()
@@ -469,9 +470,8 @@ struct OrderReq {
     budget: f64,
 }
 
-/// Create a rental order: records it and, if the worker is connected, switches
-/// its hashrate to the buyer's target now. `applied=false` means the order is
-/// stored and will take effect when the miner connects.
+/// Create a rental order for a delivering rig: records it and reconnects the
+/// rig's miners onto the buyer's pool. `reconnected` counts the miners dropped.
 async fn create_order(
     State(s): State<AppState>,
     Json(req): Json<OrderReq>,
@@ -516,14 +516,7 @@ async fn create_order(
             }
         }
     }
-    // An already-rented rig (live order) can't be rented again.
-    if s.orders
-        .active_for_worker(&req.worker, now_ms())
-        .await
-        .is_some()
-    {
-        return Err((StatusCode::CONFLICT, "rig is already rented".into()));
-    }
+    rented_guard(&s, &req.worker).await?;
     // Only rigs currently delivering hashrate can be rented (summed across all
     // of the rig's miners).
     let live_hashrate = s
@@ -570,20 +563,15 @@ async fn create_order(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
         }
     };
-    let sessions = s.registry.get_all(&req.worker).await;
     // Reconnect every connected miner of the rig; each lands on the new rental's
-    // buyer pool (failover handled at the connect path). Partial success is fine:
-    // billing is pay-as-you-hash (the buyer is charged for measured delivered work
-    // and the unspent prepaid budget is refunded when the order ends), so a miner
-    // that doesn't come back simply delivers less. The response reports switched/of.
-    let switched = reconnect_all(&sessions);
-    let applied = switched > 0;
+    // buyer pool (failover handled at the connect path). Billing is
+    // pay-as-you-hash on measured delivered work, so a miner that doesn't come
+    // back simply delivers less.
+    let reconnected = reconnect_all(&s, &req.worker).await;
     Ok(Json(json!({
         "ok": true,
         "order": order_json(&order),
-        "applied": applied,
-        "switched": switched,
-        "of": sessions.len(),
+        "reconnected": reconnected,
     })))
 }
 
@@ -597,11 +585,8 @@ async fn cancel_order(
         .cancel(&id)
         .await
         .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
-    let sessions = s.registry.get_all(&order.worker).await;
-    let reverted = reconnect_all(&sessions);
-    Ok(Json(
-        json!({"ok": true, "reverted": reverted, "of": sessions.len()}),
-    ))
+    let reconnected = reconnect_all(&s, &order.worker).await;
+    Ok(Json(json!({"ok": true, "reconnected": reconnected})))
 }
 
 #[cfg(test)]

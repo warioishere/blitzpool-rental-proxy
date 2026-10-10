@@ -21,15 +21,13 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::registry::Registry;
-use crate::session::UpstreamTarget;
+use crate::session::{UpstreamTarget, DIFF1_HASHES};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Hashes in one TH·day: 1e12 H/s × 86400 s. Used to turn measured work into
 /// the billable TH·day quantity.
 const HASHES_PER_TH_DAY: f64 = 1e12 * 86_400.0;
-/// Hashes per diff-1 share (2^32).
-const DIFF1_HASHES: f64 = 4_294_967_296.0;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()

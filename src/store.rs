@@ -63,8 +63,9 @@ impl SellerStore {
     }
 
     pub async fn get(&self, worker: &str) -> Option<Rig> {
-        let row = sqlx::query!(
-            "SELECT pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
+        let row = sqlx::query_as!(
+            RigRow,
+            "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
              price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, \
              max_rental_secs \
              FROM rigs WHERE worker = ?",
@@ -73,22 +74,7 @@ impl SellerStore {
         .fetch_optional(&self.pool)
         .await;
         match row {
-            Ok(Some(r)) => Some(Rig {
-                default_pool: UpstreamTarget {
-                    url: r.pool_url,
-                    user: r.pool_user,
-                    password: r.pool_password,
-                    authority_pubkey: r.pool_authority,
-                },
-                advertised_ths: r.advertised_ths,
-                price_per_th_day: r.price_per_th_day,
-                price_min_per_th_day: r.price_min_per_th_day,
-                price_max_per_th_day: r.price_max_per_th_day,
-                payout_address: r.payout_address,
-                rentable: r.rentable != 0,
-                max_rental_secs: r.max_rental_secs,
-            }),
-            Ok(None) => None,
+            Ok(r) => r.map(|r| r.into_rig().1),
             Err(e) => {
                 warn!(worker, error = %e, "rig lookup failed");
                 None
@@ -154,36 +140,18 @@ impl SellerStore {
     }
 
     pub async fn list(&self) -> HashMap<String, Rig> {
-        let rows = sqlx::query!(
+        sqlx::query_as!(
+            RigRow,
             "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
              price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, \
              max_rental_secs FROM rigs"
         )
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|r| {
-                (
-                    r.worker,
-                    Rig {
-                        default_pool: UpstreamTarget {
-                            url: r.pool_url,
-                            user: r.pool_user,
-                            password: r.pool_password,
-                            authority_pubkey: r.pool_authority,
-                        },
-                        advertised_ths: r.advertised_ths,
-                        price_per_th_day: r.price_per_th_day,
-                        price_min_per_th_day: r.price_min_per_th_day,
-                        price_max_per_th_day: r.price_max_per_th_day,
-                        payout_address: r.payout_address,
-                        rentable: r.rentable != 0,
-                        max_rental_secs: r.max_rental_secs,
-                    },
-                )
-            })
-            .collect()
+        .unwrap_or_default()
+        .into_iter()
+        .map(RigRow::into_rig)
+        .collect()
     }
 
     /// All rigs belonging to a seller: the worker exactly equals `address`, or
@@ -191,7 +159,8 @@ impl SellerStore {
     /// by the seller dashboard to list that seller's own rigs.
     pub async fn list_for_seller(&self, address: &str) -> HashMap<String, Rig> {
         let prefix = format!("{address}.%");
-        let rows = sqlx::query!(
+        sqlx::query_as!(
+            RigRow,
             "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, \
              price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, \
              max_rental_secs \
@@ -201,29 +170,49 @@ impl SellerStore {
         )
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|r| {
-                (
-                    r.worker,
-                    Rig {
-                        default_pool: UpstreamTarget {
-                            url: r.pool_url,
-                            user: r.pool_user,
-                            password: r.pool_password,
-                            authority_pubkey: r.pool_authority,
-                        },
-                        advertised_ths: r.advertised_ths,
-                        price_per_th_day: r.price_per_th_day,
-                        price_min_per_th_day: r.price_min_per_th_day,
-                        price_max_per_th_day: r.price_max_per_th_day,
-                        payout_address: r.payout_address,
-                        rentable: r.rentable != 0,
-                        max_rental_secs: r.max_rental_secs,
-                    },
-                )
-            })
-            .collect()
+        .unwrap_or_default()
+        .into_iter()
+        .map(RigRow::into_rig)
+        .collect()
+    }
+}
+
+/// Flat `rigs` row → `(worker, Rig)`.
+struct RigRow {
+    worker: String,
+    pool_url: String,
+    pool_user: String,
+    pool_password: String,
+    pool_authority: Option<String>,
+    advertised_ths: f64,
+    price_per_th_day: f64,
+    price_min_per_th_day: f64,
+    price_max_per_th_day: f64,
+    payout_address: Option<String>,
+    rentable: i64,
+    max_rental_secs: i64,
+}
+
+impl RigRow {
+    fn into_rig(self) -> (String, Rig) {
+        (
+            self.worker,
+            Rig {
+                default_pool: UpstreamTarget {
+                    url: self.pool_url,
+                    user: self.pool_user,
+                    password: self.pool_password,
+                    authority_pubkey: self.pool_authority,
+                },
+                advertised_ths: self.advertised_ths,
+                price_per_th_day: self.price_per_th_day,
+                price_min_per_th_day: self.price_min_per_th_day,
+                price_max_per_th_day: self.price_max_per_th_day,
+                payout_address: self.payout_address,
+                rentable: self.rentable != 0,
+                max_rental_secs: self.max_rental_secs,
+            },
+        )
     }
 }
 

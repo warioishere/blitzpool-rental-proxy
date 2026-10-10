@@ -1,61 +1,66 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT pool_url, pool_user, pool_password, pool_authority, advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, max_rental_secs FROM rigs WHERE worker = ?",
+  "query": "SELECT worker, pool_url, pool_user, pool_password, pool_authority, advertised_ths, price_per_th_day, price_min_per_th_day, price_max_per_th_day, payout_address, rentable, max_rental_secs FROM rigs WHERE worker = ?",
   "describe": {
     "columns": [
       {
-        "name": "pool_url",
+        "name": "worker",
         "ordinal": 0,
         "type_info": "Text"
       },
       {
-        "name": "pool_user",
+        "name": "pool_url",
         "ordinal": 1,
         "type_info": "Text"
       },
       {
-        "name": "pool_password",
+        "name": "pool_user",
         "ordinal": 2,
         "type_info": "Text"
       },
       {
-        "name": "pool_authority",
+        "name": "pool_password",
         "ordinal": 3,
         "type_info": "Text"
       },
       {
-        "name": "advertised_ths",
+        "name": "pool_authority",
         "ordinal": 4,
-        "type_info": "Float"
+        "type_info": "Text"
       },
       {
-        "name": "price_per_th_day",
+        "name": "advertised_ths",
         "ordinal": 5,
         "type_info": "Float"
       },
       {
-        "name": "price_min_per_th_day",
+        "name": "price_per_th_day",
         "ordinal": 6,
         "type_info": "Float"
       },
       {
-        "name": "price_max_per_th_day",
+        "name": "price_min_per_th_day",
         "ordinal": 7,
         "type_info": "Float"
       },
       {
-        "name": "payout_address",
+        "name": "price_max_per_th_day",
         "ordinal": 8,
+        "type_info": "Float"
+      },
+      {
+        "name": "payout_address",
+        "ordinal": 9,
         "type_info": "Text"
       },
       {
         "name": "rentable",
-        "ordinal": 9,
+        "ordinal": 10,
         "type_info": "Integer"
       },
       {
         "name": "max_rental_secs",
-        "ordinal": 10,
+        "ordinal": 11,
         "type_info": "Integer"
       }
     ],
@@ -63,6 +68,7 @@
       "Right": 1
     },
     "nullable": [
+      false,
       false,
       false,
       false,
@@ -76,5 +82,5 @@
       false
     ]
   },
-  "hash": "96f8d655fd33a70cdf9d03952152c63e2d55648762d0dde76e93e8deab23c90f"
+  "hash": "3f02268f9ff64b06a12b74124ad3440b6a7edb2a314ae9a2fda6a6f5cc33497c"
 }
