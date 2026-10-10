@@ -14,11 +14,9 @@ use crate::control::{accept_ratio, accept_ratio_low, SessionStatus};
 pub const DIFF1_HASHES: f64 = 4_294_967_296.0;
 
 /// Turn a pool address the way buyers and sellers type it into the `host:port`
-/// the relays connect with. Miner menus teach `stratum+tcp://host:port`, and
-/// that prefix used to reach the resolver verbatim: `TcpStream::connect` took
-/// the whole string as the host name and failed every time. A rental declared
-/// that way ran 2026-09-13 for 38 minutes at zero delivery (`stratum+tcp://
-/// stratum.braiins.com:3333`), while every earlier order had been typed bare.
+/// the relays connect with. Miner menus teach `stratum+tcp://host:port`;
+/// `TcpStream::connect` takes the whole string as the host name, so the scheme
+/// must go before anything is stored, or every connect of the order fails.
 ///
 /// Only the plain-TCP schemes are stripped; anything else (`stratum+ssl://`,
 /// `ssl://`, `http://`) names a transport the proxy cannot speak and is refused
@@ -320,7 +318,6 @@ mod pool_url_tests {
 
     #[test]
     fn the_scheme_miner_menus_teach_is_stripped() {
-        // The exact string of the 2026-09-13 order.
         assert_eq!(
             normalize_pool_url("stratum+tcp://stratum.braiins.com:3333").unwrap(),
             "stratum.braiins.com:3333"

@@ -3,10 +3,10 @@
 //! Persistent rig/seller store (SQLite, `rigs` table): each seller miner's
 //! worker name → its [`Rig`] (default pool + marketplace listing).
 //!
-//! Set via the API; the relay consults the default pool when a miner
-//! authorizes. A worker with no entry falls back to the process-wide default
-//! upstream. The marketplace fields (advertised hashrate, price) are what a
-//! buyer sees and what billing uses together with measured delivered work.
+//! Set via the API; the relays read the idle pool when a miner's worker
+//! becomes known. A worker with neither a row nor an active order is refused
+//! (register-only). The marketplace fields (advertised hashrate, price) are
+//! what a buyer sees.
 
 use std::collections::HashMap;
 use std::sync::Arc;

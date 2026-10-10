@@ -1,6 +1,5 @@
-//! End-to-end relay test over real loopback Noise sockets: a mock miner
-//! talks to the proxy, which relays to mock pool A; then a rental switch
-//! re-points it to mock pool B without the miner reconnecting.
+//! End-to-end relay tests over real loopback Noise sockets: mock miners talk
+//! to the proxy, which relays to mock pools and swaps between them.
 
 use super::*;
 use serde_json::json;
@@ -46,11 +45,9 @@ fn diff1_target() -> Vec<u8> {
 /// The job + prev-hash a pool sends **immediately after** an OpenSuccess, so
 /// the newly-opened channel has something to hash on.
 ///
-/// The mock pool has to do this to be a pool at all, and until 2026-08-13 it did
-/// not: it opened channels and then went silent. That is why no test could see
-/// `open_on` dropping the frames of an already-opened channel while the next one
-/// was still opening — the fixture never produced them. A harness that models a
-/// silent pool cannot fail on a bug about what a talking pool sends.
+/// The mock pool has to do this to be a pool at all: a harness that opens
+/// channels and then goes silent cannot catch `open_on` mishandling the frames
+/// of an already-opened channel while the next one is still opening.
 fn initial_job_frames(channel_id: u32, job_id: u32) -> [EitherFrame; 2] {
     let job = NewExtendedMiningJob {
         channel_id,
@@ -3116,7 +3113,8 @@ async fn validating_sv1_pool(listener: TcpListener, accepted: mpsc::UnboundedSen
             let (r, mut w) = sock.into_split();
             let mut lines = BufReader::new(r).lines();
             // Strict like ckpool: the submit worker must equal the authorized
-            // worker, else "Worker mismatch" — catches the authorize≠submit bug.
+            // worker, else "Worker mismatch" — catches authorize and submit
+            // using different worker names.
             let mut authorized_worker: Option<String> = None;
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -3671,9 +3669,8 @@ async fn reattach_reconciles_rig_onto_active_rental_pool() {
 async fn reattach_into_empty_grace_hull_routes_to_active_rental() {
     // Single-device rig: on rent its ONLY member force-reconnects, so between the
     // member leaving and reconnecting the rig is an empty grace-window hull (no
-    // channels). The reconnecting member must still land on the rented pool B —
-    // the field bug bundled it back onto idle A because the switch found "no
-    // channels to move" and gave up.
+    // channels). The reconnecting member must still land on the rented pool B,
+    // not bundle back onto idle A because the switch found no channels to move.
     let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a_addr = pool_a.local_addr().unwrap();
     let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3754,7 +3751,7 @@ async fn reattach_into_empty_grace_hull_routes_to_active_rental() {
         .unwrap();
 
     // Drop the only member → wait for the empty grace hull (present, memberless):
-    // this is the exact state the switch used to give up on with "no channels".
+    // the state in which the switch has no channels to move.
     drop(m1);
     loop {
         let empty = match sv2_rigs.get("bc1qSELLER.solo").await {
@@ -3880,14 +3877,13 @@ async fn a_real_sv2_pool_still_probes_clean() {
 /// proxy is already waiting for the NEXT channel's success. Those frames must
 /// reach the miners.
 ///
-/// Until 2026-08-13 `open_on` dropped them as "unexpected", so every channel but
-/// the last kept hashing its pre-reconnect job under an extranonce prefix the
-/// pool had reassigned. Measured on prod: ~200 rejected shares/min per rig
-/// (`job-not-found` / `difficulty-too-low`) until the proxy was restarted.
+/// Dropped, they would leave every channel but the last hashing a job under an
+/// extranonce prefix the pool has reassigned (`job-not-found` /
+/// `difficulty-too-low` on every share).
 ///
-/// The assertion is per channel, not a count: with three channels, the old code
-/// still delivered ONE job (the last channel's, read by the steady reader), so
-/// "at least one job arrived" would have passed on the bug.
+/// The assertion is per channel, not a count: with three channels a relay that
+/// drops them still delivers ONE job (the last channel's, read by the steady
+/// reader), so "at least one job arrived" would pass on the defect.
 #[tokio::test]
 async fn upstream_reopen_delivers_a_job_to_every_channel() {
     let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3948,7 +3944,7 @@ async fn upstream_reopen_delivers_a_job_to_every_channel() {
         "before any switch every channel must already have a job; got {on_a:?}"
     );
 
-    // Now the case the bug lived in: ONE re-open loop over all three channels.
+    // Now the case under test: ONE re-open loop over all three channels.
     let sess = loop {
         if let Some(s) = registry.get_all("bc1qSELLER.rig1").await.into_iter().next() {
             break s;
@@ -3976,14 +3972,9 @@ async fn upstream_reopen_delivers_a_job_to_every_channel() {
 ///
 /// `attach_member` refuses while the rig is `translating`, and rightly so — a
 /// translated rig speaks one SV1 connection and cannot multiplex a second
-/// member onto it. But the flag has to come back DOWN when the rig returns to
-/// SV2, and only `connect_and_install_initial` ever cleared it, which runs for
-/// a brand-new session and never for a swap.
-///
-/// Measured on prod 2026-08-23: a pool restart made the rig fail over to SV1
-/// for 31 ms, then straight back to SV2. Three same-rig miners reconnected two
-/// seconds later, were each refused by the stale flag, and came up as three
-/// standalone sessions — the rig stayed split until they reconnected again.
+/// member onto it. But the flag has to come back DOWN when a swap returns the
+/// rig to SV2, or same-rig miners reconnecting afterwards are each refused and
+/// come up as standalone sessions.
 #[tokio::test]
 async fn a_rig_that_came_back_from_translation_bundles_again() {
     // Idle pool speaks SV2 → the rig registers as the bundle target, as on prod.
@@ -4119,13 +4110,10 @@ async fn a_rig_that_came_back_from_translation_bundles_again() {
 /// other frame is re-emitted already-serialized. The SV1 translate writer calls
 /// `payload()` on everything it is handed, which panics on a built frame.
 ///
-/// Both channel-OPEN paths already refuse a translated upstream
-/// (`attach_member` returns `None`, the serve loop answers "additional channels
-/// are not supported on an SV1 upstream"). `detach_member` had no such guard.
-///
-/// Seen on prod 2026-08-23: the rig failed over to SV1, the miners were forced
-/// to reconnect, and the three `member left` lines are immediately followed by
-/// `Sv2Frame is not yet serialized.` on a tokio worker.
+/// Both channel-OPEN paths refuse a translated upstream (`attach_member`
+/// returns `None`, the serve loop answers "additional channels are not
+/// supported on an SV1 upstream"); `detach_member` must not send a close there
+/// either, or the writer dies with `Sv2Frame is not yet serialized.`
 ///
 /// The writer runs in a spawned task, so its death is invisible to the test
 /// harness — the assertion goes through a panic hook instead, chained so a
@@ -4235,11 +4223,10 @@ async fn a_member_leaving_a_translated_rig_does_not_panic_the_writer() {
 
 #[tokio::test]
 async fn a_failed_attach_switch_is_retried_until_the_rental_pool_answers() {
-    // 2026-09-13 in the field: three members attached in the same second, the
-    // one TCP connect to the rental pool failed, and the rig mined for its
-    // seller until the buyer cancelled. The attach must keep retrying while
-    // the order is active, and land the rig on the rental once the pool is
-    // reachable again.
+    // Members attach while the one TCP connect to the rental pool fails. The
+    // attach must keep retrying while the order is active, and land the rig on
+    // the rental once the pool is reachable again, instead of mining for the
+    // seller for the rest of the order.
     let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a_addr = pool_a.local_addr().unwrap();
     let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
@@ -4352,9 +4339,9 @@ async fn a_failed_attach_switch_is_retried_until_the_rental_pool_answers() {
 
 #[tokio::test]
 async fn a_worker_with_an_active_order_but_no_seller_row_is_admitted_onto_the_rental() {
-    // 2026-09-16: the seller deleted his rig row mid-rental. The live session
-    // carried on, but the next reconnect was refused as unregistered while the
-    // buyer's order still ran. Admission is order OR rig, as on SV1.
+    // The seller's rig row is gone while the buyer's order still runs: the
+    // reconnect must be admitted onto the rental, not refused as unregistered.
+    // Admission is order OR rig, as on SV1.
     let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let b_addr = pool_b.local_addr().unwrap();
     let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();

@@ -7,10 +7,13 @@
 //!   GET  /api/sessions                      list live miners + status
 //!   GET  /api/sessions/{worker}             one session
 //!
+//!   GET|PUT|DELETE /api/sellers[/{worker}]   rig registration + listing
+//!   POST /api/sellers/{worker}/rentable      list/unlist a rig
+//!   GET  /api/sellers/{worker}/history       hashrate + rental history
+//!   GET|POST|DELETE /api/orders[/{id}]       rentals
+//!
 //! Rentals are driven through the orders layer (`POST /api/orders`), which gates,
 //! records, bills and auto-reverts. There is no raw session-switch endpoint.
-//!
-//! Seller-config + order endpoints are added by their modules (sellers/orders).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -45,9 +48,9 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    // Everything except health requires a valid bearer token. The pool sits
-    // behind pfSense (TLS termination); auth here is what keeps the control
-    // API safe to expose.
+    // Everything except health requires a valid bearer token. TLS terminates
+    // in front of the proxy; auth here is what keeps the control API safe to
+    // expose.
     let protected = Router::new()
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{worker}", get(get_session))
@@ -125,11 +128,9 @@ pub async fn serve(addr: String, state: AppState) -> anyhow::Result<()> {
 type ApiError = (StatusCode, String);
 
 /// A rig with a live rental is frozen: its seller row is neither edited nor
-/// deleted until the order ends. Seen 2026-09-16: a seller re-registered his
-/// rig under a new name and deleted the old row mid-rental. The live session
-/// kept routing (it reads the row only at connect), but the rig vanished from
-/// the hashrate history and the next reconnect would have been refused as
-/// unregistered while the buyer's order was still running.
+/// deleted until the order ends. The live session reads the row only at
+/// connect, so an edit would not reach it, and a deleted row drops the rig from
+/// the hashrate history while the buyer's order still runs.
 async fn rented_guard(s: &AppState, worker: &str) -> Result<(), ApiError> {
     if s.orders.active_for_worker(worker, now_ms()).await.is_some() {
         return Err((StatusCode::CONFLICT, "rig is already rented".into()));
@@ -448,8 +449,8 @@ struct OrderReq {
     /// SV2 only: pool Noise authority public key (base58).
     #[serde(default)]
     authority: Option<String>,
-    /// Optional fallback pool (same protocol as the rig) used when the primary
-    /// `url` is unreachable. Empty/absent = no fallback.
+    /// Optional fallback pool used when the primary `url` is unreachable.
+    /// Empty/absent = no fallback.
     #[serde(default)]
     fallback_url: String,
     #[serde(default)]
@@ -477,7 +478,8 @@ async fn create_order(
     Json(req): Json<OrderReq>,
 ) -> Result<Json<Value>, ApiError> {
     // Refuse a target the relays could never connect to before anything is
-    // stored: a bad url used to become a live order that mined for the seller.
+    // stored: an order on an unreachable url would leave the rig mining for
+    // its seller.
     let url = pool_url(&req.url)?;
     let fallback_url = if req.fallback_url.trim().is_empty() {
         None
@@ -534,7 +536,7 @@ async fn create_order(
         password: req.pass,
         authority_pubkey: req.authority,
     };
-    // Optional fallback pool (same protocol as the rig). Empty url = none.
+    // Optional fallback pool. Empty url = none.
     let fallback = fallback_url.map(|url| UpstreamTarget {
         url,
         user: req.fallback_user,
@@ -651,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_public() {
-        // No token needed for liveness checks (pfSense health probes).
+        // No token needed for liveness checks.
         let resp = app()
             .await
             .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
@@ -785,9 +787,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_order_target_the_proxy_cannot_reach_is_refused_before_it_is_stored() {
-        // 2026-09-13: `stratum+tcp://…` reached the resolver verbatim and the
-        // order lived on, mining for the seller. A scheme the proxy cannot
-        // speak is refused at the API; the miner-menu scheme is accepted
+        // A scheme the proxy cannot speak is refused at the API before
+        // anything is stored; the miner-menu scheme is accepted
         // (this worker is offline, so the request then fails on THAT, proving
         // the url check passed).
         let app = app().await;

@@ -41,44 +41,36 @@ seller miners ──▶  [ this proxy ]  ──▶  upstream pool
 ```
 
 Protocol-agnostic core:
-- **session** — `Idle(default_pool)` | `Rented(target, until)` + a rolling
-  share window for per-miner hashrate.
-- **router / control API** — driven by the web UI: register sellers + default
-  pools, start/stop rentals (the pool switch), buyer orders, configuration.
-- **accounting** — delivered hashrate per seller → billing (buyers) + payout
-  (sellers).
+- **session**: idle (the rig's own pool) or rented (an order's pool), plus a
+  rolling share window for per-miner hashrate.
+- **control API**: driven by the web UI; register rigs and idle pools,
+  start/stop rentals, order history.
+- **accounting**: delivered work per order (accepted shares × difficulty),
+  the basis for billing (buyers) and payout (sellers).
 
-Pluggable protocol adapters (`src/proto/`):
-- **downstream** — Stratum server: accept seller miners.
-- **upstream** — Stratum client: one connection per session, **swappable at
-  runtime**.
-- `sv1` and `sv2` (same session/router/accounting underneath), plus a
-  `translate` adapter that bridges the two in both directions.
+Protocol handling (`src/proto/`): an SV1 relay and an SV2 relay, each driving
+one miner connection with a **swappable upstream**, plus `translate`, which
+bridges the two protocols in both directions. SV1 and SV2 miners share one
+port; the first byte of each connection decides which relay serves it.
 
 ### The one hard problem: switching upstream
 
-A new upstream hands out a different extranonce + difficulty. Two cases:
-- **Operator-initiated change** (idle-pool edit, rent start, rent end) — the
-  proxy **forces the miner to reconnect** so it re-handshakes cleanly against
-  the new upstream (correct extranonce/difficulty from the first job). A live
-  re-point a miner might silently ignore would waste every share, so the
-  reconnect is the safe default here.
-- **Automatic failover** (the upstream pool *dies* mid-session) — the proxy
-  re-points in place: SV1 pushes `mining.set_extranonce` + `mining.set_difficulty`
-  + `mining.notify(clean)` (or `client.reconnect` if the miner can't take a live
-  extranonce); SV2 uses `SetExtranoncePrefix` + `SetTarget`. In-place keeps a
-  flapping pool from storming the miner with reconnects.
+A new upstream hands out a different extranonce + difficulty. Every pool
+change the miner did not start (idle-pool edit, rent start, rent end, and
+recovery after the upstream pool dropped) **forces the miner to reconnect**,
+so it re-handshakes cleanly against the new upstream, with the correct
+extranonce and difficulty from the first job. A live re-point cannot carry
+everything (SV2 has no message for a channel's extranonce *size*), and a miner
+that silently ignores one wastes every share.
 
-## Milestones
+## Build
 
-1. **Core pass-through (SV1)** — accept a miner, connect to one (default)
-   upstream, relay subscribe/authorize/notify/set_difficulty/submit, measure
-   per-miner hashrate. *(in progress)*
-2. **Switch (SV1)** — swap the upstream at runtime + extranonce handling +
-   control API (`set_target` / `clear_target`).
-3. **Rental layer** — buyer orders, allocation, auto-revert at order end,
-   accounting, web UI, seller/buyer configuration.
-4. **SV2 adapter** — second protocol adapter under the same core.
+```
+cargo build --release
+```
+
+SQL queries are checked at compile time against the committed `.sqlx/`
+cache; set `SQLX_OFFLINE=true` to build without a database.
 
 ## References (inspiration, not dependencies)
 

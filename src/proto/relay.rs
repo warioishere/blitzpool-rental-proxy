@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-connection SV1 relay with a **swappable upstream** (the M2 core).
+//! Per-connection SV1 relay with a swappable upstream.
 //!
 //! Full-proxy model: the proxy drives the upstream handshake itself
 //! (`configure`→`subscribe`→`authorize`) and synthesizes the miner-facing
 //! handshake (`mining.configure` reply + `mining.subscribe` reply carrying the
-//! upstream's extranonce). Because the proxy owns the miner-facing handshake,
-//! it can switch the upstream at runtime and just push a `mining.set_extranonce`
-//! to the miner — the downstream connection never drops.
+//! upstream's extranonce).
 //!
-//! - **idle**: relay to the seller's default upstream.
-//! - **rented**: [`Session::switch_to`] connects the buyer's target, swaps the
-//!   active upstream, and pushes `set_extranonce`; [`Session::revert`] goes
-//!   back to the default.
+//! SV1 only learns the worker at `mining.authorize`, after `mining.subscribe`
+//! has been answered, so the handshake runs against a bootstrap pool (or the
+//! pool a reconnect hint names). Once the worker is known the session moves to
+//! the worker's pool: live with `mining.set_extranonce` for an
+//! extranonce-capable miner, otherwise by `client.reconnect` straight onto it.
+//! Every later pool change the miner did not start (rent start or end,
+//! idle-pool edit, recovery after a dropped upstream) drops the connection so
+//! the miner re-handshakes.
 //!
 //! Submits are rewritten to the active upstream's account; accepted submits
 //! feed the per-miner hashrate window. A generation counter tags each upstream
@@ -55,8 +57,8 @@ const RECONNECT_HINT_TTL: Duration = Duration::from_secs(120);
 /// The wait ends as soon as the subscribe arrives — this is only the ceiling for
 /// miners that never send it (they then take the reconnect path). The miner can
 /// only send it after the authorize result has made the round trip, so this must
-/// exceed the link RTT: ~48ms was observed over the public IP/pfSense, so 250ms
-/// gives ample margin (50ms is enough only for LAN-local miners).
+/// exceed the link RTT: ~48ms was observed over a WAN link, so 250ms gives
+/// ample margin (50ms is enough only for LAN-local miners).
 const EXTRANONCE_GRACE: Duration = Duration::from_millis(250);
 
 /// Per-source-IP reconnect hints. When a miner that can't take a live
@@ -165,9 +167,8 @@ impl Session {
             .await
     }
 
-    /// Switch onto a rental order's pool with failover: try the order's primary
-    /// target, then its fallback if the primary is unreachable. Errors only if
-    /// both fail (same protocol as the rig — the proxy doesn't translate).
+    /// Switch onto a rental order's pool: its primary target, then its fallback
+    /// if the primary is unreachable. Errors only if both fail.
     pub async fn switch_to_order(self: &Arc<Self>, order_id: String) -> anyhow::Result<()> {
         let order = self
             .orders
@@ -202,8 +203,8 @@ impl Session {
     }
 
     /// Set the seller's configured default upstream and use it now (the miner
-    /// is idle). Applied when a miner authorizes and the seller store has a
-    /// per-worker default that differs from the process-wide default.
+    /// is idle). Applied when an extranonce-capable miner authorizes and its
+    /// rig's idle pool differs from the pool the handshake ran against.
     pub async fn set_default(self: &Arc<Self>, target: UpstreamTarget) -> anyhow::Result<()> {
         {
             self.inner.lock().await.default_target = target.clone();
@@ -266,15 +267,10 @@ impl Session {
                 .to_miner
                 .send(RpcMessage::set_extranonce(&en1, en2).to_line());
         } else {
-            // "May need a reconnect" was the whole of it: a warning, and then
-            // the miner was left running on an extranonce1 that no longer
-            // matches the upstream. Every share it submits from here on is
-            // built on the old prefix, so the pool rebuilds a different
-            // coinbase and rejects all of them — the SV1 half of what the SV2
-            // recovery path did until 2026-08-13.
-            //
-            // A non-capable miner cannot be told mid-session, so tell it the
-            // only way it understands: drop it and let it come back.
+            // Left connected, this miner would keep building on an extranonce1
+            // the new upstream does not know, and the pool would reject every
+            // share. It cannot be told mid-session, so drop it and let it come
+            // back.
             warn!(upstream = %target.url, "miner not extranonce-capable; reconnecting it onto the new upstream");
             self.force_reconnect();
         }

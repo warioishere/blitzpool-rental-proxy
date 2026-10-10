@@ -3,12 +3,12 @@
 //! Rental orders (SQLite, `orders` table): a buyer rents a worker's hashrate
 //! until a deadline and/or a prepaid budget.
 //!
-//! Creating an order switches the session to the buyer's target; a background
-//! expiry task reverts the session to its default when the deadline passes or
-//! the prepaid budget is consumed. Orders are persisted, so a rental is resumed
-//! when the miner reconnects (the relay checks for an active order on authorize)
-//! and finished orders are cleaned up after a restart. Measured delivered work
-//! (the billing basis) is accumulated durably here.
+//! Creating an order reconnects the rig's miners onto the buyer's target; a
+//! background expiry task reconnects them to the idle pool when the deadline
+//! passes or the prepaid budget is consumed. Orders are persisted, so a rental
+//! is resumed when the miner reconnects (the relays look up the active order
+//! when the worker becomes known) and finished orders are ended after a
+//! restart. Measured delivered work (the billing basis) is accumulated here.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,7 +61,8 @@ pub struct Order {
     pub target: UpstreamTarget,
     /// Optional fallback pool: if the proxy can't reach `target` (offline at the
     /// switch, or it drops mid-rental), it routes the rented hashrate here
-    /// instead. Same protocol as the rented rig (the proxy doesn't translate).
+    /// instead. Either protocol; the proxy translates when it differs from the
+    /// rig's.
     #[serde(default)]
     pub fallback: Option<UpstreamTarget>,
     pub created_ms: i64,

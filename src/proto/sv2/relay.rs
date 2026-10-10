@@ -8,20 +8,22 @@
 //! (Standard or Extended) onto the upstream, assigns the miner a stable
 //! downstream `channel_id`, and maps it to the upstream's `channel_id` on every
 //! frame. Most traffic (jobs, prev-hash, shares, set-target, set-extranonce) is
-//! forwarded by rewriting just the `channel_id` (see [`super::wire`]).
+//! forwarded by rewriting just the `channel_id` (see [`crate::proto::sv2::wire`]).
 //!
-//! On a rental switch the proxy opens a fresh channel on the buyer's upstream
-//! for every channel and re-points the miner with `SetExtranoncePrefix` +
-//! `SetTarget` — the downstream `channel_id`s are unchanged, so the miner never
-//! reconnects. The new upstream's jobs + prev-hash then stream through.
+//! An upstream swap ([`crate::proto::sv2::relay::Sv2Session::swap_upstream`]) opens every channel afresh
+//! on the new pool and re-points the miners with `SetExtranoncePrefix` +
+//! `SetTarget`. Pool changes the miners did not start are followed by a forced
+//! reconnect ([`crate::proto::sv2::relay::Sv2Session::force_reconnect`]), so the miners get the new pool
+//! through a fresh handshake; the swap keeps the rig's shared upstream current
+//! for the members that come back.
 //!
 //! Multiple mining channels per connection are supported. Every `OpenMiningChannel`
 //! — the miner's first as well as any additional one — is forwarded to the
 //! upstream as a `pending` open and finalized by the steady reader when its
 //! success arrives (assign a stable downstream id, map it, reply to the miner).
 //! Each channel maps its own downstream↔upstream `channel_id`. The only
-//! synchronous open is the switch re-open (see [`open_on`]), which must stage the
-//! new upstream before the atomic swap.
+//! synchronous open is the switch re-open (see [`crate::proto::sv2::relay::open_on`]),
+//! which must stage the new upstream before the atomic swap.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -144,10 +146,10 @@ async fn read_one(read: &mut Read) -> anyhow::Result<Sv2Frame> {
 /// whole point.
 ///
 /// The probe answers two different questions at once, and only one of them is
-/// about protocols. Collapsing them is what made a pool RESTART look like a
-/// pool that speaks SV1: the downgrade to translation is permanent (nothing
-/// re-probes SV2), so a rig that happened to retry inside the restart window
-/// stayed translated for the rest of its session.
+/// about protocols. Collapsing them would make a pool RESTART look like a pool
+/// that speaks SV1: the downgrade to translation is permanent (nothing
+/// re-probes SV2), so a rig that retried inside the restart window would stay
+/// translated for the rest of its session.
 pub(crate) enum ProbeFailure {
     /// No TCP connection could be established. The pool is down, restarting or
     /// unroutable, and it has said NOTHING about which protocol it speaks.
@@ -165,12 +167,10 @@ impl ProbeFailure {
     /// not there and must not buy the miner a protocol downgrade; `Ok` = the pool
     /// answered and did not speak SV2, so the caller may translate.
     ///
-    /// Both probe sites (initial connect and upstream swap) asked this question
-    /// with their own copy of the match. That is precisely how the bug this enum
-    /// exists for was written: one collect-all arm, duplicated, treating "down"
-    /// and "speaks SV1" alike. With the judgement here, a third failure class
-    /// forces a change in exactly one exhaustive match, and the sites keep only
-    /// what legitimately differs — what they DO to translate.
+    /// Both probe sites (initial connect and upstream swap) ask this question.
+    /// With the judgement here, a third failure class forces a change in
+    /// exactly one exhaustive match, and the sites keep only what legitimately
+    /// differs — what they DO to translate.
     fn allow_translation(self, url: &str) -> anyhow::Result<()> {
         match self {
             ProbeFailure::Unreachable(e) => {
@@ -297,12 +297,9 @@ pub(crate) async fn open_on(
             _ => {
                 // A frame for a channel opened EARLIER on this connection.
                 //
-                // The old reasoning here was that nothing can legitimately
-                // precede the success, because the pool cannot address a channel
-                // before it has assigned it. True for ONE channel — and this
-                // function runs once per channel on the SAME connection. The pool
-                // sends each channel's first NewExtendedMiningJob (31) +
-                // SetNewPrevHash (32) straight after ITS OpenSuccess, which is
+                // This function runs once per channel on the SAME connection.
+                // The pool sends each channel's first NewExtendedMiningJob (31)
+                // + SetNewPrevHash (32) straight after ITS OpenSuccess, which is
                 // while we are already waiting for the NEXT channel's success.
                 //
                 // They cannot be routed yet: the up→down channel map is only
@@ -310,14 +307,10 @@ pub(crate) async fn open_on(
                 // and replayed by the steady reader, which is the same path they
                 // would have taken had they arrived a moment later.
                 //
-                // Dropping them (which this did until 2026-08-13) left every
-                // channel but the last one with no job after a reconnect. Those
-                // miners kept hashing their pre-reconnect job under an extranonce
-                // prefix the pool had since reassigned, so every share came back
-                // job-not-found or difficulty-too-low — measured on prod as
-                // ~200 rejects/min per rig until the proxy was restarted, and
-                // amplified by the pool's vardiff dropping the target (1024 → 4)
-                // because it saw no accepted shares.
+                // Dropped, they would leave every channel but the last one
+                // without a job: those miners keep hashing a job under an
+                // extranonce prefix the pool has since reassigned, and every
+                // share comes back job-not-found or difficulty-too-low.
                 deferred.push(f);
                 continue;
             }
@@ -432,14 +425,12 @@ struct Inner {
     /// upstream `group_channel_id` → the downstream group id we handed the
     /// miners of that group.
     ///
-    /// This used to be a single `Option<u32>` on the assumption that "a 1:1 miner
-    /// connection has at most one group". That held for one miner per upstream
-    /// and was never revisited when same-rig miners started sharing one upstream:
-    /// with mixed firmware asking for different extranonce sizes, the pool opens
-    /// a SECOND group on the same connection, and collapsing both onto one
-    /// downstream id made every member receive both groups' jobs — a job built
-    /// for the wrong extranonce layout, which the miner then hashes and the pool
-    /// rejects.
+    /// A map, not one id per connection: with same-rig miners sharing one
+    /// upstream and mixed firmware asking for different extranonce sizes, the
+    /// pool opens a SECOND group on the same connection. Collapsing both onto
+    /// one downstream id would hand every member both groups' jobs — a job
+    /// built for the wrong extranonce layout, which the miner hashes and the
+    /// pool rejects.
     group_down: std::collections::HashMap<u32, u32>,
     /// proxy-assigned upstream request_id → (member, spec) for opens awaiting the
     /// upstream's success. Keyed by the UNIQUE upstream request_id (not the
@@ -487,8 +478,7 @@ impl Inner {
     ///
     /// Every install path goes through here — SV2 initial, SV2 swap,
     /// SV1-translate initial, SV1-translate swap. They differ in how the reader
-    /// is built (native vs translating) and in nothing else, and the three steps
-    /// below were written out four times before this existed.
+    /// is built (native vs translating) and in nothing else.
     ///
     /// Taking `&mut self` is the load-bearing part, not ceremony: it can only be
     /// called with the `inner` lock held. [`Sv2Session::on_upstream_frame`] drops
@@ -689,10 +679,8 @@ impl Sv2Session {
             .await
     }
 
-    /// Switch onto a rental order's pool with failover: try the order's primary
-    /// target, then its fallback if the primary is unreachable. Errors only if
-    /// both fail. Resolves the pools from the order store (same protocol as the
-    /// rig — the proxy doesn't translate).
+    /// Switch onto a rental order's pool: its primary target, then its fallback
+    /// if the primary is unreachable. Errors only if both fail.
     pub async fn switch_to_order(self: &Arc<Self>, order_id: String) -> anyhow::Result<()> {
         let order = self
             .orders
@@ -770,9 +758,8 @@ impl Sv2Session {
     /// the current upstream and [`Sv2Session::spawn_switch_retry`] keeps
     /// trying: nothing else would. The supervisor only wakes when the ACTIVE
     /// upstream dies, and here the active upstream is the seller's healthy
-    /// pool, so a rental that failed to connect once stayed unrouted for the
-    /// whole order (2026-09-13: three miners, one unreachable second, zero
-    /// shares delivered until the buyer cancelled).
+    /// pool, so a rental that failed to connect once would stay unrouted for
+    /// the whole order.
     async fn reconcile_routing(self: &Arc<Self>, desired: Option<&crate::orders::Order>) {
         let current = self.current_order_id().await;
         match (desired, current) {
@@ -887,7 +874,7 @@ impl Sv2Session {
         // and install it as `active` + set `routing` below (the re-open and
         // re-point loops are no-ops on empty `specs`), so the member that attaches
         // next opens its first channel straight on the new pool instead of
-        // bundling back onto the old (idle) one — the single-device rent bug.
+        // bundling back onto the old (idle) one.
 
         // Native first: re-open on SV2; if the new pool doesn't answer as SV2,
         // it's an SV1 buyer pool → translate the switch onto it. But an
@@ -963,13 +950,10 @@ impl Sv2Session {
             let abandoned = i.take_pending_opens();
             i.routing = routing;
             // Back on a native SV2 upstream: this rig can multiplex again.
-            // `swap_to_sv1_translate` sets this flag and only
-            // `connect_and_install_initial` ever cleared it — which runs for a
-            // fresh session, never for a swap. Left stale, `attach_member`
-            // refuses every same-rig miner and the rig silently splits into
-            // standalone sessions. Reaching here means `probe_sv2` accepted the
-            // target: the SV1 case returned through `swap_to_sv1_translate`
-            // above.
+            // Left set, `attach_member` would refuse every same-rig miner and
+            // the rig would split into standalone sessions. Reaching here
+            // means `probe_sv2` accepted the target: the SV1 case returned
+            // through `swap_to_sv1_translate` above.
             i.translating = false;
             abandoned
         };
@@ -1859,9 +1843,8 @@ pub async fn handle_seller_miner_sv2(
         parse_miner_open(&mut open_frame).ok_or_else(|| anyhow!("expected OpenMiningChannel"))?;
 
     // 4. Register-only: the worker is admitted when it has a registered rig
-    //    (its idle pool) OR an active order, the same rule the SV1 relay applies.
-    //    Requiring the rig row alone locked a rented rig out after its seller
-    //    deleted the row mid-rental (2026-09-16) while the buyer's order ran.
+    //    (its idle pool) OR an active order, the same rule the SV1 relay applies,
+    //    so a rented rig is still served while the buyer's order runs.
     let idle_target = ctx.sellers.default_pool(&worker).await;
 
     // 5. Decide where the first channel opens: straight on the buyer's pool if a
@@ -2016,7 +1999,7 @@ pub async fn handle_seller_miner_sv2(
         }
     };
 
-    // 9. Downstream loop: open additional channels and forward shares/updates
+    // 7. Downstream loop: open additional channels and forward shares/updates
     //    upstream (channel-id remapped per channel).
     let result: anyhow::Result<()> = async {
         loop {
