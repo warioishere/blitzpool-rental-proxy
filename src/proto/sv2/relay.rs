@@ -365,76 +365,6 @@ fn spawn_upstream_reader(
     })
 }
 
-/// Per-session supervisor: when the active upstream drops while a rental is in
-/// effect, reconnect to the order's pool (primary→fallback); when an idle pool
-/// drops, reconnect the seller's default. Retries with capped backoff. Each
-/// reconnect bumps the generation, so a recovered/superseded session ends the
-/// retry loop; stale signals (from an already-swapped reader) are ignored.
-async fn supervise_upstream(session: Arc<Sv2Session>, mut died_rx: mpsc::UnboundedReceiver<u64>) {
-    while let Some(gen) = died_rx.recv().await {
-        if session.inner.lock().await.active.generation != gen {
-            continue; // stale (already swapped away)
-        }
-        warn!(gen, "sv2 upstream dropped — reconnecting/failing over");
-        let mut backoff = Duration::from_millis(500);
-        loop {
-            let order_id = {
-                let i = session.inner.lock().await;
-                if i.active.generation != gen {
-                    None // re-established, or reverted/switched elsewhere
-                } else {
-                    match &i.routing {
-                        Routing::Rented { order_id } => Some(Some(order_id.clone())),
-                        Routing::Idle => Some(None),
-                    }
-                }
-            };
-            let res = match order_id {
-                None => break,
-                Some(Some(oid)) => session.switch_to_order(oid).await,
-                Some(None) => session.revert().await,
-            };
-            match res {
-                Ok(()) => {
-                    // Drop the miners so they come back on a fresh channel,
-                    // rather than leaving them live-re-pointed onto the new
-                    // upstream.
-                    //
-                    // This is the rule the operator paths already follow — see
-                    // `api::reconnect_all` and the rental-expiry sweep, both of
-                    // which force a reconnect precisely because "miners ignore a
-                    // mid-session extranonce change and keep wasting shares".
-                    // Recovery after a dropped upstream is the same situation and
-                    // was the one path still re-pointing in place.
-                    //
-                    // A re-point cannot carry everything the miner needs:
-                    // `SetExtranoncePrefix` changes the prefix but SV2 has no way
-                    // to change the extranonce *size* a channel was opened with,
-                    // and a re-opened channel gets whatever the pool assigns this
-                    // time. Measured on prod 2026-08-13: after a pool restart the
-                    // re-pointed rig produced only hash-0 shares
-                    // (`difficulty-too-low (0.000000)`) plus `job-not-found`,
-                    // ~200/min, until the proxy was restarted by hand — a
-                    // restart being exactly the reconnect this now does by
-                    // itself. The cost is one reconnect per miner; the old
-                    // behaviour cost every share until someone noticed.
-                    session.force_reconnect();
-                    info!(
-                        gen,
-                        "sv2 upstream re-established after drop — reconnecting miners"
-                    );
-                    break;
-                }
-                Err(e) => {
-                    warn!(error = %e, "sv2 reconnect failed; backing off");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                }
-            }
-        }
-    }
-}
-
 // ── session ─────────────────────────────────────────────────────────
 
 struct ActiveUpstream {
@@ -734,10 +664,9 @@ pub struct Sv2Session {
     orders: Arc<OrderStore>,
     /// Fired by [`Sv2Session::force_reconnect`] to drop the miner connections so
     /// they reconnect and re-resolve their upstream from current state. Used for
-    /// operator-initiated pool changes (idle-pool edit, rent start, rent
-    /// end/cancel) where a live re-point would risk the miner mining on a stale
-    /// extranonce. Automatic upstream failover does NOT use this (it re-points in
-    /// place) so a flapping pool can't storm the miner with reconnects.
+    /// every pool change the miners did not start: operator changes (idle-pool
+    /// edit, rent start, rent end/cancel), recovery after a dropped upstream
+    /// ([`crate::control::supervise_upstream`]) and a completed attach retry.
     ///
     /// A `watch` epoch, not a `Notify`: EVERY bundled member holds its own
     /// receiver, so one signal drops all of them (`notify_one` woke exactly one
@@ -814,6 +743,12 @@ impl Sv2Session {
     /// the order store, so the fresh resolve right after subscription sees it.
     fn subscribe_reconnect(&self) -> watch::Receiver<u64> {
         self.reconnect.subscribe()
+    }
+
+    /// The rig's routing, if `generation` is still its active upstream.
+    pub async fn routing_if_active(&self, generation: u64) -> Option<Routing> {
+        let i = self.inner.lock().await;
+        (i.active.generation == generation).then(|| i.routing.clone())
     }
 
     /// The order this rig is routed to, `None` while idle.
@@ -2055,7 +1990,10 @@ pub async fn handle_seller_miner_sv2(
                 .insert(worker.clone(), AnySession::Sv2(session.clone()))
                 .await;
             // Supervisor owned by the rig (aborted only on last-member teardown).
-            let supervisor = tokio::spawn(supervise_upstream(session.clone(), died_rx));
+            let supervisor = tokio::spawn(crate::control::supervise_upstream(
+                AnySession::Sv2(session.clone()),
+                died_rx,
+            ));
             session.inner.lock().await.supervisor = Some(supervisor);
 
             // Become the bundle target for this worker only if the upstream is SV2

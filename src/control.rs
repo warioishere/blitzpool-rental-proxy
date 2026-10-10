@@ -7,7 +7,12 @@
 //! revert, set-default, status). A closed enum, one variant per protocol.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::session::Routing;
 #[cfg(test)]
 use crate::session::UpstreamTarget;
 
@@ -80,15 +85,35 @@ impl AnySession {
         }
     }
 
-    /// Route this session onto a rental order's pool, with primary→fallback
-    /// failover (the pools are resolved from the order). Production switches go
-    /// through [`AnySession::force_reconnect`]; this live-swap path is exercised
-    /// by the sv2 relay failover tests.
-    #[cfg(test)]
+    /// Connect a rental order's pool (primary, then fallback) and make it the
+    /// active upstream.
     pub async fn switch_to_order(&self, order_id: String) -> anyhow::Result<()> {
         match self {
             AnySession::Sv1(s) => s.switch_to_order(order_id).await,
             AnySession::Sv2(s) => s.switch_to_order(order_id).await,
+        }
+    }
+
+    /// Make the seller's idle pool the active upstream again.
+    async fn revert(&self) -> anyhow::Result<()> {
+        match self {
+            AnySession::Sv1(s) => s.revert().await,
+            AnySession::Sv2(s) => s.revert().await,
+        }
+    }
+
+    /// The session's routing, if `generation` is still its active upstream.
+    async fn routing_if_active(&self, generation: u64) -> Option<Routing> {
+        match self {
+            AnySession::Sv1(s) => s.routing_if_active(generation).await,
+            AnySession::Sv2(s) => s.routing_if_active(generation).await,
+        }
+    }
+
+    fn protocol(&self) -> &'static str {
+        match self {
+            AnySession::Sv1(_) => "sv1",
+            AnySession::Sv2(_) => "sv2",
         }
     }
 
@@ -117,6 +142,55 @@ impl AnySession {
             (AnySession::Sv1(a), AnySession::Sv1(b)) => Arc::ptr_eq(a, b),
             (AnySession::Sv2(a), AnySession::Sv2(b)) => Arc::ptr_eq(a, b),
             _ => false,
+        }
+    }
+}
+
+/// Per-session supervisor: when the active upstream drops, re-establish it
+/// with capped backoff — the order's pool (primary, then fallback) while
+/// rented, the seller's idle pool while idle — and then reconnect the miners.
+///
+/// The reconnect is the same rule every operator path follows: a miner gets a
+/// new pool through a fresh handshake, never through a live re-point. A
+/// re-point cannot carry everything the miner needs (SV2 has no message for
+/// the extranonce *size* a channel was opened with, and a re-opened channel
+/// gets whatever the pool assigns this time), and miners that ignore a
+/// mid-session extranonce change keep hashing work the pool rejects.
+///
+/// Readers report their generation on `died_rx` when their pool connection
+/// ends; a report for a generation that is no longer active (an intentional
+/// swap happened since) is ignored, and a swap made elsewhere ends the retry.
+pub async fn supervise_upstream(session: AnySession, mut died_rx: mpsc::UnboundedReceiver<u64>) {
+    let protocol = session.protocol();
+    while let Some(gen) = died_rx.recv().await {
+        if session.routing_if_active(gen).await.is_none() {
+            continue;
+        }
+        warn!(
+            gen,
+            protocol, "upstream dropped — reconnecting/failing over"
+        );
+        let mut backoff = Duration::from_millis(500);
+        while let Some(routing) = session.routing_if_active(gen).await {
+            let res = match routing.order_id() {
+                Some(order_id) => session.switch_to_order(order_id.to_string()).await,
+                None => session.revert().await,
+            };
+            match res {
+                Ok(()) => {
+                    session.force_reconnect();
+                    info!(
+                        gen,
+                        protocol, "upstream re-established after drop — reconnecting miners"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    warn!(protocol, error = %e, "upstream reconnect failed; backing off");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
         }
     }
 }

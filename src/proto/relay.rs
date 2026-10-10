@@ -148,9 +148,9 @@ pub struct Session {
     orders: Arc<crate::orders::OrderStore>,
     /// Fired by [`Session::force_reconnect`] to drop the miner connection so it
     /// reconnects and re-resolves its upstream from current state. Used for
-    /// operator-initiated pool changes (idle-pool edit, rent start, rent
-    /// end/cancel); automatic upstream failover re-points in place instead, so a
-    /// flapping pool can't storm the miner with reconnects.
+    /// every pool change the miner did not start: operator changes (idle-pool
+    /// edit, rent start, rent end/cancel) and recovery after a dropped upstream
+    /// ([`crate::control::supervise_upstream`]).
     reconnect: tokio::sync::Notify,
 }
 
@@ -178,6 +178,12 @@ impl Session {
             .connect_with_fallback(|target| self.switch_to(order_id.clone(), target))
             .await
             .map(drop)
+    }
+
+    /// The session's routing, if `generation` is still its active upstream.
+    pub async fn routing_if_active(&self, generation: u64) -> Option<Routing> {
+        let i = self.inner.lock().await;
+        (i.active.generation == generation).then(|| i.routing.clone())
     }
 
     /// Switch back to the seller's default upstream (a rental ends).
@@ -871,49 +877,6 @@ fn spawn_upstream_reader(
     })
 }
 
-/// Per-session supervisor: when the active upstream drops, reconnect with capped
-/// backoff — to the order's pool (primary→fallback) while rented, or the
-/// seller's default while idle. Generation-guarded; stale signals (from an
-/// already-swapped reader) are ignored.
-async fn supervise_upstream(session: Arc<Session>, mut died_rx: mpsc::UnboundedReceiver<u64>) {
-    while let Some(gen) = died_rx.recv().await {
-        if session.inner.lock().await.active.generation != gen {
-            continue; // stale (already swapped away)
-        }
-        warn!(gen, "sv1 upstream dropped — reconnecting/failing over");
-        let mut backoff = Duration::from_millis(500);
-        loop {
-            let action = {
-                let i = session.inner.lock().await;
-                if i.active.generation != gen {
-                    None
-                } else {
-                    match &i.routing {
-                        Routing::Rented { order_id } => Some(Some(order_id.clone())),
-                        Routing::Idle => Some(None),
-                    }
-                }
-            };
-            let res = match action {
-                None => break,
-                Some(Some(oid)) => session.switch_to_order(oid).await,
-                Some(None) => session.revert().await,
-            };
-            match res {
-                Ok(()) => {
-                    info!(gen, "sv1 upstream re-established after drop");
-                    break;
-                }
-                Err(e) => {
-                    warn!(error = %e, "sv1 reconnect failed; backing off");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                }
-            }
-        }
-    }
-}
-
 /// Drive one seller miner end to end. Connects the default upstream, answers
 /// the miner handshake (synthesizing configure + subscribe), registers the
 /// session under the miner's worker, then relays until either side closes.
@@ -1009,7 +972,10 @@ pub async fn handle_seller_miner(
         .install_raw(raw, generation, handshake_target.clone(), Routing::Idle)
         .await;
     // Supervisor: reconnect / fail over to the fallback if the upstream drops.
-    let supervisor = tokio::spawn(supervise_upstream(session.clone(), died_rx));
+    let supervisor = tokio::spawn(crate::control::supervise_upstream(
+        AnySession::Sv1(session.clone()),
+        died_rx,
+    ));
 
     info!(%peer, upstream = %handshake_target.url, "relay established (idle)");
 
@@ -1303,6 +1269,50 @@ mod tests {
         }
     }
 
+    /// An idle, extranonce-capable session connected to `target` (its idle
+    /// pool) as generation 0, reporting dropped upstreams on `died_tx`.
+    async fn idle_session_on(
+        target: &UpstreamTarget,
+        died_tx: mpsc::UnboundedSender<u64>,
+    ) -> Arc<Session> {
+        let conn = sv1::connect_pool(target, &target.user, None).await.unwrap();
+        let (to_miner, _to_miner_rx) = mpsc::unbounded_channel::<String>();
+        let (to_up, up_rx) = mpsc::unbounded_channel::<String>();
+        let session = Arc::new(Session {
+            to_miner,
+            switch: Mutex::new(()),
+            died_tx,
+            orders: crate::orders::OrderStore::new(crate::db::test_pool().await),
+            reconnect: tokio::sync::Notify::new(),
+            inner: Mutex::new(Inner {
+                active: ActiveUpstream {
+                    generation: 0,
+                    target: target.clone(),
+                    to_up,
+                    reader: tokio::spawn(async {}),
+                    writer: spawn_writer(conn.write, up_rx),
+                },
+                generation_counter: 0,
+                current_difficulty: 1.0,
+                pending: HashMap::new(),
+                delivery: Delivery::new(),
+                routing: Routing::Idle,
+                default_target: target.clone(),
+                configure: None,
+                extranonce_capable: true,
+                label: "bc1qSELLER.rig1".into(),
+                pending_prelude: Vec::new(),
+                extranonce1: String::new(),
+                extranonce2_size: 0,
+                translating: false,
+                subscribed: false,
+            }),
+        });
+        let reader = spawn_upstream_reader(session.clone(), 0, conn.read);
+        std::mem::replace(&mut session.inner.lock().await.active.reader, reader).abort();
+        session
+    }
+
     #[tokio::test]
     async fn switch_clears_orphaned_pending_submits() {
         // A switch must drop submit-credit entries left in flight on the old
@@ -1321,47 +1331,9 @@ mod tests {
             password: "x".into(),
             authority_pubkey: None,
         };
-        let conn = sv1::connect_pool(&target_a, &target_a.user, None)
-            .await
-            .unwrap();
-        let (to_miner, _to_miner_rx) = mpsc::unbounded_channel::<String>();
-        let (to_up, up_rx) = mpsc::unbounded_channel::<String>();
-        let up_writer = spawn_writer(conn.write, up_rx);
-        let session = Arc::new(Session {
-            to_miner,
-            switch: Mutex::new(()),
-            died_tx: mpsc::unbounded_channel().0,
-            orders: crate::orders::OrderStore::new(crate::db::test_pool().await),
-            reconnect: tokio::sync::Notify::new(),
-            inner: Mutex::new(Inner {
-                active: ActiveUpstream {
-                    generation: 0,
-                    target: target_a.clone(),
-                    to_up,
-                    reader: tokio::spawn(async {}),
-                    writer: up_writer,
-                },
-                generation_counter: 0,
-                current_difficulty: 1.0,
-                pending: HashMap::new(),
-                delivery: Delivery::new(),
-                routing: Routing::Idle,
-                default_target: target_a.clone(),
-                configure: None,
-                extranonce_capable: true,
-                label: "bc1qSELLER.rig1".into(),
-                pending_prelude: Vec::new(),
-                extranonce1: String::new(),
-                extranonce2_size: 0,
-                translating: false,
-                subscribed: false,
-            }),
-        });
+        let session = idle_session_on(&target_a, mpsc::unbounded_channel().0).await;
         {
-            let reader = spawn_upstream_reader(session.clone(), 0, conn.read);
             let mut i = session.inner.lock().await;
-            let old = std::mem::replace(&mut i.active.reader, reader);
-            old.abort();
             // Two submits awaiting upstream responses.
             i.pending.insert("1".into(), (0, 1000.0));
             i.pending.insert("2".into(), (0, 1000.0));
@@ -1378,6 +1350,39 @@ mod tests {
         assert!(
             session.inner.lock().await.pending.is_empty(),
             "switch cleared the orphaned pending submits"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_comes_back_reconnects_an_extranonce_capable_miner() {
+        // After its pool connection drops, the supervisor re-establishes the
+        // upstream and then drops the miner, even one that would accept a live
+        // `mining.set_extranonce`: recovery gives every miner a fresh handshake.
+        let pool = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = pool.local_addr().unwrap();
+        tokio::spawn(mock_sv1_pool(pool, "aaaa".into()));
+        let target = UpstreamTarget {
+            url: addr.to_string(),
+            user: "acctA".into(),
+            password: "x".into(),
+            authority_pubkey: None,
+        };
+        let (died_tx, died_rx) = mpsc::unbounded_channel();
+        let session = idle_session_on(&target, died_tx.clone()).await;
+        tokio::spawn(crate::control::supervise_upstream(
+            AnySession::Sv1(session.clone()),
+            died_rx,
+        ));
+
+        // The generation-0 reader reports its pool connection gone.
+        died_tx.send(0).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), session.reconnect.notified())
+            .await
+            .expect("miner reconnected after the upstream came back");
+        assert!(
+            session.inner.lock().await.active.generation > 0,
+            "the upstream was re-established before the reconnect"
         );
     }
 }
