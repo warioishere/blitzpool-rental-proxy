@@ -471,6 +471,23 @@ struct Channel {
     down_group_id: u32,
 }
 
+impl Channel {
+    /// The one synthesized channel of a translated SV1 upstream. Its upstream
+    /// id is the downstream id (there is no SV2 channel behind it) and it is
+    /// ungrouped (there is no SV2 group either).
+    fn translated(down_cid: u32, owner: u32, spec: OpenSpec, difficulty: f64) -> Self {
+        Self {
+            down_channel_id: down_cid,
+            up_channel_id: down_cid,
+            spec,
+            difficulty,
+            owner,
+            up_group_id: 0,
+            down_group_id: 0,
+        }
+    }
+}
+
 struct Inner {
     active: ActiveUpstream,
     generation_counter: u64,
@@ -567,6 +584,31 @@ impl Inner {
             reader,
             writer,
         };
+    }
+
+    /// Ask the active upstream to open a channel for `member`. The open is sent
+    /// under a proxy-assigned request_id that is unique on this upstream (the
+    /// miners' own ids can collide across bundled members) and is finalized by
+    /// the steady reader when the pool answers.
+    fn open_upstream_channel(&mut self, member: u32, spec: &OpenSpec) -> anyhow::Result<()> {
+        let account = crate::proto::relay::upstream_worker(&self.active.target.user, &self.label);
+        let up_req = self.next_up_req;
+        self.next_up_req += 1;
+        let frame = open_channel_upstream(spec, &account, up_req)?;
+        self.pending.insert(up_req, (member, spec.clone()));
+        self.active
+            .to_up
+            .send(frame)
+            .map_err(|_| anyhow!("upstream writer gone"))
+    }
+
+    /// Drop the opens still pending on the upstream being replaced, returning
+    /// `(member, request_id)` for each so the member can be told to reopen.
+    fn take_pending_opens(&mut self) -> Vec<(u32, u32)> {
+        self.pending
+            .drain()
+            .map(|(request_id, (member, _))| (member, request_id))
+            .collect()
     }
 
     fn up_for_down(&self, down_cid: u32) -> Option<u32> {
@@ -774,6 +816,16 @@ impl Sv2Session {
         self.reconnect.subscribe()
     }
 
+    /// The order this rig is routed to, `None` while idle.
+    async fn current_order_id(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .await
+            .routing
+            .order_id()
+            .map(str::to_string)
+    }
+
     /// Align the shared upstream with the current order state before bundling
     /// a new member. A live rig can sit on a stale upstream across a rent or
     /// cancel: the other members hold the rig alive while one reconnects, and
@@ -787,10 +839,7 @@ impl Sv2Session {
     /// whole order (2026-09-13: three miners, one unreachable second, zero
     /// shares delivered until the buyer cancelled).
     async fn reconcile_routing(self: &Arc<Self>, desired: Option<&crate::orders::Order>) {
-        let current = match &self.inner.lock().await.routing {
-            Routing::Rented { order_id, .. } => Some(order_id.clone()),
-            Routing::Idle => None,
-        };
+        let current = self.current_order_id().await;
         match (desired, current) {
             (Some(o), current) if current.as_deref() != Some(o.id.as_str()) => {
                 info!(order = %o.id, "attach: rig on stale upstream — switching to the active rental");
@@ -837,10 +886,7 @@ impl Sv2Session {
                     info!(%worker, "attach retry: no active rental any more; giving up");
                     return;
                 };
-                let current = match &session.inner.lock().await.routing {
-                    Routing::Rented { order_id, .. } => Some(order_id.clone()),
-                    Routing::Idle => None,
-                };
+                let current = session.current_order_id().await;
                 if current.as_deref() == Some(order.id.as_str()) {
                     return; // converged elsewhere
                 }
@@ -979,13 +1025,7 @@ impl Sv2Session {
             i.channels = new_channels;
             i.up_to_down = up_to_down;
             i.group_down = group_down;
-            // In-flight opens were sent to the old upstream; abandon them and
-            // tell the requesting member so it can reopen (rather than hang).
-            let abandoned: Vec<(u32, u32)> = i
-                .pending
-                .drain()
-                .map(|(request_id, (member, _))| (member, request_id))
-                .collect();
+            let abandoned = i.take_pending_opens();
             i.routing = routing;
             // Back on a native SV2 upstream: this rig can multiplex again.
             // `swap_to_sv1_translate` sets this flag and only
@@ -1009,13 +1049,7 @@ impl Sv2Session {
                 let _ = sink.send(set_target(down_cid, tgt)?);
             }
         }
-        for (member, request_id) in abandoned {
-            if let Ok(f) = open_channel_error(request_id, "upstream switched; please reopen") {
-                if let Some(sink) = members.get(&member) {
-                    let _ = sink.send(f);
-                }
-            }
-        }
+        refuse_abandoned_opens(&members, abandoned);
         info!(upstream = %target.url, generation, channels = specs.len(), "sv2 upstream switched");
         Ok(())
     }
@@ -1244,15 +1278,8 @@ impl Sv2Session {
             return None;
         }
         let member = i.add_member(sink);
-        let account = crate::proto::relay::upstream_worker(&i.active.target.user, &i.label);
-        let up_req = i.next_up_req;
-        i.next_up_req += 1;
-        match open_channel_upstream(spec, &account, up_req) {
-            Ok(f) => {
-                i.pending.insert(up_req, (member, spec.clone()));
-                let _ = i.active.to_up.send(f);
-            }
-            Err(e) => warn!(error = %e, "attach: additional channel open failed"),
+        if let Err(e) = i.open_upstream_channel(member, spec) {
+            warn!(error = %e, "attach: additional channel open failed");
         }
         Some(member)
     }
@@ -1678,18 +1705,18 @@ impl Sv2Session {
         routing: Routing,
         member: u32,
     ) -> anyhow::Result<()> {
-        let up_ident = crate::proto::relay::upstream_worker(&target.user, worker);
         // Native first: try SV2 (reusing its socket on success); if the pool
         // doesn't answer as SV2, it's an SV1 buyer pool → translate.
         // An unreachable pool says nothing about protocols, so it must not buy
         // the miner a permanent downgrade — fail, and let the connect retry.
         match probe_sv2(&target).await {
             Ok((read, write)) => {
-                self.install_sv2_initial(read, write, spec, up_ident, target, routing, member)
+                self.install_sv2_initial(read, write, spec, target, routing, member)
                     .await
             }
             Err(f) => {
                 f.allow_translation(&target.url)?;
+                let up_ident = crate::proto::relay::upstream_worker(&target.user, worker);
                 let conn = connect_sv1_upstream(&target, &up_ident).await?;
                 self.install_sv1_translate_initial(conn, spec, up_ident, target, routing, member)
                     .await
@@ -1699,13 +1726,11 @@ impl Sv2Session {
 
     /// Install an SV2 passthrough upstream and forward the miner's open (the
     /// steady reader finalizes it on the pool's OpenSuccess).
-    #[allow(clippy::too_many_arguments)] // wire-plumbing install path; cohesive args
     async fn install_sv2_initial(
         self: &Arc<Self>,
         read: Read,
         write: Write,
         spec: OpenSpec,
-        up_ident: String,
         target: UpstreamTarget,
         routing: Routing,
         member: u32,
@@ -1721,14 +1746,7 @@ impl Sv2Session {
         i.install_active(0, target, to_up, reader, writer);
         i.routing = routing;
         i.translating = false;
-        let up_req = i.next_up_req;
-        i.next_up_req += 1;
-        i.pending.insert(up_req, (member, spec.clone()));
-        i.active
-            .to_up
-            .send(open_channel_upstream(&spec, &up_ident, up_req)?)
-            .map_err(|_| anyhow!("upstream writer gone"))?;
-        Ok(())
+        i.open_upstream_channel(member, &spec)
     }
 
     /// Install an SV1 translation upstream: open the channel locally (synthesize
@@ -1742,7 +1760,6 @@ impl Sv2Session {
         routing: Routing,
         member: u32,
     ) -> anyhow::Result<()> {
-        let extended = spec.is_extended();
         let (down_cid, sink) = {
             let mut i = self.inner.lock().await;
             let c = i.next_down_cid;
@@ -1764,49 +1781,10 @@ impl Sv2Session {
             sink.send(open_success_downstream(&spec, down_cid, 0, &info)?)
                 .map_err(|_| anyhow!("miner writer gone"))?;
         }
-
-        let state = Arc::new(Mutex::new(Sv1UpState {
-            version_mask: conn.version_mask,
-            user_name: up_ident,
-            extended,
-            extranonce1: conn.extranonce1,
-            extranonce2_size: conn.extranonce2_size,
-            next_job_id: 1,
-            next_submit_id: 1,
-            ..Default::default()
-        }));
-        let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
-        let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
-        {
-            let mut i = self.inner.lock().await;
-            // Reader spawned inside the lock — see `Inner::install_active`.
-            let generation = i.active.generation;
-            let reader = spawn_sv1_translate_reader(
-                self.clone(),
-                generation,
-                conn.read,
-                state,
-                down_cid,
-                conn.prelude,
-            );
-            i.install_active(generation, target, to_up, reader, writer);
-            i.channels = vec![Channel {
-                down_channel_id: down_cid,
-                up_channel_id: down_cid,
-                spec,
-                difficulty: conn.initial_diff,
-                owner: member,
-                // A translated upstream is one SV1 connection collapsed onto a
-                // single synthesized channel: there is no SV2 group behind it.
-                up_group_id: 0,
-                down_group_id: 0,
-            }];
-            i.up_to_down = HashMap::from([(down_cid, down_cid)]);
-            i.group_down.clear();
-            i.pending.clear();
-            i.routing = routing;
-            i.translating = true;
-        }
+        let channel = Channel::translated(down_cid, member, spec, conn.initial_diff);
+        // A fresh session has no earlier upstream, so nothing was pending on it.
+        self.install_sv1_translated(conn, up_ident, target, routing, 0, channel)
+            .await;
         Ok(())
     }
 
@@ -1830,16 +1808,42 @@ impl Sv2Session {
                 None => bail!("no channel to switch"),
             }
         };
-        let extended = spec.is_extended();
         let conn = connect_sv1_upstream(&target, &up_ident)
             .await
             .map_err(|e| anyhow!("switch to {}: {e}", target.url))?;
         let initial_target = translate::target_from_difficulty(conn.initial_diff).to_vec();
         let extranonce1 = conn.extranonce1.clone();
+        let channel = Channel::translated(down_cid, owner, spec, conn.initial_diff);
+        let abandoned = self
+            .install_sv1_translated(conn, up_ident, target.clone(), routing, generation, channel)
+            .await;
+        // Re-point the channel's owner: new extranonce prefix + target; the reader
+        // streams the new pool's first job after.
+        if let Some(sink) = members.get(&owner) {
+            let _ = sink.send(set_extranonce_prefix(down_cid, extranonce1)?);
+            let _ = sink.send(set_target(down_cid, initial_target)?);
+        }
+        refuse_abandoned_opens(&members, abandoned);
+        info!(upstream = %target.url, generation, "sv2→sv1 upstream switched (translated)");
+        Ok(())
+    }
+
+    /// Make the SV1 pool behind `conn` the active upstream, translated onto the
+    /// single `channel`. Returns the opens that were still pending on the
+    /// upstream it replaces.
+    async fn install_sv1_translated(
+        self: &Arc<Self>,
+        conn: Sv1UpConn,
+        up_ident: String,
+        target: UpstreamTarget,
+        routing: Routing,
+        generation: u64,
+        channel: Channel,
+    ) -> Vec<(u32, u32)> {
         let state = Arc::new(Mutex::new(Sv1UpState {
             version_mask: conn.version_mask,
             user_name: up_ident,
-            extended,
+            extended: channel.spec.is_extended(),
             extranonce1: conn.extranonce1,
             extranonce2_size: conn.extranonce2_size,
             next_job_id: 1,
@@ -1848,54 +1852,39 @@ impl Sv2Session {
         }));
         let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
         let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
-        let abandoned: Vec<(u32, u32)> = {
-            let mut i = self.inner.lock().await;
-            // Reader spawned inside the lock — see `Inner::install_active`.
-            let reader = spawn_sv1_translate_reader(
-                self.clone(),
-                generation,
-                conn.read,
-                state,
-                down_cid,
-                conn.prelude,
-            );
-            i.install_active(generation, target.clone(), to_up, reader, writer);
-            i.channels = vec![Channel {
-                down_channel_id: down_cid,
-                up_channel_id: down_cid,
-                spec,
-                difficulty: conn.initial_diff,
-                owner,
-                // See the sibling path: no SV2 group behind a translated upstream.
-                up_group_id: 0,
-                down_group_id: 0,
-            }];
-            i.up_to_down = HashMap::from([(down_cid, down_cid)]);
-            i.group_down.clear();
-            let abandoned: Vec<(u32, u32)> = i
-                .pending
-                .drain()
-                .map(|(request_id, (member, _))| (member, request_id))
-                .collect();
-            i.routing = routing;
-            i.translating = true;
-            abandoned
-        };
-        // Re-point the channel's owner: new extranonce prefix + target; the reader
-        // streams the new pool's first job after.
-        if let Some(sink) = members.get(&owner) {
-            let _ = sink.send(set_extranonce_prefix(down_cid, extranonce1)?);
-            let _ = sink.send(set_target(down_cid, initial_target)?);
-        }
-        for (member, request_id) in abandoned {
-            if let Ok(f) = open_channel_error(request_id, "upstream switched; please reopen") {
-                if let Some(sink) = members.get(&member) {
-                    let _ = sink.send(f);
-                }
+        let down_cid = channel.down_channel_id;
+        let mut i = self.inner.lock().await;
+        // Reader spawned inside the lock — see `Inner::install_active`.
+        let reader = spawn_sv1_translate_reader(
+            self.clone(),
+            generation,
+            conn.read,
+            state,
+            down_cid,
+            conn.prelude,
+        );
+        i.install_active(generation, target, to_up, reader, writer);
+        i.channels = vec![channel];
+        i.up_to_down = HashMap::from([(down_cid, down_cid)]);
+        i.group_down.clear();
+        i.routing = routing;
+        i.translating = true;
+        i.take_pending_opens()
+    }
+}
+
+/// Answer every open that was pending on a replaced upstream with an error,
+/// so the member that asked reopens instead of waiting forever.
+fn refuse_abandoned_opens(
+    members: &HashMap<u32, mpsc::UnboundedSender<EitherFrame>>,
+    abandoned: Vec<(u32, u32)>,
+) {
+    for (member, request_id) in abandoned {
+        if let Ok(f) = open_channel_error(request_id, "upstream switched; please reopen") {
+            if let Some(sink) = members.get(&member) {
+                let _ = sink.send(f);
             }
         }
-        info!(upstream = %target.url, generation, "sv2→sv1 upstream switched (translated)");
-        Ok(())
     }
 }
 
@@ -2131,16 +2120,8 @@ pub async fn handle_seller_miner_sv2(
                         }
                         continue;
                     }
-                    let account =
-                        crate::proto::relay::upstream_worker(&i.active.target.user, &i.label);
-                    let up_req = i.next_up_req;
-                    i.next_up_req += 1;
-                    match open_channel_upstream(&open.spec, &account, up_req) {
-                        Ok(f) => {
-                            i.pending.insert(up_req, (member_id, open.spec.clone()));
-                            let _ = i.active.to_up.send(f);
-                        }
-                        Err(e) => warn!(%worker, error = %e, "additional channel open failed"),
+                    if let Err(e) = i.open_upstream_channel(member_id, &open.spec) {
+                        warn!(%worker, error = %e, "additional channel open failed");
                     }
                 }
             } else if wire::is_channel_scoped(mt) {
