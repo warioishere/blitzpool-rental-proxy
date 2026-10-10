@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::sv1::RpcMessage;
+use super::sv1::{self, PoolConn, RpcMessage};
 use super::ProxyContext;
 use crate::control::{AnySession, SessionStatus};
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
@@ -43,9 +43,6 @@ use stratum_core::bitcoin::hashes::hex::DisplayHex;
 use stratum_core::mining_sv2 as mining;
 use stratum_core::parsers_sv2::{AnyMessage, Mining};
 use stratum_core::sv1_api::{json_rpc as sv1_json, methods::client_to_server, utils::HexU32Be};
-
-/// Standard BIP320 version-rolling mask we advertise to the miner.
-const VERSION_ROLLING_MASK: &str = "1fffe000";
 
 type Tx = mpsc::UnboundedSender<String>;
 
@@ -452,7 +449,7 @@ const SV2_UP_MIN_EXTRANONCE: u16 = 4;
 /// before the reader runs (so the first job is never dropped as stale).
 enum RawUpstream {
     /// Same protocol as the miner: SV1 lines are forwarded verbatim.
-    Sv1(UpstreamConn),
+    Sv1(PoolConn),
     /// An SV2 buyer pool behind an SV1 miner: an open Extended channel whose jobs
     /// and shares are translated (see [`crate::proto::translate`]). Boxed — the
     /// Noise halves are far larger than the SV1 variant.
@@ -482,7 +479,7 @@ async fn connect_raw(
     // answer as SV1, it's an SV2 buyer pool → open an Extended channel + translate.
     match tokio::time::timeout(
         translate::UPSTREAM_PROBE_TIMEOUT,
-        connect_upstream(target, configure, user_identity),
+        sv1::connect_pool(target, user_identity, configure),
     )
     .await
     {
@@ -556,7 +553,7 @@ impl Session {
             RawUpstream::Sv1(conn) => {
                 let (to_up, rx) = mpsc::unbounded_channel::<String>();
                 let writer = spawn_writer(conn.write, rx);
-                let reader = spawn_upstream_reader(self.clone(), generation, conn.reader);
+                let reader = spawn_upstream_reader(self.clone(), generation, conn.read);
                 (
                     to_up,
                     reader,
@@ -888,120 +885,13 @@ impl Session {
 
     /// Answer a miner `mining.submit` with `result: true/false`.
     async fn send_submit_result(&self, id: Option<Value>, ok: bool) {
-        let reply = RpcMessage {
-            id,
-            method: None,
-            params: None,
-            result: Some(json!(ok)),
-            error: Some(if ok {
-                Value::Null
-            } else {
-                json!([20, "rejected", Value::Null])
-            }),
+        let reply = if ok {
+            RpcMessage::response(id, json!(true))
+        } else {
+            RpcMessage::refusal(id, 20, "rejected")
         };
         let _ = self.to_miner.send(reply.to_line());
     }
-}
-
-/// A connected + handshaken upstream, positioned for the streaming reader.
-struct UpstreamConn {
-    reader: BufReader<OwnedReadHalf>,
-    write: OwnedWriteHalf,
-    extranonce1: String,
-    extranonce2_size: u32,
-    /// Notifications (`set_difficulty`/`notify`) the pool sent during the
-    /// handshake, in order. Must be forwarded to the miner — otherwise it never
-    /// gets its initial difficulty (mines at "diff 0" → all shares rejected).
-    prelude: Vec<String>,
-}
-
-/// Connect to `target`, drive `configure`(replay)→`subscribe`→`authorize`, and
-/// return the stream positioned after the handshake plus the extranonce.
-async fn connect_upstream(
-    target: &UpstreamTarget,
-    configure: Option<&RpcMessage>,
-    user_identity: &str,
-) -> anyhow::Result<UpstreamConn> {
-    let stream = TcpStream::connect(&target.url).await?;
-    let _ = stream.set_nodelay(true);
-    let (r, mut w) = stream.into_split();
-    let mut reader = BufReader::new(r);
-    let mut prelude: Vec<String> = Vec::new();
-
-    if let Some(cfg) = configure {
-        w.write_all(cfg.to_line().as_bytes()).await?;
-        let _ = read_response(&mut reader, &mut prelude).await?; // discard upstream configure reply
-    }
-
-    let sub = RpcMessage::request(json!(1), "mining.subscribe", json!(["bp-proxy"]));
-    w.write_all(sub.to_line().as_bytes()).await?;
-    let sub_resp = read_response(&mut reader, &mut prelude).await?;
-    let (extranonce1, extranonce2_size) =
-        parse_subscribe_result(&sub_resp).ok_or_else(|| anyhow::anyhow!("bad subscribe result"))?;
-
-    // Authorize with the worker we submit under (matches the submit's worker so
-    // strict pools don't reject every share as "Worker mismatch").
-    let auth = RpcMessage::request(
-        json!(2),
-        "mining.authorize",
-        json!([user_identity, target.password]),
-    );
-    w.write_all(auth.to_line().as_bytes()).await?;
-    read_response(&mut reader, &mut prelude)
-        .await?
-        .check_authorized()?;
-
-    Ok(UpstreamConn {
-        reader,
-        write: w,
-        extranonce1,
-        extranonce2_size,
-        prelude,
-    })
-}
-
-/// Read lines until a *response* (has `result`/`error`, no `method`). Any
-/// notifications (`set_difficulty`/`notify`) that interleave the handshake are
-/// pushed to `prelude` so the caller can forward them to the miner — the pool's
-/// initial `set_difficulty`+`notify` arrive here, and dropping them leaves the
-/// miner mining at "diff 0" (every share rejected as "Difficulty too low").
-async fn read_response(
-    reader: &mut BufReader<OwnedReadHalf>,
-    prelude: &mut Vec<String>,
-) -> anyhow::Result<RpcMessage> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            anyhow::bail!("upstream closed during handshake");
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(msg) = RpcMessage::parse(trimmed) {
-            if msg.method.is_none() {
-                return Ok(msg);
-            }
-            // Keep the newline — the writer sends lines verbatim, and stratum is
-            // newline-delimited. Without it this notification glues onto the next
-            // message (e.g. set_difficulty + authorize result run together) and
-            // the miner only parses the first, missing the authorize result.
-            prelude.push(format!("{trimmed}\n"));
-        }
-    }
-}
-
-/// `mining.subscribe` result shape: `[subscriptions, extranonce1, en2_size]`.
-fn parse_subscribe_result(msg: &RpcMessage) -> Option<(String, u32)> {
-    let arr = msg.result.as_ref()?.as_array()?;
-    if arr.len() < 3 {
-        return None;
-    }
-    let en1 = arr[1].as_str()?.to_string();
-    let en2 = arr[2].as_u64()? as u32;
-    Some((en1, en2))
 }
 
 fn spawn_writer(
@@ -1222,16 +1112,13 @@ pub async fn handle_seller_miner(
                     // Synthesize an accept (standard BIP320 mask); remember it
                     // to replay to upstreams.
                     session.inner.lock().await.configure = Some(msg.clone());
-                    let reply = RpcMessage {
-                        id: msg.id.clone(),
-                        method: None,
-                        params: None,
-                        result: Some(json!({
+                    let reply = RpcMessage::response(
+                        msg.id.clone(),
+                        json!({
                             "version-rolling": true,
-                            "version-rolling.mask": VERSION_ROLLING_MASK
-                        })),
-                        error: Some(Value::Null),
-                    };
+                            "version-rolling.mask": sv1::version_rolling_mask_hex()
+                        }),
+                    );
                     let _ = to_miner.send(reply.to_line());
                 }
                 Some("mining.subscribe") => {
@@ -1241,17 +1128,14 @@ pub async fn handle_seller_miner(
                         let i = session.inner.lock().await;
                         (i.extranonce1.clone(), i.extranonce2_size)
                     };
-                    let reply = RpcMessage {
-                        id: msg.id.clone(),
-                        method: None,
-                        params: None,
-                        result: Some(json!([
+                    let reply = RpcMessage::response(
+                        msg.id.clone(),
+                        json!([
                             [["mining.set_difficulty", "1"], ["mining.notify", "1"]],
                             en1,
                             en2
-                        ])),
-                        error: Some(Value::Null),
-                    };
+                        ]),
+                    );
                     let _ = to_miner.send(reply.to_line());
                     // Mark subscribed + flush any prelude (the upstream's initial
                     // set_difficulty/notify, or translated jobs stashed before the
@@ -1267,13 +1151,7 @@ pub async fn handle_seller_miner(
                 }
                 Some("mining.extranonce.subscribe") => {
                     session.inner.lock().await.extranonce_capable = true;
-                    let reply = RpcMessage {
-                        id: msg.id.clone(),
-                        method: None,
-                        params: None,
-                        result: Some(json!(true)),
-                        error: Some(Value::Null),
-                    };
+                    let reply = RpcMessage::response(msg.id.clone(), json!(true));
                     let _ = to_miner.send(reply.to_line());
                 }
                 _ => {
@@ -1295,13 +1173,11 @@ pub async fn handle_seller_miner(
                         let order = orders.active_for_worker(&w, crate::orders::now_ms()).await;
                         let rig = sellers.default_pool(&w).await;
                         if order.is_none() && rig.is_none() {
-                            let reply = RpcMessage {
-                                id: msg.id.clone(),
-                                method: None,
-                                params: None,
-                                result: Some(json!(false)),
-                                error: Some(json!([24, "unregistered worker — register the rig first", Value::Null])),
-                            };
+                            let reply = RpcMessage::refusal(
+                                msg.id.clone(),
+                                24,
+                                "unregistered worker — register the rig first",
+                            );
                             let _ = to_miner.send(reply.to_line());
                             warn!(worker = %w, "rejected unregistered worker (register-only)");
                             break;
@@ -1318,13 +1194,7 @@ pub async fn handle_seller_miner(
                         registry
                             .insert(w.clone(), AnySession::Sv1(session.clone()))
                             .await;
-                        let auth_reply = RpcMessage {
-                            id: msg.id.clone(),
-                            method: None,
-                            params: None,
-                            result: Some(json!(true)),
-                            error: Some(Value::Null),
-                        };
+                        let auth_reply = RpcMessage::response(msg.id.clone(), json!(true));
                         let _ = to_miner.send(auth_reply.to_line());
                         // Where this worker should mine: its active rental's target,
                         // else its seller default pool.
@@ -1375,13 +1245,7 @@ pub async fn handle_seller_miner(
                                                 {
                                                     session.inner.lock().await.extranonce_capable =
                                                         true;
-                                                    let reply = RpcMessage {
-                                                        id: gm.id.clone(),
-                                                        method: None,
-                                                        params: None,
-                                                        result: Some(json!(true)),
-                                                        error: Some(Value::Null),
-                                                    };
+                                                    let reply = RpcMessage::response(gm.id.clone(), json!(true));
                                                     let _ = to_miner.send(reply.to_line());
                                                 } else {
                                                     session.on_miner_msg(gm).await;
@@ -1450,11 +1314,6 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    /// The pool's initial `set_difficulty` + `notify` interleave the handshake
-    /// (they arrive before/around the authorize reply). `read_response` must keep
-    /// them in `prelude` (so the relay can forward them) and still return the
-    /// response — dropping them leaves the miner at "diff 0" → every share
-    /// rejected as "Difficulty too low".
     #[test]
     fn upstream_worker_keeps_rig_and_tags_proxy() {
         // Account stays a valid payout address; rig name kept + tagged.
@@ -1480,7 +1339,7 @@ mod tests {
     }
 
     /// Minimal SV1 pool: completes the `subscribe` (handing back `en1`) +
-    /// `authorize` handshake so [`connect_upstream`] succeeds, then idles.
+    /// `authorize` handshake so [`sv1::connect_pool`] succeeds, then idles.
     pub(crate) async fn mock_sv1_pool(listener: TcpListener, en1: String) -> anyhow::Result<()> {
         // Loop-accept so protocol detection's probe connection and the real
         // connect are both served (real pools accept many connections).
@@ -1503,13 +1362,7 @@ mod tests {
                         Some("mining.authorize") => json!(true),
                         _ => continue,
                     };
-                    let reply = RpcMessage {
-                        id: msg.id.clone(),
-                        method: None,
-                        params: None,
-                        result: Some(result),
-                        error: Some(Value::Null),
-                    };
+                    let reply = RpcMessage::response(msg.id.clone(), result);
                     let _ = w.write_all(reply.to_line().as_bytes()).await;
                 }
             });
@@ -1534,7 +1387,7 @@ mod tests {
             password: "x".into(),
             authority_pubkey: None,
         };
-        let conn = connect_upstream(&target_a, None, &target_a.user)
+        let conn = sv1::connect_pool(&target_a, &target_a.user, None)
             .await
             .unwrap();
         let (to_miner, _to_miner_rx) = mpsc::unbounded_channel::<String>();
@@ -1575,7 +1428,7 @@ mod tests {
             }),
         });
         {
-            let reader = spawn_upstream_reader(session.clone(), 0, conn.reader);
+            let reader = spawn_upstream_reader(session.clone(), 0, conn.read);
             let mut i = session.inner.lock().await;
             let old = std::mem::replace(&mut i.active.reader, reader);
             old.abort();
@@ -1596,42 +1449,6 @@ mod tests {
             session.inner.lock().await.pending.is_empty(),
             "switch cleared the orphaned pending submits"
         );
-    }
-
-    #[tokio::test]
-    async fn read_response_keeps_handshake_notifications() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut s, _) = listener.accept().await.unwrap();
-            s.write_all(b"{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[512]}\n")
-                .await
-                .unwrap();
-            s.write_all(b"{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"job1\"]}\n")
-                .await
-                .unwrap();
-            s.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n")
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        });
-
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (r, _w) = stream.into_split();
-        let mut reader = BufReader::new(r);
-        let mut prelude: Vec<String> = Vec::new();
-        let resp = read_response(&mut reader, &mut prelude).await.unwrap();
-
-        assert!(resp.method.is_none(), "returned message is the response");
-        assert_eq!(resp.result, Some(json!(true)));
-        assert_eq!(prelude.len(), 2, "both handshake notifications kept");
-        assert!(prelude[0].contains("set_difficulty"));
-        assert!(prelude[1].contains("notify"));
-        // Each kept line must end with a newline so it isn't glued to the next
-        // message when forwarded to the miner.
-        assert!(prelude[0].ends_with('\n'));
-        assert!(prelude[1].ends_with('\n'));
-        server.await.unwrap();
     }
 }
 

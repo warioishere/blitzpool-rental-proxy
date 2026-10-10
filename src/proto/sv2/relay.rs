@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -38,7 +38,7 @@ use tracing::{debug, error, info, warn};
 
 use stratum_core::bitcoin::hashes::hex::FromHex;
 
-use crate::proto::sv1::RpcMessage;
+use crate::proto::sv1::{self, RpcMessage};
 use crate::proto::translate;
 
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
@@ -1391,110 +1391,35 @@ struct Sv1UpState {
     first_job_sent: bool,
 }
 
-/// Connect an SV1 pool and run `configure`(version-rolling) → `subscribe` →
-/// `authorize`, capturing the extranonce, the negotiated version mask, and the
-/// handshake notifications (initial difficulty + first job).
+/// Connect an SV1 pool for translation: the shared SV1 handshake with the
+/// proxy's own version-rolling `configure`, plus what the translator needs from
+/// it (granted version mask, extranonce as bytes, initial difficulty).
 async fn connect_sv1_upstream(
     target: &UpstreamTarget,
     user_identity: &str,
 ) -> anyhow::Result<Sv1UpConn> {
-    let tcp = TcpStream::connect(&target.url)
-        .await
-        .with_context(|| format!("connect sv1 upstream {}", target.url))?;
-    let _ = tcp.set_nodelay(true);
-    let (r, mut w) = tcp.into_split();
-    let mut read = BufReader::new(r);
-    let mut prelude: Vec<String> = Vec::new();
-
-    let cfg = RpcMessage::request(
-        json!(1),
-        "mining.configure",
-        json!([["version-rolling"], {"version-rolling.mask": "1fffe000"}]),
-    );
-    w.write_all(cfg.to_line().as_bytes()).await?;
-    let cfg_resp = sv1_read_response(&mut read, &mut prelude).await?;
-    let version_mask = parse_version_mask(&cfg_resp);
-
-    let sub = RpcMessage::request(json!(2), "mining.subscribe", json!(["bp-proxy"]));
-    w.write_all(sub.to_line().as_bytes()).await?;
-    let sub_resp = sv1_read_response(&mut read, &mut prelude).await?;
-    let (en1_hex, extranonce2_size) =
-        parse_subscribe_sv1(&sub_resp).ok_or_else(|| anyhow!("bad subscribe result"))?;
-
-    // Authorize with the SAME worker name we submit shares under (see
-    // `upstream_worker`). Strict pools (e.g. ckpool) reject submits whose worker
-    // differs from the authorized one ("Worker mismatch"); the payout address is
-    // the part before the first '.', so this keeps the payout correct.
-    let auth = RpcMessage::request(
-        json!(3),
-        "mining.authorize",
-        json!([user_identity, target.password]),
-    );
-    w.write_all(auth.to_line().as_bytes()).await?;
-    sv1_read_response(&mut read, &mut prelude)
-        .await?
-        .check_authorized()?;
-
-    let initial_diff = prelude
+    let conn = sv1::connect_pool(
+        target,
+        user_identity,
+        Some(&RpcMessage::version_rolling_configure()),
+    )
+    .await?;
+    let initial_diff = conn
+        .prelude
         .iter()
         .rev()
         .find_map(|l| translate::set_difficulty_from_line(l))
         .unwrap_or(1.0);
     Ok(Sv1UpConn {
-        read,
-        write: w,
-        extranonce1: Vec::<u8>::from_hex(&en1_hex)
+        extranonce1: Vec::<u8>::from_hex(&conn.extranonce1)
             .map_err(|e| anyhow!("bad extranonce hex: {e}"))?,
-        extranonce2_size,
-        version_mask,
+        extranonce2_size: conn.extranonce2_size as u16,
+        read: conn.read,
+        write: conn.write,
+        version_mask: conn.version_mask,
         initial_diff,
-        prelude,
+        prelude: conn.prelude,
     })
-}
-
-/// Read SV1 lines until a response (no `method`), pushing interleaved
-/// notifications to `prelude`.
-async fn sv1_read_response(
-    read: &mut BufReader<OwnedReadHalf>,
-    prelude: &mut Vec<String>,
-) -> anyhow::Result<RpcMessage> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if read.read_line(&mut line).await? == 0 {
-            bail!("sv1 upstream closed during handshake");
-        }
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        if let Ok(m) = RpcMessage::parse(t) {
-            if m.method.is_none() {
-                return Ok(m);
-            }
-            prelude.push(format!("{t}\n"));
-        }
-    }
-}
-
-fn parse_version_mask(resp: &RpcMessage) -> Option<u32> {
-    let r = resp.result.as_ref()?;
-    if r.get("version-rolling")?.as_bool() != Some(true) {
-        return None;
-    }
-    let mask = r
-        .get("version-rolling.mask")
-        .and_then(|v| v.as_str())
-        .and_then(|s| u32::from_str_radix(s, 16).ok());
-    Some(mask.unwrap_or(translate::VERSION_ROLLING_MASK))
-}
-
-fn parse_subscribe_sv1(resp: &RpcMessage) -> Option<(String, u16)> {
-    let arr = resp.result.as_ref()?.as_array()?;
-    if arr.len() < 3 {
-        return None;
-    }
-    Some((arr[1].as_str()?.to_string(), arr[2].as_u64()? as u16))
 }
 
 /// Writer: the miner's share frames → SV1 `mining.submit` lines. Handles both

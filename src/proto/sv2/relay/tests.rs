@@ -3,6 +3,7 @@
 //! re-points it to mock pool B without the miner reconnecting.
 
 use super::*;
+use serde_json::json;
 use std::collections::HashSet;
 use stratum_core::binary_sv2::{Seq0255, Sv2Option, B032, B064K};
 use stratum_core::mining_sv2::{
