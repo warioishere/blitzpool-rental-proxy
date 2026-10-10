@@ -1859,6 +1859,76 @@ async fn connect_with_active_rental_opens_on_buyer_directly() {
 }
 
 #[tokio::test]
+async fn connect_with_active_rental_opens_on_the_fallback_when_the_primary_is_down() {
+    // The order's primary pool is down when the miner connects: the first
+    // channel opens on the order's fallback pool, not on the seller's pool.
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap(); // rig idle pool
+    let a_addr = pool_a.local_addr().unwrap();
+    let pool_fb = TcpListener::bind("127.0.0.1:0").await.unwrap(); // buyer fallback
+    let fb_addr = pool_fb.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+    let (fb_tx, _fb_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool(
+        pool_a,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        a_tx,
+    ));
+    tokio::spawn(mock_pool(
+        pool_fb,
+        vec![0xCC; 8],
+        99,
+        NoiseKeys::generate(),
+        fb_tx,
+    ));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: crate::registry::Registry::new(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.rig1",
+        ext_target(&a_addr.to_string(), "acctA"),
+    )
+    .await;
+    orders
+        .create(
+            "bc1qSELLER.rig1".into(),
+            ext_target(&dead_addr().await, "acctDead"),
+            Some(ext_target(&fb_addr.to_string(), "acctFb")),
+            0,
+            0.0,
+            0.0,
+        )
+        .await
+        .unwrap();
+
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        let (sock, peer) = proxy.accept().await.unwrap();
+        let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+    });
+
+    let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+    miner.setup().await.unwrap();
+    let (_down_cid, prefix) = miner.open("bc1qSELLER.rig1", 1).await.unwrap();
+    assert_eq!(
+        prefix,
+        vec![0xCC; 8],
+        "primary down at connect → first channel opened on the fallback pool"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_switches_leave_a_consistent_session() {
     // Two switches fired at once must serialize (the switch lock) and leave the
     // session internally consistent: `routing`/`order_id` agree with the active

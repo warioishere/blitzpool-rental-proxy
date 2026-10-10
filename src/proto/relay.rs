@@ -174,16 +174,10 @@ impl Session {
             .get(&order_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("order {order_id} not found"))?;
-        match self.switch_to(order_id.clone(), order.target).await {
-            Ok(()) => Ok(()),
-            Err(primary_err) => match order.fallback {
-                Some(fb) => {
-                    warn!(order = %order_id, error = %primary_err, "primary buyer pool unreachable — using fallback");
-                    self.switch_to(order_id, fb).await
-                }
-                None => Err(primary_err),
-            },
-        }
+        order
+            .connect_with_fallback(|target| self.switch_to(order_id.clone(), target))
+            .await
+            .map(drop)
     }
 
     /// Switch back to the seller's default upstream (a rental ends).

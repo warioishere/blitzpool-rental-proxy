@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::registry::Registry;
 use crate::session::UpstreamTarget;
@@ -120,6 +120,28 @@ impl Order {
         } else {
             (self.budget - self.cost()).max(0.0)
         }
+    }
+
+    /// Run `connect` against the order's pool, then against its fallback pool
+    /// when the primary fails. Returns the pool that took the connection.
+    pub async fn connect_with_fallback<F, Fut>(
+        &self,
+        mut connect: F,
+    ) -> anyhow::Result<UpstreamTarget>
+    where
+        F: FnMut(UpstreamTarget) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        let primary_err = match connect(self.target.clone()).await {
+            Ok(()) => return Ok(self.target.clone()),
+            Err(e) => e,
+        };
+        let Some(fallback) = &self.fallback else {
+            return Err(primary_err);
+        };
+        warn!(order = %self.id, error = %primary_err, "primary buyer pool unreachable — using fallback");
+        connect(fallback.clone()).await?;
+        Ok(fallback.clone())
     }
 
     /// True when a budgeted rental has consumed its prepaid credit.

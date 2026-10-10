@@ -728,16 +728,10 @@ impl Sv2Session {
             .get(&order_id)
             .await
             .ok_or_else(|| anyhow!("order {order_id} not found"))?;
-        match self.switch_to(order_id.clone(), order.target).await {
-            Ok(()) => Ok(()),
-            Err(primary_err) => match order.fallback {
-                Some(fb) => {
-                    warn!(order = %order_id, error = %primary_err, "primary buyer pool unreachable — using fallback");
-                    self.switch_to(order_id, fb).await
-                }
-                None => Err(primary_err),
-            },
-        }
+        order
+            .connect_with_fallback(|target| self.switch_to(order_id.clone(), target))
+            .await
+            .map(drop)
     }
 
     pub async fn revert(self: &Arc<Self>) -> anyhow::Result<()> {
@@ -1955,7 +1949,7 @@ pub async fn handle_seller_miner_sv2(
         .orders
         .active_for_worker(&worker, crate::orders::now_ms())
         .await;
-    let (mut open_target, routing) = match (&active_order, &idle_target) {
+    let (open_target, routing) = match (&active_order, &idle_target) {
         (Some(o), _) => (
             o.target.clone(),
             Routing::Rented {
@@ -2051,33 +2045,22 @@ pub async fn handle_seller_miner_sv2(
             // initial channel and receives that channel's per-channel frames.
             let member_id = session.inner.lock().await.add_member(to_miner.clone());
 
-            if let Err(e) = session
-                .connect_and_install_initial(
-                    open_target.clone(),
+            let install = |target| {
+                session.connect_and_install_initial(
+                    target,
                     spec.clone(),
                     &worker,
                     routing.clone(),
                     member_id,
                 )
-                .await
-            {
-                match active_order.as_ref().and_then(|o| o.fallback.clone()) {
-                    Some(fb) => {
-                        warn!(%worker, error = %e, "primary buyer pool unreachable — using fallback");
-                        open_target = fb.clone();
-                        session
-                            .connect_and_install_initial(
-                                fb,
-                                spec.clone(),
-                                &worker,
-                                routing.clone(),
-                                member_id,
-                            )
-                            .await?;
-                    }
-                    None => return Err(e),
+            };
+            let upstream = match &active_order {
+                Some(o) => o.connect_with_fallback(install).await?,
+                None => {
+                    install(open_target.clone()).await?;
+                    open_target
                 }
-            }
+            };
 
             ctx.registry
                 .insert(worker.clone(), AnySession::Sv2(session.clone()))
@@ -2096,10 +2079,10 @@ pub async fn handle_seller_miner_sv2(
             drop(_hold);
             match &active_order {
                 Some(o) => {
-                    info!(%peer, %worker, member = member_id, upstream = %open_target.url, order = %o.id, "sv2 relay established (rented)")
+                    info!(%peer, %worker, member = member_id, upstream = %upstream.url, order = %o.id, "sv2 relay established (rented)")
                 }
                 None => {
-                    info!(%peer, %worker, member = member_id, upstream = %open_target.url, "sv2 relay established (idle)")
+                    info!(%peer, %worker, member = member_id, upstream = %upstream.url, "sv2 relay established (idle)")
                 }
             }
             (session, member_id, reconnect_rx)
