@@ -21,9 +21,8 @@ axum = "0.8"
 # lets the build run without a live DB (SQLX_OFFLINE).
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 
-# Stratum V2 protocol + Noise transport, optional (only with `--features sv2`)
-# so the default SV1 build stays lean. Pulled from the upstream stratum-mining
-# git repos (NOT crates.io): the crates.io releases at current majors don't
+# Stratum V2 protocol + Noise transport. Pulled from the upstream
+# stratum-mining git repos (NOT crates.io): the crates.io releases at current majors don't
 # compile together (mining_sv2's derives reference `super::binary_sv2`), whereas
 # the git workspaces are internally consistent.
 #   - stratum-core re-exports the protocol set (codec_sv2 + noise_sv2 +
@@ -35,19 +34,15 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # The `translation` feature adds the stratum_translation + sv1_api sub-crates:
 # SV1↔SV2 message conversion + the SV1 protocol types, used by the bidirectional
 # translator that lets a buyer pool speak either protocol regardless of the rig.
-stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main", features = ["translation"], optional = true }
-stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps", rev = "27985c63f7c47310281289d4da17b90780bb11fd", default-features = false, features = ["network", "std"], optional = true }
+stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main", features = ["translation"] }
+stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps", rev = "27985c63f7c47310281289d4da17b90780bb11fd", default-features = false, features = ["network", "std"] }
 # secp256k1 matched to noise_sv2's version so the keypair types line up; rand
 # for key generation.
-secp256k1 = { version = "0.28", features = ["rand", "alloc"], optional = true }
-rand = { version = "0.8", optional = true }
+secp256k1 = { version = "0.28", features = ["rand", "alloc"] }
+rand = "0.8"
 # 256-bit integer division for the bdiff difficulty<->target conversion in the
 # translator (translate.rs). Already present transitively via the SV2 stack.
-primitive-types = { version = "0.13", default-features = false, optional = true }
-
-[features]
-# Build the SV2 downstream relay + foundation (Noise transport + protocol).
-sv2 = ["dep:stratum-core", "dep:stratum-apps", "dep:secp256k1", "dep:rand", "dep:primitive-types"]
+primitive-types = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

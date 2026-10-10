@@ -30,26 +30,18 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::adapter::{DownstreamAdapter, ProxyContext};
 use super::sv1::RpcMessage;
+use super::ProxyContext;
 use crate::control::{AnySession, SessionStatus};
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 
-// Translation path (combo 3: SV1 miner ↔ SV2 buyer pool). Only compiled with the
-// SV2 stack; without it the relay is SV1 passthrough only.
-#[cfg(feature = "sv2")]
+// Translation path (combo 3: SV1 miner ↔ SV2 buyer pool).
 use crate::proto::sv2::wire;
-#[cfg(feature = "sv2")]
 use crate::proto::translate;
-#[cfg(feature = "sv2")]
 use std::collections::VecDeque;
-#[cfg(feature = "sv2")]
 use stratum_core::bitcoin::hashes::hex::DisplayHex;
-#[cfg(feature = "sv2")]
 use stratum_core::mining_sv2 as mining;
-#[cfg(feature = "sv2")]
 use stratum_core::parsers_sv2::{AnyMessage, Mining};
-#[cfg(feature = "sv2")]
 use stratum_core::sv1_api::{json_rpc as sv1_json, methods::client_to_server, utils::HexU32Be};
 
 /// Standard BIP320 version-rolling mask we advertise to the miner.
@@ -451,10 +443,8 @@ fn id_key(id: &Option<Value>) -> String {
 
 /// Default nominal hashrate (H/s) advertised when opening an Extended channel on
 /// an SV2 buyer pool behind an SV1 miner; the pool's vardiff adjusts from here.
-#[cfg(feature = "sv2")]
 const SV2_UP_NOMINAL_HASHRATE: f32 = 1.0e12;
 /// Extranonce-2 size requested from the SV2 pool — also the SV1 `extranonce2_size`.
-#[cfg(feature = "sv2")]
 const SV2_UP_MIN_EXTRANONCE: u16 = 4;
 
 /// A freshly connected upstream, not yet spawned into reader/writer tasks. The
@@ -466,12 +456,10 @@ enum RawUpstream {
     /// An SV2 buyer pool behind an SV1 miner: an open Extended channel whose jobs
     /// and shares are translated (see [`crate::proto::translate`]). Boxed — the
     /// Noise halves are far larger than the SV1 variant.
-    #[cfg(feature = "sv2")]
     Sv2(Box<Sv2RawUpstream>),
 }
 
 /// An opened SV2 Extended channel ready to translate for an SV1 miner.
-#[cfg(feature = "sv2")]
 struct Sv2RawUpstream {
     read: crate::proto::sv2::relay::Read,
     write: crate::proto::sv2::relay::Write,
@@ -490,15 +478,8 @@ async fn connect_raw(
     configure: Option<&RpcMessage>,
     user_identity: &str,
 ) -> anyhow::Result<RawUpstream> {
-    #[cfg(not(feature = "sv2"))]
-    {
-        return Ok(RawUpstream::Sv1(
-            connect_upstream(target, configure, user_identity).await?,
-        ));
-    }
     // Native first: try SV1 (reusing its socket on success); if the pool doesn't
     // answer as SV1, it's an SV2 buyer pool → open an Extended channel + translate.
-    #[cfg(feature = "sv2")]
     match tokio::time::timeout(
         translate::UPSTREAM_PROBE_TIMEOUT,
         connect_upstream(target, configure, user_identity),
@@ -518,7 +499,6 @@ async fn connect_raw(
 }
 
 /// Open an Extended channel on an SV2 pool to serve an SV1 miner through it.
-#[cfg(feature = "sv2")]
 async fn connect_sv2_translate(
     target: &UpstreamTarget,
     user_identity: &str,
@@ -588,7 +568,6 @@ impl Session {
                     None,
                 )
             }
-            #[cfg(feature = "sv2")]
             RawUpstream::Sv2(b) => {
                 let Sv2RawUpstream {
                     read,
@@ -644,7 +623,6 @@ impl Session {
 /// Shared state between the two translate driver tasks: job versions (to rebuild
 /// the SV2 submit version), the sequence counter, and the submit id mapping
 /// (SV2 `sequence_number` → the miner's SV1 submit id, for the result reply).
-#[cfg(feature = "sv2")]
 #[derive(Default)]
 struct Sv2UpState {
     channel_id: u32,
@@ -656,7 +634,6 @@ struct Sv2UpState {
 
 /// Translate the miner's SV1 `mining.submit` lines into `SubmitSharesExtended`
 /// frames for the SV2 pool.
-#[cfg(feature = "sv2")]
 fn spawn_sv2_translate_writer(
     mut write: crate::proto::sv2::relay::Write,
     state: Arc<Mutex<Sv2UpState>>,
@@ -716,7 +693,6 @@ fn spawn_sv2_translate_writer(
 /// Translate the SV2 pool's jobs / target / share results back into SV1 lines for
 /// the miner, and credit accepted shares. Future jobs are buffered until their
 /// `SetNewPrevHash` arrives (per SV2 §7), then emitted as a `mining.notify`.
-#[cfg(feature = "sv2")]
 fn spawn_sv2_translate_reader(
     session: Arc<Session>,
     generation: u64,
@@ -802,7 +778,6 @@ fn spawn_sv2_translate_reader(
 }
 
 /// Build + emit a `mining.notify` for the miner from an SV2 job + prev-hash.
-#[cfg(feature = "sv2")]
 async fn emit_translate_notify(
     session: &Arc<Session>,
     generation: u64,
@@ -822,7 +797,6 @@ async fn emit_translate_notify(
 
 /// Pop all `(seq, id)` with `seq <= last_seq` (the pool acked them), returning
 /// the miner submit ids to answer `result: true`.
-#[cfg(feature = "sv2")]
 fn drain_acked(q: &mut VecDeque<(u32, Option<Value>)>, last_seq: u32) -> Vec<Option<Value>> {
     let mut out = Vec::new();
     while let Some(&(seq, _)) = q.front() {
@@ -836,13 +810,11 @@ fn drain_acked(q: &mut VecDeque<(u32, Option<Value>)>, last_seq: u32) -> Vec<Opt
 }
 
 /// Remove the entry for `seq` (a rejected share), returning the miner submit id.
-#[cfg(feature = "sv2")]
 fn remove_seq(q: &mut VecDeque<(u32, Option<Value>)>, seq: u32) -> Option<Option<Value>> {
     let pos = q.iter().position(|(s, _)| *s == seq)?;
     Some(q.remove(pos).unwrap().1)
 }
 
-#[cfg(feature = "sv2")]
 impl Session {
     /// Send a line to the miner, or stash it as prelude if the miner hasn't
     /// subscribed yet (so a job never precedes the subscribe reply). No-op if the
@@ -1114,21 +1086,6 @@ async fn supervise_upstream(session: Arc<Session>, mut died_rx: mpsc::UnboundedR
     }
 }
 
-/// The Stratum V1 downstream adapter: a transparent full-proxy with a
-/// swappable upstream. Plugs into the [`DownstreamAdapter`] seam.
-#[derive(Clone, Copy, Default)]
-pub struct Sv1Adapter;
-
-impl DownstreamAdapter for Sv1Adapter {
-    fn protocol(&self) -> &'static str {
-        "sv1"
-    }
-
-    async fn serve(&self, miner: TcpStream, peer: String, ctx: ProxyContext) -> anyhow::Result<()> {
-        handle_seller_miner(miner, peer, ctx).await
-    }
-}
-
 /// Drive one seller miner end to end. Connects the default upstream, answers
 /// the miner handshake (synthesizing configure + subscribe), registers the
 /// session under the miner's worker, then relays until either side closes.
@@ -1142,7 +1099,7 @@ pub async fn handle_seller_miner(
         registry,
         sellers,
         orders,
-        // SV2-only rig bundling registry; not used by the SV1 relay.
+        // SV2 rig bundling registry; not used by the SV1 relay.
         ..
     } = ctx;
     let ip = peer_ip(&peer);
@@ -1680,7 +1637,7 @@ mod tests {
 
 /// Combo 3: an SV1 miner rented onto an SV2 buyer pool. The proxy opens an
 /// Extended channel on the SV2 pool and translates jobs/shares both ways.
-#[cfg(all(test, feature = "sv2"))]
+#[cfg(test)]
 mod sv2_translate_tests {
     use super::tests::mock_sv1_pool;
     use super::*;
@@ -1941,7 +1898,6 @@ mod sv2_translate_tests {
         let ctx = ProxyContext {
             default_target: Some(boot_target.clone()),
             registry: registry.clone(),
-            #[cfg(feature = "sv2")]
             sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),
@@ -2050,7 +2006,6 @@ mod sv2_translate_tests {
         let ctx = ProxyContext {
             default_target: Some(boot_target.clone()),
             registry: registry.clone(),
-            #[cfg(feature = "sv2")]
             sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
             orders: orders.clone(),

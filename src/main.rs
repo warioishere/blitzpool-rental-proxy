@@ -2,7 +2,7 @@
 
 //! stratum-rental-proxy — entry point.
 //!
-//! Binds the downstream Stratum server (SV1, SV2, or auto-detect on one port),
+//! Binds the downstream Stratum server (SV1 and SV2 on one port),
 //! accepts seller miners, and drives each through its protocol relay with a
 //! swappable upstream: idle → the rig's default pool, rented → the buyer's pool.
 //! Persistent rig/order state lives in SQLite; the HTTP control API steers
@@ -26,8 +26,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use config::Protocol;
-use proto::adapter::{DownstreamAdapter, ProxyContext};
+use proto::ProxyContext;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -105,61 +104,18 @@ async fn main() -> anyhow::Result<()> {
         registry,
         sellers,
         orders,
-        #[cfg(feature = "sv2")]
         sv2_rigs: Default::default(),
     };
 
-    // Select the wire protocol's adapter at boot; the accept loop is
-    // monomorphised over it (generics, no per-message dyn dispatch). `Both`
-    // peeks the first byte of each connection and dispatches per-connection.
-    match cfg.protocol {
-        Protocol::Sv1 => accept_loop(listener, proto::relay::Sv1Adapter, ctx).await,
-        Protocol::Sv2 => {
-            // `default()` generates/loads the Noise key in the real adapter; in
-            // a non-`sv2` build the adapter is a unit stub (hence the allow).
-            #[allow(clippy::default_constructed_unit_structs)]
-            let adapter = proto::sv2::Sv2Adapter::default();
-            accept_loop(listener, adapter, ctx).await
-        }
-        Protocol::Both => accept_loop_auto(listener, ctx).await,
-    }
+    accept_loop(listener, ctx).await
 }
 
-/// Accept seller miners and hand each to `adapter` with the shared context.
-async fn accept_loop<A: DownstreamAdapter>(
-    listener: TcpListener,
-    adapter: A,
-    ctx: ProxyContext,
-) -> anyhow::Result<()> {
-    info!(protocol = adapter.protocol(), "listening for seller miners");
-    let adapter = Arc::new(adapter);
-    loop {
-        let (sock, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "accept failed");
-                continue;
-            }
-        };
-        let adapter = adapter.clone();
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let peer = peer.to_string();
-            if let Err(e) = adapter.serve(sock, peer.clone(), ctx).await {
-                warn!(%peer, error = %e, "session ended with error");
-            }
-        });
-    }
-}
-
-/// Accept seller miners and auto-detect SV1 vs SV2 per connection (one port).
-/// The first byte is peeked (not consumed) and routed to the matching adapter,
+/// Accept seller miners on the one port and tell SV1 from SV2 per connection.
+/// The first byte is peeked (not consumed) and routed to the matching relay,
 /// which then reads the full stream from the start.
-async fn accept_loop_auto(listener: TcpListener, ctx: ProxyContext) -> anyhow::Result<()> {
-    info!("listening for seller miners (auto SV1/SV2 on one port)");
-    let sv1 = proto::relay::Sv1Adapter;
-    #[allow(clippy::default_constructed_unit_structs)]
-    let sv2 = proto::sv2::Sv2Adapter::default();
+async fn accept_loop(listener: TcpListener, ctx: ProxyContext) -> anyhow::Result<()> {
+    info!("listening for seller miners (SV1 and SV2 on one port)");
+    let keys = proto::sv2::keys::NoiseKeys::from_env_or_generate();
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -168,10 +124,7 @@ async fn accept_loop_auto(listener: TcpListener, ctx: ProxyContext) -> anyhow::R
                 continue;
             }
         };
-        // The real (`--features sv2`) adapter holds Noise keys and needs a clone
-        // per task; the no-feature stub is a Copy unit (clone_on_copy is inert).
-        #[allow(clippy::clone_on_copy)]
-        let sv2 = sv2.clone();
+        let keys = keys.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let peer = peer.to_string();
@@ -185,9 +138,10 @@ async fn accept_loop_auto(listener: TcpListener, ctx: ProxyContext) -> anyhow::R
                     return;
                 }
             }
-            let result = match proto::detect::detect(first[0]) {
-                Protocol::Sv2 => sv2.serve(sock, peer.clone(), ctx).await,
-                _ => sv1.serve(sock, peer.clone(), ctx).await,
+            let result = if proto::detect::is_sv1(first[0]) {
+                proto::relay::handle_seller_miner(sock, peer.clone(), ctx).await
+            } else {
+                proto::sv2::relay::handle_seller_miner_sv2(sock, peer.clone(), ctx, keys).await
             };
             if let Err(e) = result {
                 warn!(%peer, error = %e, "session ended with error");

@@ -57,7 +57,7 @@ use super::keys::NoiseKeys;
 use super::wire::{self, EitherFrame, Msg, Sv2Frame};
 use crate::control::{AnySession, SessionStatus};
 use crate::orders::OrderStore;
-use crate::proto::adapter::{DownstreamAdapter, ProxyContext};
+use crate::proto::ProxyContext;
 use crate::session::{HashrateWindow, Routing, UpstreamTarget};
 
 /// SV2 frame builders/parsers (split out for navigability).
@@ -2382,32 +2382,6 @@ pub async fn handle_seller_miner_sv2(
         info!(%peer, member = member_id, "sv2 member left; rig keeps running");
     }
     Ok(())
-}
-
-// ── adapter ─────────────────────────────────────────────────────────
-
-/// The Stratum V2 downstream adapter (full proxy with a swappable upstream).
-#[derive(Clone)]
-pub struct Sv2Adapter {
-    keys: NoiseKeys,
-}
-
-impl Default for Sv2Adapter {
-    fn default() -> Self {
-        Self {
-            keys: NoiseKeys::from_env_or_generate(),
-        }
-    }
-}
-
-impl DownstreamAdapter for Sv2Adapter {
-    fn protocol(&self) -> &'static str {
-        "sv2"
-    }
-
-    async fn serve(&self, miner: TcpStream, peer: String, ctx: ProxyContext) -> anyhow::Result<()> {
-        handle_seller_miner_sv2(miner, peer, ctx, self.keys.clone()).await
-    }
 }
 
 #[cfg(test)]

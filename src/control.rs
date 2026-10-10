@@ -4,13 +4,11 @@
 //!
 //! The registry and control API don't care whether a session speaks SV1 or
 //! SV2; they hold an [`AnySession`] and call the same operations (switch,
-//! revert, set-default, status). The proxy runs one protocol per process, so
-//! this is a closed enum (no `dyn`), with the SV2 variant behind the `sv2`
-//! feature.
+//! revert, set-default, status). A closed enum, one variant per protocol.
 
 use std::sync::Arc;
 
-#[cfg(all(test, feature = "sv2"))]
+#[cfg(test)]
 use crate::session::UpstreamTarget;
 
 /// Minimum submitted-share sample before the accept-ratio is considered
@@ -67,7 +65,6 @@ pub struct SessionStatus {
 #[derive(Clone)]
 pub enum AnySession {
     Sv1(Arc<crate::proto::relay::Session>),
-    #[cfg(feature = "sv2")]
     Sv2(Arc<crate::proto::sv2::relay::Sv2Session>),
 }
 
@@ -75,11 +72,10 @@ impl AnySession {
     /// Route this session's hashrate to a single `target` (no fallback). The
     /// production path forces a reconnect; this lower-level live-swap form is
     /// used by the sv2 relay tests to drive a switch without a stored order.
-    #[cfg(all(test, feature = "sv2"))]
+    #[cfg(test)]
     pub async fn switch_to(&self, order_id: String, target: UpstreamTarget) -> anyhow::Result<()> {
         match self {
             AnySession::Sv1(s) => s.switch_to(order_id, target).await,
-            #[cfg(feature = "sv2")]
             AnySession::Sv2(s) => s.switch_to(order_id, target).await,
         }
     }
@@ -88,11 +84,10 @@ impl AnySession {
     /// failover (the pools are resolved from the order). Production switches go
     /// through [`AnySession::force_reconnect`]; this live-swap path is exercised
     /// by the sv2 relay failover tests.
-    #[cfg(all(test, feature = "sv2"))]
+    #[cfg(test)]
     pub async fn switch_to_order(&self, order_id: String) -> anyhow::Result<()> {
         match self {
             AnySession::Sv1(s) => s.switch_to_order(order_id).await,
-            #[cfg(feature = "sv2")]
             AnySession::Sv2(s) => s.switch_to_order(order_id).await,
         }
     }
@@ -105,7 +100,6 @@ impl AnySession {
     pub fn force_reconnect(&self) {
         match self {
             AnySession::Sv1(s) => s.force_reconnect(),
-            #[cfg(feature = "sv2")]
             AnySession::Sv2(s) => s.force_reconnect(),
         }
     }
@@ -113,7 +107,6 @@ impl AnySession {
     pub async fn status(&self) -> SessionStatus {
         match self {
             AnySession::Sv1(s) => s.status().await,
-            #[cfg(feature = "sv2")]
             AnySession::Sv2(s) => s.status().await,
         }
     }
@@ -122,9 +115,7 @@ impl AnySession {
     pub fn ptr_eq(&self, other: &AnySession) -> bool {
         match (self, other) {
             (AnySession::Sv1(a), AnySession::Sv1(b)) => Arc::ptr_eq(a, b),
-            #[cfg(feature = "sv2")]
             (AnySession::Sv2(a), AnySession::Sv2(b)) => Arc::ptr_eq(a, b),
-            #[cfg(feature = "sv2")]
             _ => false,
         }
     }
