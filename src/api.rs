@@ -22,6 +22,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
@@ -30,8 +31,10 @@ use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::chain::Electrum;
 use crate::hashrate::HashrateStore;
 use crate::orders::{now_ms, OrderStatus, OrderStore};
+use crate::probe::{probe_pools, PoolRefusal};
 use crate::registry::Registry;
 use crate::session::UpstreamTarget;
 use crate::store::{Rig, SellerStore};
@@ -45,6 +48,8 @@ pub struct AppState {
     /// Bearer token required on every endpoint except `/api/health`. Empty =
     /// not configured → the API fails closed (rejects all). See [`require_bearer`].
     pub api_token: Arc<str>,
+    /// The Bitcoin tip source for the pool probe; `None` skips the chain check.
+    pub chain: Option<Arc<Electrum>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -439,9 +444,9 @@ async fn get_order(
     }
 }
 
+/// The buyer's pools, as `POST /api/orders` takes them.
 #[derive(Deserialize)]
-struct OrderReq {
-    worker: String,
+struct PoolsReq {
     url: String,
     user: String,
     #[serde(default)]
@@ -459,6 +464,37 @@ struct OrderReq {
     fallback_pass: String,
     #[serde(default)]
     fallback_authority: Option<String>,
+}
+
+impl PoolsReq {
+    /// The primary pool and the optional fallback, urls normalized. Empty
+    /// fallback url = none.
+    fn targets(self) -> Result<(UpstreamTarget, Option<UpstreamTarget>), ApiError> {
+        let primary = UpstreamTarget {
+            url: pool_url(&self.url)?,
+            user: self.user,
+            password: self.pass,
+            authority_pubkey: self.authority,
+        };
+        let fallback = if self.fallback_url.trim().is_empty() {
+            None
+        } else {
+            Some(UpstreamTarget {
+                url: pool_url(&self.fallback_url)?,
+                user: self.fallback_user,
+                password: self.fallback_pass,
+                authority_pubkey: self.fallback_authority,
+            })
+        };
+        Ok((primary, fallback))
+    }
+}
+
+#[derive(Deserialize)]
+struct OrderReq {
+    worker: String,
+    #[serde(flatten)]
+    pools: PoolsReq,
     /// Auto-revert deadline in epoch ms; `0`/absent = open-ended.
     #[serde(default)]
     until_ms: i64,
@@ -471,35 +507,83 @@ struct OrderReq {
     budget: f64,
 }
 
-/// Create a rental order for a delivering rig: records it and reconnects the
-/// rig's miners onto the buyer's pool. `reconnected` counts the miners dropped.
+/// A refusal of `POST /api/orders`: a plain API error, or a pool that failed
+/// the probe.
+enum Refusal {
+    Api(ApiError),
+    /// 422 `{error, detail, pool}`; `error` is a [`crate::probe::RefusalCode`] and `pool`
+    /// names the failing pool (`"primary"` or `"fallback"`).
+    Pool(&'static str, PoolRefusal),
+}
+
+impl From<ApiError> for Refusal {
+    fn from(e: ApiError) -> Self {
+        Refusal::Api(e)
+    }
+}
+
+impl IntoResponse for Refusal {
+    fn into_response(self) -> Response {
+        match self {
+            Refusal::Api(e) => e.into_response(),
+            Refusal::Pool(pool, r) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": r.code, "detail": r.detail, "pool": pool})),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Probe the buyer's pools as `worker` would be rented onto them.
+async fn probe(
+    s: &AppState,
+    primary: &UpstreamTarget,
+    fallback: Option<&UpstreamTarget>,
+    worker: &str,
+) -> Result<(), Refusal> {
+    let identity = crate::proto::relay::upstream_worker(&primary.user, worker);
+    let fallback_identity = fallback.map(|f| crate::proto::relay::upstream_worker(&f.user, worker));
+    probe_pools(
+        primary,
+        &identity,
+        fallback.zip(fallback_identity.as_deref()),
+        s.chain.as_deref(),
+    )
+    .await
+    .map_err(|(pool, r)| Refusal::Pool(pool, r))
+}
+
+/// Create a rental order for a delivering rig: probes the buyer's pools,
+/// records the order and reconnects the rig's miners onto the buyer's pool.
+/// `reconnected` counts the miners dropped.
 async fn create_order(
     State(s): State<AppState>,
     Json(req): Json<OrderReq>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, Refusal> {
     // Refuse a target the relays could never connect to before anything is
     // stored: an order on an unreachable url would leave the rig mining for
     // its seller.
-    let url = pool_url(&req.url)?;
-    let fallback_url = if req.fallback_url.trim().is_empty() {
-        None
-    } else {
-        Some(pool_url(&req.fallback_url)?)
-    };
+    let (target, fallback) = req.pools.targets()?;
     // A bounded rental's end time must be in the future (0 = open-ended). Without
     // this a past `until_ms` would slip through the max-duration check (negative
     // duration is not "too long") and create an already-expired order.
     if req.until_ms != 0 && req.until_ms <= now_ms() {
         return Err((
             StatusCode::CONFLICT,
-            "end time must be in the future".into(),
-        ));
+            "end time must be in the future".to_string(),
+        )
+            .into());
     }
     // A registered rig that's toggled off can't be rented; and a rig with a
     // max-duration cap rejects open-ended or too-long rentals.
     if let Some(rig) = s.sellers.get(&req.worker).await {
         if !rig.rentable {
-            return Err((StatusCode::CONFLICT, "rig is not listed for rent".into()));
+            return Err((
+                StatusCode::CONFLICT,
+                "rig is not listed for rent".to_string(),
+            )
+                .into());
         }
         if rig.max_rental_secs > 0 {
             let max_h = rig.max_rental_secs / 3600;
@@ -507,14 +591,16 @@ async fn create_order(
                 return Err((
                     StatusCode::CONFLICT,
                     format!("this rig caps rentals at {max_h} h — set an end time"),
-                ));
+                )
+                    .into());
             }
             let duration_ms = req.until_ms - now_ms();
             if duration_ms > rig.max_rental_secs.saturating_mul(1000) {
                 return Err((
                     StatusCode::CONFLICT,
                     format!("rental too long — this rig caps at {max_h} h"),
-                ));
+                )
+                    .into());
             }
         }
     }
@@ -528,21 +614,11 @@ async fn create_order(
         .map(|st| st.hashrate_hs)
         .unwrap_or(0.0);
     if !is_delivering(live_hashrate) {
-        return Err((StatusCode::CONFLICT, "rig is offline".into()));
+        return Err((StatusCode::CONFLICT, "rig is offline".to_string()).into());
     }
-    let target = UpstreamTarget {
-        url,
-        user: req.user,
-        password: req.pass,
-        authority_pubkey: req.authority,
-    };
-    // Optional fallback pool. Empty url = none.
-    let fallback = fallback_url.map(|url| UpstreamTarget {
-        url,
-        user: req.fallback_user,
-        password: req.fallback_pass,
-        authority_pubkey: req.fallback_authority,
-    });
+    // The buyer's pools must take this rig's work before the order exists:
+    // the marketplace takes the first payment only after this returns.
+    probe(&s, &target, fallback.as_ref(), &req.worker).await?;
     let order = match s
         .orders
         .create(
@@ -559,10 +635,10 @@ async fn create_order(
         // The DB's one-active-per-worker guard fired — a concurrent request won
         // the race between the check above and this insert.
         Err(crate::orders::CreateOrderError::AlreadyActive) => {
-            return Err((StatusCode::CONFLICT, "rig is already rented".into()));
+            return Err((StatusCode::CONFLICT, "rig is already rented".to_string()).into());
         }
         Err(crate::orders::CreateOrderError::Db(e)) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into());
         }
     };
     // Reconnect every connected miner of the rig; each lands on the new rental's
@@ -610,6 +686,7 @@ mod tests {
             orders: crate::orders::OrderStore::new(pool.clone()),
             hashrate: HashrateStore::new(pool),
             api_token: token.into(),
+            chain: None,
         })
     }
 
@@ -627,6 +704,7 @@ mod tests {
             orders: orders.clone(),
             hashrate: HashrateStore::new(pool.clone()),
             api_token: TOKEN.into(),
+            chain: None,
         });
         (app, orders)
     }
@@ -828,6 +906,26 @@ mod tests {
             .unwrap();
         let v = body_json(resp).await;
         assert_eq!(v["orders"].as_array().unwrap().len(), 0, "nothing stored");
+    }
+
+    #[test]
+    fn a_pool_refusal_is_a_422_with_its_code_and_pool() {
+        let r = Refusal::Pool(
+            "fallback",
+            crate::probe::PoolRefusal {
+                code: crate::probe::RefusalCode::AuthRefused,
+                detail: "Unauthorized worker (24)".into(),
+            },
+        );
+        let resp = r.into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_json(resp));
+        assert_eq!(
+            v,
+            json!({"error": "pool-auth-refused", "detail": "Unauthorized worker (24)", "pool": "fallback"})
+        );
     }
 
     #[tokio::test]

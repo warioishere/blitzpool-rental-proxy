@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE orders SET status = 'ended', ended_ms = ?, end_reason = ?, end_detail = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "edd0ca906e49e174f9580247bbe4854c7b3b3e38233da94db570de34e5ff718d"
+}

@@ -23,6 +23,14 @@ pub mod sv1;
 pub mod sv2;
 pub mod translate;
 
+/// A pool refused the proxy's login: an SV1 `mining.authorize` not answered
+/// `true`, or an SV2 `OpenMiningChannel` answered with an error (SV2 carries
+/// the user identity in the channel open). Holds the pool's reason; callers
+/// that must tell a refusal from a broken connection downcast to it.
+#[derive(Debug, thiserror::Error)]
+#[error("pool refused the login: {0}")]
+pub struct LoginRefused(pub String);
+
 /// Shared, protocol-independent state handed to every connection handler.
 #[derive(Clone)]
 pub struct ProxyContext {

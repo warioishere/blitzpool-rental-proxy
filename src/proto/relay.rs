@@ -286,6 +286,7 @@ impl Session {
     /// to forward to the miner (or `None` to drop a stale-upstream line).
     async fn on_upstream_msg(&self, generation: u64, msg: RpcMessage) -> Option<String> {
         let mut order_credit: Option<(String, f64)> = None;
+        let mut order_reject: Option<(String, String)> = None;
         {
             let mut guard = self.inner.lock().await;
             let i = &mut *guard;
@@ -305,14 +306,20 @@ impl Session {
                     }
                 }
                 None => {
-                    // A response — credit accepted submits (diff-weighted).
+                    // A submit response: credit an accepted share (diff-weighted),
+                    // keep a rejected one's reason for the rental's pool health.
                     let idk = id_key(&msg.id);
-                    if let Some((g, diff)) = i.pending.remove(&idk) {
-                        if g == generation
-                            && matches!(&msg.result, Some(Value::Bool(true)))
-                            && i.delivery.accepted(diff, 1, &i.label)
-                        {
-                            order_credit = i.routing.order_id().map(|o| (o.to_string(), diff));
+                    let ours = i.pending.remove(&idk).filter(|(g, _)| *g == generation);
+                    if let Some((_, diff)) = ours {
+                        if matches!(&msg.result, Some(Value::Bool(true))) {
+                            if i.delivery.accepted(diff, 1, &i.label) {
+                                order_credit = i.routing.order_id().map(|o| (o.to_string(), diff));
+                            }
+                        } else {
+                            order_reject = i
+                                .routing
+                                .order_id()
+                                .map(|o| (o.to_string(), msg.reject_reason()));
                         }
                     }
                 }
@@ -321,6 +328,9 @@ impl Session {
         }
         if let Some((order_id, diff)) = order_credit {
             self.orders.add_work(&order_id, diff, 1);
+        }
+        if let Some((order_id, reason)) = order_reject {
+            self.orders.note_rejected(&order_id, reason);
         }
         Some(msg.to_line())
     }
@@ -378,6 +388,10 @@ impl Session {
         self.inner.lock().await.label.clone()
     }
 
+    pub(crate) fn orders(&self) -> &crate::orders::OrderStore {
+        &self.orders
+    }
+
     /// Snapshot for the control API.
     pub async fn status(&self) -> SessionStatus {
         let i = self.inner.lock().await;
@@ -399,6 +413,18 @@ fn id_key(id: &Option<Value>) -> String {
 const SV2_UP_NOMINAL_HASHRATE: f32 = 1.0e12;
 /// Extranonce-2 size requested from the SV2 pool — also the SV1 `extranonce2_size`.
 const SV2_UP_MIN_EXTRANONCE: u16 = 4;
+
+/// The Extended channel the proxy opens on an SV2 pool for an SV1 miner. The
+/// pre-rental pool probe opens the same one.
+pub(crate) fn translate_open_spec() -> crate::proto::sv2::relay::OpenSpec {
+    crate::proto::sv2::relay::OpenSpec::Extended {
+        request_id: 1,
+        nominal_hash_rate: SV2_UP_NOMINAL_HASHRATE,
+        // Most permissive max_target — let the pool's vardiff pick the working one.
+        max_target: vec![0xff; 32],
+        min_extranonce_size: SV2_UP_MIN_EXTRANONCE,
+    }
+}
 
 /// A freshly connected upstream, not yet spawned into reader/writer tasks. The
 /// caller installs it under the session lock so the new generation is visible
@@ -456,15 +482,9 @@ async fn connect_sv2_translate(
     target: &UpstreamTarget,
     user_identity: &str,
 ) -> anyhow::Result<RawUpstream> {
-    use crate::proto::sv2::relay::{connect_setup, open_on, OpenSpec};
+    use crate::proto::sv2::relay::{connect_setup, open_on};
     let (mut read, mut write) = connect_setup(target).await?;
-    let spec = OpenSpec::Extended {
-        request_id: 1,
-        nominal_hash_rate: SV2_UP_NOMINAL_HASHRATE,
-        // Most permissive max_target — let the pool's vardiff pick the working one.
-        max_target: vec![0xff; 32],
-        min_extranonce_size: SV2_UP_MIN_EXTRANONCE,
-    };
+    let spec = translate_open_spec();
     // This is the ONLY channel on a freshly-connected upstream, so no earlier
     // channel exists whose job/prev-hash could arrive before this success —
     // anything buffered here really is unexpected, unlike in the multi-channel
@@ -653,7 +673,7 @@ fn spawn_sv2_translate_reader(
     state: Arc<Mutex<Sv2UpState>>,
 ) -> JoinHandle<()> {
     use crate::proto::sv2::relay::codec::{
-        parse_new_extended_job, parse_set_new_prev_hash, parse_set_target, parse_submit_error_seq,
+        parse_new_extended_job, parse_set_new_prev_hash, parse_set_target, parse_submit_error,
         parse_submit_success,
     };
     tokio::spawn(async move {
@@ -714,7 +734,8 @@ fn spawn_sv2_translate_reader(
                     }
                 }
             } else if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_ERROR {
-                if let Some(seq) = parse_submit_error_seq(&mut f) {
+                if let Some((seq, code)) = parse_submit_error(&mut f) {
+                    session.note_translate_rejected(generation, code).await;
                     let id = {
                         let mut s = state.lock().await;
                         remove_seq(&mut s.pending_submits, seq)
@@ -820,6 +841,21 @@ impl Session {
         };
         if let Some((order_id, work, shares)) = credit {
             self.orders.add_work(&order_id, work, shares);
+        }
+    }
+
+    /// Remember a translated pool's reject reason on the active rental.
+    /// Generation-guarded.
+    async fn note_translate_rejected(&self, generation: u64, reason: String) {
+        let order_id = {
+            let i = self.inner.lock().await;
+            if generation != i.active.generation {
+                return;
+            }
+            i.routing.order_id().map(str::to_string)
+        };
+        if let Some(order_id) = order_id {
+            self.orders.note_rejected(&order_id, reason);
         }
     }
 
@@ -1350,6 +1386,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_share_the_rental_pool_rejects_leaves_its_reason_on_the_order() {
+        let pool = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = pool.local_addr().unwrap();
+        tokio::spawn(mock_sv1_pool(pool, "aaaa".into()));
+        let target = UpstreamTarget {
+            url: addr.to_string(),
+            user: "acctA".into(),
+            password: "x".into(),
+            authority_pubkey: None,
+        };
+        let (died_tx, _died_rx) = mpsc::unbounded_channel();
+        let session = idle_session_on(&target, died_tx).await;
+        let order = session
+            .orders
+            .create("acctA.rig".into(), target.clone(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
+        session.attach_order(order.id.clone()).await;
+
+        let submit = RpcMessage::request(
+            json!(7),
+            "mining.submit",
+            json!(["acctA.rig", "1", "00000000", "65000000", "00000000"]),
+        );
+        session.on_miner_msg(submit).await;
+        let refusal = RpcMessage::refusal(Some(json!(7)), 23, "Low difficulty share");
+        session.on_upstream_msg(0, refusal).await;
+
+        // Enough unanswered submits for the rule to end the rental; its detail
+        // carries the pool's words from the refusal above.
+        session
+            .orders
+            .add_submitted(&order.id, crate::orders::UNACCEPTED_SUBMITS_LIMIT);
+        session.orders.flush().await;
+        let ended = session.orders.take_finished(crate::orders::now_ms()).await;
+        assert_eq!(ended.len(), 1);
+        let detail = ended[0].end_detail.as_deref().unwrap();
+        assert!(detail.contains("Low difficulty share (23)"), "{detail}");
+    }
+
+    #[tokio::test]
     async fn an_upstream_that_comes_back_reconnects_an_extranonce_capable_miner() {
         // After its pool connection drops, the supervisor re-establishes the
         // upstream and then drops the miner, even one that would accept a live
@@ -1386,7 +1463,7 @@ mod tests {
 /// Combo 3: an SV1 miner rented onto an SV2 buyer pool. The proxy opens an
 /// Extended channel on the SV2 pool and translates jobs/shares both ways.
 #[cfg(test)]
-mod sv2_translate_tests {
+pub(crate) mod sv2_translate_tests {
     use super::tests::mock_sv1_pool;
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
@@ -1437,7 +1514,7 @@ mod sv2_translate_tests {
     /// A mock SV2 pool: loop-accepts (so detection probes + the real connect are
     /// served), opens the Extended channel, sends a future job + prev-hash, and
     /// accepts shares. Reports each share's `(channel_id, sequence_number)`.
-    async fn mock_sv2_pool(
+    pub(crate) async fn mock_sv2_pool(
         listener: TcpListener,
         keys: NoiseKeys,
         prefix: Vec<u8>,

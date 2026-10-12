@@ -110,6 +110,14 @@ impl AnySession {
         }
     }
 
+    /// The order store this session credits its rental work to.
+    fn orders(&self) -> &crate::orders::OrderStore {
+        match self {
+            AnySession::Sv1(s) => s.orders(),
+            AnySession::Sv2(s) => s.orders(),
+        }
+    }
+
     fn protocol(&self) -> &'static str {
         match self {
             AnySession::Sv1(_) => "sv1",
@@ -160,11 +168,16 @@ impl AnySession {
 /// Readers report their generation on `died_rx` when their pool connection
 /// ends; a report for a generation that is no longer active (an intentional
 /// swap happened since) is ignored, and a swap made elsewhere ends the retry.
+/// A drop while rented counts toward the order's pool health
+/// ([`crate::orders::OrderStore::note_upstream_drop`]).
 pub async fn supervise_upstream(session: AnySession, mut died_rx: mpsc::UnboundedReceiver<u64>) {
     let protocol = session.protocol();
     while let Some(gen) = died_rx.recv().await {
-        if session.routing_if_active(gen).await.is_none() {
+        let Some(routing) = session.routing_if_active(gen).await else {
             continue;
+        };
+        if let Some(order_id) = routing.order_id() {
+            session.orders().note_upstream_drop(order_id);
         }
         warn!(
             gen,

@@ -48,11 +48,27 @@ impl RpcMessage {
         if matches!(self.result, Some(Value::Bool(true))) {
             return Ok(());
         }
-        anyhow::bail!(
-            "pool refused mining.authorize (result={}, error={})",
+        Err(crate::proto::LoginRefused(format!(
+            "mining.authorize refused (result={}, error={})",
             self.result.as_ref().unwrap_or(&Value::Null),
             self.error.as_ref().unwrap_or(&Value::Null)
-        )
+        ))
+        .into())
+    }
+
+    /// The pool's words for a refused request: the message of a
+    /// `[code, message, data]` error, else the raw error or result.
+    pub fn reject_reason(&self) -> String {
+        match self.error.as_ref() {
+            Some(Value::Array(a)) => match (a.first(), a.get(1).and_then(Value::as_str)) {
+                (Some(code), Some(msg)) => format!("{msg} ({code})"),
+                _ => Value::Array(a.clone()).to_string(),
+            },
+            Some(Value::Null) | None => {
+                format!("result={}", self.result.as_ref().unwrap_or(&Value::Null))
+            }
+            Some(other) => other.to_string(),
+        }
     }
 
     /// Serialize to a wire line *including* the trailing `\n`.

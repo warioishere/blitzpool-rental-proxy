@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE worker = ? ORDER BY created_ms ASC",
+  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, created_ms, until_ms, status, ended_ms, end_reason, end_detail, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders",
   "describe": {
     "columns": [
       {
@@ -74,33 +74,43 @@
         "type_info": "Integer"
       },
       {
-        "name": "delivered_work",
+        "name": "end_reason",
         "ordinal": 14,
+        "type_info": "Text"
+      },
+      {
+        "name": "end_detail",
+        "ordinal": 15,
+        "type_info": "Text"
+      },
+      {
+        "name": "delivered_work",
+        "ordinal": 16,
         "type_info": "Float"
       },
       {
         "name": "accepted_shares",
-        "ordinal": 15,
+        "ordinal": 17,
         "type_info": "Integer"
       },
       {
         "name": "submitted_shares",
-        "ordinal": 16,
+        "ordinal": 18,
         "type_info": "Integer"
       },
       {
         "name": "price_per_th_day",
-        "ordinal": 17,
+        "ordinal": 19,
         "type_info": "Float"
       },
       {
         "name": "budget",
-        "ordinal": 18,
+        "ordinal": 20,
         "type_info": "Float"
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 0
     },
     "nullable": [
       false,
@@ -117,6 +127,8 @@
       false,
       false,
       false,
+      true,
+      true,
       false,
       false,
       false,
@@ -124,5 +136,5 @@
       false
     ]
   },
-  "hash": "c097a09fe1289e867ec8386e6b6b30f52cc2cb3001cc4480a4d6b1d5e9504681"
+  "hash": "c38855044d6b9d7543610a8cb6a0d9f6e3a0843cc7c93f4c9fb11e6510588fbd"
 }

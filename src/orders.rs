@@ -54,6 +54,65 @@ impl OrderStatus {
     }
 }
 
+/// Why an order left `active`. Serialized kebab-case, the same string the DB
+/// stores, so the marketplace can map it to its own wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndReason {
+    /// The rental reached its `until_ms`.
+    Deadline,
+    /// The measured cost reached the prepaid budget.
+    Budget,
+    /// Cancelled through the API.
+    Cancelled,
+    /// The buyer's pool accepted none of [`UNACCEPTED_SUBMITS_LIMIT`] shares.
+    PoolRejectsShares,
+    /// The buyer's pool connection dropped [`UNACCEPTED_DROPS_LIMIT`] times
+    /// before it accepted a single share.
+    PoolConnectionUnstable,
+}
+
+impl EndReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            EndReason::Deadline => "deadline",
+            EndReason::Budget => "budget",
+            EndReason::Cancelled => "cancelled",
+            EndReason::PoolRejectsShares => "pool-rejects-shares",
+            EndReason::PoolConnectionUnstable => "pool-connection-unstable",
+        }
+    }
+
+    fn from_db(s: &str) -> Option<EndReason> {
+        [
+            EndReason::Deadline,
+            EndReason::Budget,
+            EndReason::Cancelled,
+            EndReason::PoolRejectsShares,
+            EndReason::PoolConnectionUnstable,
+        ]
+        .into_iter()
+        .find(|r| r.as_str() == s)
+    }
+}
+
+/// Shares submitted on a rental, none of them accepted, after which the
+/// buyer's pool is judged unable to take this rig's work and the rental ends.
+/// A pool that accepts even one share is never judged by this.
+pub const UNACCEPTED_SUBMITS_LIMIT: u64 = 30;
+/// Upstream drops on a rental, with no share accepted, after which the rental
+/// ends.
+pub const UNACCEPTED_DROPS_LIMIT: u32 = 10;
+
+/// What the relays saw of a rental's pool beyond the share counters: how often
+/// its connection dropped and the last reason it gave for rejecting a share.
+/// In memory only; a restart starts the count over.
+#[derive(Default, Clone)]
+struct PoolHealth {
+    drops: u32,
+    last_reject: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
     pub id: String,
@@ -74,6 +133,13 @@ pub struct Order {
     /// migration.
     #[serde(default)]
     pub ended_ms: i64,
+    /// Why the order ended; `None` while active, or for rows that ended before
+    /// the `end_reason` migration.
+    #[serde(default)]
+    pub end_reason: Option<EndReason>,
+    /// Detail for `end_reason`, e.g. the pool's reject reason.
+    #[serde(default)]
+    pub end_detail: Option<String>,
     /// Delivered work measured by the proxy over this rental, in diff-1 share
     /// units (Σ of accepted-share difficulty). Hashes = `delivered_work * 2^32`;
     /// average delivered hashrate = `delivered_work * 2^32 / elapsed_seconds`.
@@ -147,6 +213,42 @@ impl Order {
     pub fn funding_exhausted(&self) -> bool {
         self.budget > 0.0 && self.cost() >= self.budget
     }
+
+    /// Why this active order must end now, if it must. Deadline and budget come
+    /// first; the pool rules only judge a rental whose pool has not accepted a
+    /// single share, so a delivering rental is never ended by them.
+    fn end_cause(&self, health: &PoolHealth, now: i64) -> Option<(EndReason, Option<String>)> {
+        if self.until_ms > 0 && self.until_ms <= now {
+            return Some((EndReason::Deadline, None));
+        }
+        if self.funding_exhausted() {
+            return Some((EndReason::Budget, None));
+        }
+        if self.accepted_shares > 0 {
+            return None;
+        }
+        if self.submitted_shares >= UNACCEPTED_SUBMITS_LIMIT {
+            let detail = match &health.last_reject {
+                Some(reason) => format!(
+                    "{} shares submitted, none accepted; pool said: {reason}",
+                    self.submitted_shares
+                ),
+                None => format!(
+                    "{} shares submitted, none accepted; the pool did not answer",
+                    self.submitted_shares
+                ),
+            };
+            return Some((EndReason::PoolRejectsShares, Some(detail)));
+        }
+        if health.drops >= UNACCEPTED_DROPS_LIMIT {
+            let detail = format!(
+                "pool connection dropped {} times before a share was accepted",
+                health.drops
+            );
+            return Some((EndReason::PoolConnectionUnstable, Some(detail)));
+        }
+        None
+    }
 }
 
 /// Flat DB row → [`Order`].
@@ -165,6 +267,8 @@ struct OrderRow {
     until_ms: i64,
     status: String,
     ended_ms: i64,
+    end_reason: Option<String>,
+    end_detail: Option<String>,
     delivered_work: f64,
     accepted_shares: i64,
     submitted_shares: i64,
@@ -193,6 +297,8 @@ impl OrderRow {
             until_ms: self.until_ms,
             status: OrderStatus::from_db(&self.status),
             ended_ms: self.ended_ms,
+            end_reason: self.end_reason.as_deref().and_then(EndReason::from_db),
+            end_detail: self.end_detail,
             delivered_work: self.delivered_work,
             accepted_shares: self.accepted_shares as u64,
             submitted_shares: self.submitted_shares as u64,
@@ -229,6 +335,9 @@ pub struct OrderStore {
     /// budgets, so funding enforcement stays current; a crash loses at most one
     /// flush interval of credit (the buyer is then slightly under-charged).
     pending: Mutex<HashMap<String, WorkDelta>>,
+    /// Per-order pool health the share counters do not carry, read by
+    /// [`OrderStore::take_finished`].
+    health: Mutex<HashMap<String, PoolHealth>>,
 }
 
 impl OrderStore {
@@ -236,6 +345,7 @@ impl OrderStore {
         Arc::new(Self {
             pool,
             pending: Mutex::new(HashMap::new()),
+            health: Mutex::new(HashMap::new()),
         })
     }
 
@@ -301,6 +411,8 @@ impl OrderStore {
             until_ms,
             status,
             ended_ms: 0,
+            end_reason: None,
+            end_detail: None,
             delivered_work: 0.0,
             accepted_shares: 0,
             submitted_shares: 0,
@@ -314,8 +426,8 @@ impl OrderStore {
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
-             price_per_th_day, budget FROM orders WHERE id = ?",
+             created_ms, until_ms, status, ended_ms, end_reason, end_detail, delivered_work, \
+             accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE id = ?",
             id
         )
         .fetch_optional(&self.pool)
@@ -330,8 +442,8 @@ impl OrderStore {
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
-             price_per_th_day, budget FROM orders"
+             created_ms, until_ms, status, ended_ms, end_reason, end_detail, delivered_work, \
+             accepted_shares, submitted_shares, price_per_th_day, budget FROM orders"
         )
         .fetch_all(&self.pool)
         .await
@@ -348,8 +460,8 @@ impl OrderStore {
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
-             price_per_th_day, budget FROM orders WHERE worker = ? ORDER BY created_ms ASC",
+             created_ms, until_ms, status, ended_ms, end_reason, end_detail, delivered_work, \
+             accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE worker = ? ORDER BY created_ms ASC",
             worker
         )
         .fetch_all(&self.pool)
@@ -366,8 +478,8 @@ impl OrderStore {
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
-             price_per_th_day, budget FROM orders \
+             created_ms, until_ms, status, ended_ms, end_reason, end_detail, delivered_work, \
+             accepted_shares, submitted_shares, price_per_th_day, budget FROM orders \
              WHERE worker = ? AND status = 'active' AND (until_ms = 0 OR until_ms > ?)",
             worker,
             now
@@ -394,6 +506,19 @@ impl OrderStore {
     pub fn add_submitted(&self, id: &str, submitted: u64) {
         let mut p = self.pending.lock().unwrap();
         p.entry(id.to_string()).or_default().submitted += submitted;
+    }
+
+    /// Remember the reason the rental's pool gave for rejecting a share; the
+    /// latest one becomes the end detail if the pool never accepts a share.
+    pub fn note_rejected(&self, id: &str, reason: String) {
+        let mut h = self.health.lock().unwrap();
+        h.entry(id.to_string()).or_default().last_reject = Some(reason);
+    }
+
+    /// Count a dropped connection to the rental's pool.
+    pub fn note_upstream_drop(&self, id: &str) {
+        let mut h = self.health.lock().unwrap();
+        h.entry(id.to_string()).or_default().drops += 1;
     }
 
     /// Flush buffered accounting to the DB — one UPDATE per order, coalescing all
@@ -428,30 +553,35 @@ impl OrderStore {
     pub async fn cancel(&self, id: &str) -> Option<Order> {
         let existing = self.get(id).await?;
         let now = now_ms();
+        let reason = EndReason::Cancelled.as_str();
         let _ = sqlx::query!(
-            "UPDATE orders SET status = 'cancelled', ended_ms = ? WHERE id = ?",
+            "UPDATE orders SET status = 'cancelled', ended_ms = ?, end_reason = ? WHERE id = ?",
             now,
+            reason,
             id
         )
         .execute(&self.pool)
         .await;
+        self.health.lock().unwrap().remove(id);
         Some(Order {
             status: OrderStatus::Cancelled,
             ended_ms: now,
+            end_reason: Some(EndReason::Cancelled),
+            end_detail: None,
             ..existing
         })
     }
 
-    /// Mark every finished active order as ended (past its deadline OR with its
-    /// prepaid budget consumed) and return them so the caller can revert the
-    /// corresponding sessions.
-    pub async fn take_expired(&self, now: i64) -> Vec<Order> {
+    /// Mark every active order that must end as ended, with its
+    /// [`EndReason`], and return them so the caller can revert the
+    /// corresponding sessions. See [`Order::end_cause`] for the rules.
+    pub async fn take_finished(&self, now: i64) -> Vec<Order> {
         let active = sqlx::query_as!(
             OrderRow,
             "SELECT id, worker, target_url, target_user, target_password, target_authority, \
              fallback_url, fallback_user, fallback_password, fallback_authority, \
-             created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, \
-             price_per_th_day, budget FROM orders WHERE status = 'active'"
+             created_ms, until_ms, status, ended_ms, end_reason, end_detail, delivered_work, \
+             accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE status = 'active'"
         )
         .fetch_all(&self.pool)
         .await
@@ -459,28 +589,43 @@ impl OrderStore {
 
         let mut finished = Vec::new();
         for o in active.into_iter().map(OrderRow::into_order) {
-            let deadline_passed = o.until_ms > 0 && o.until_ms <= now;
-            if deadline_passed || o.funding_exhausted() {
-                let _ = sqlx::query!(
-                    "UPDATE orders SET status = 'ended', ended_ms = ? WHERE id = ?",
-                    now,
-                    o.id
-                )
-                .execute(&self.pool)
-                .await;
-                finished.push(Order {
-                    status: OrderStatus::Ended,
-                    ended_ms: now,
-                    ..o
-                });
-            }
+            let health = self
+                .health
+                .lock()
+                .unwrap()
+                .get(&o.id)
+                .cloned()
+                .unwrap_or_default();
+            let Some((reason, detail)) = o.end_cause(&health, now) else {
+                continue;
+            };
+            let reason_str = reason.as_str();
+            let _ = sqlx::query!(
+                "UPDATE orders SET status = 'ended', ended_ms = ?, end_reason = ?, end_detail = ? \
+                 WHERE id = ?",
+                now,
+                reason_str,
+                detail,
+                o.id
+            )
+            .execute(&self.pool)
+            .await;
+            self.health.lock().unwrap().remove(&o.id);
+            finished.push(Order {
+                status: OrderStatus::Ended,
+                ended_ms: now,
+                end_reason: Some(reason),
+                end_detail: detail,
+                ..o
+            });
         }
         finished
     }
 }
 
 /// Background task: every 5s, revert sessions whose rental has finished
-/// (deadline reached or prepaid budget consumed).
+/// (deadline reached, prepaid budget consumed, or a pool that takes none of
+/// the rig's shares).
 pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -489,7 +634,7 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
             // Persist buffered share accounting before checking budgets, so
             // funding_exhausted sees the just-delivered work.
             orders.flush().await;
-            for o in orders.take_expired(now_ms()).await {
+            for o in orders.take_finished(now_ms()).await {
                 let sessions = registry.get_all(&o.worker).await;
                 if !sessions.is_empty() {
                     // The order is already marked ended, so a reconnect resolves
@@ -497,7 +642,7 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
                     for session in &sessions {
                         session.force_reconnect();
                     }
-                    info!(order = %o.id, worker = %o.worker, sessions = sessions.len(), "rental finished → miners reconnecting to default");
+                    info!(order = %o.id, worker = %o.worker, sessions = sessions.len(), reason = ?o.end_reason, detail = ?o.end_detail, "rental finished → miners reconnecting to default");
                 }
             }
         }
@@ -541,17 +686,24 @@ mod tests {
         let c = store.cancel(&o1.id).await.unwrap();
         assert!(c.ended_ms > 0, "cancel sets ended_ms");
         assert_eq!(c.status, OrderStatus::Cancelled);
+        assert_eq!(c.end_reason, Some(EndReason::Cancelled));
 
         // A second order (allowed now the first is cancelled) with a passed
-        // deadline is ended by take_expired, which also stamps ended_ms.
+        // deadline is ended by take_finished, which also stamps ended_ms.
         let o2 = store
             .create("wend".into(), target(), None, now_ms() - 1000, 1.0, 0.0)
             .await
             .unwrap();
-        let expired = store.take_expired(now_ms()).await;
+        let expired = store.take_finished(now_ms()).await;
         assert!(
             expired.iter().any(|o| o.id == o2.id && o.ended_ms > 0),
-            "take_expired sets ended_ms"
+            "take_finished sets ended_ms"
+        );
+        let stored = store.get(&o2.id).await.unwrap();
+        assert_eq!(stored.end_reason, Some(EndReason::Deadline));
+        assert_eq!(
+            store.get(&o1.id).await.unwrap().end_reason,
+            Some(EndReason::Cancelled)
         );
 
         // Both orders come back for the worker, oldest first, all ended.
@@ -597,11 +749,11 @@ mod tests {
             .create("w3".into(), target(), None, now_ms() + 60_000, 0.0, 0.0)
             .await
             .unwrap();
-        let expired = store.take_expired(now_ms()).await;
+        let expired = store.take_finished(now_ms()).await;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].worker, "w2");
         assert!(store.active_for_worker("w3", now_ms()).await.is_some());
-        assert!(store.take_expired(now_ms()).await.is_empty());
+        assert!(store.take_finished(now_ms()).await.is_empty());
     }
 
     #[tokio::test]
@@ -613,7 +765,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            store.take_expired(now_ms()).await.is_empty(),
+            store.take_finished(now_ms()).await.is_empty(),
             "fresh order is live"
         );
 
@@ -625,9 +777,104 @@ mod tests {
         assert!((after.cost() - 100.0).abs() < 1e-6, "cost ≈ budget");
         assert_eq!(after.budget_remaining(), 0.0);
 
-        let ended = store.take_expired(now_ms()).await;
+        let ended = store.take_finished(now_ms()).await;
         assert_eq!(ended.len(), 1, "exhausted budget ends the rental");
         assert_eq!(ended[0].id, o.id);
+        assert_eq!(ended[0].end_reason, Some(EndReason::Budget));
+    }
+
+    #[tokio::test]
+    async fn a_pool_that_accepts_no_share_ends_the_rental_with_its_reason() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let o = store
+            .create("wp".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        store.add_submitted(&o.id, UNACCEPTED_SUBMITS_LIMIT - 1);
+        store.note_rejected(&o.id, "Stale (21)".into());
+        store.flush().await;
+        assert!(
+            store.take_finished(now_ms()).await.is_empty(),
+            "one share short of the limit"
+        );
+
+        store.add_submitted(&o.id, 1);
+        store.flush().await;
+        let ended = store.take_finished(now_ms()).await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].end_reason, Some(EndReason::PoolRejectsShares));
+        let stored = store.get(&o.id).await.unwrap();
+        assert_eq!(stored.status, OrderStatus::Ended);
+        assert_eq!(stored.end_reason, Some(EndReason::PoolRejectsShares));
+        assert!(
+            stored.end_detail.as_deref().unwrap().contains("Stale (21)"),
+            "{:?}",
+            stored.end_detail
+        );
+        assert!(store.active_for_worker("wp", now_ms()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_pool_rules_spare_a_rental_with_one_accepted_share() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        // Same counts on both: far past both limits. Only `delivering` has a
+        // share accepted.
+        let delivering = store
+            .create("wa".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let dead = store
+            .create("wd".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        for id in [&delivering.id, &dead.id] {
+            store.add_submitted(id, 10 * UNACCEPTED_SUBMITS_LIMIT);
+            for _ in 0..10 * UNACCEPTED_DROPS_LIMIT {
+                store.note_upstream_drop(id);
+            }
+        }
+        store.add_work(&delivering.id, 1.0, 1);
+        store.flush().await;
+        let ended = store.take_finished(now_ms()).await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].id, dead.id);
+        assert!(store.active_for_worker("wa", now_ms()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_pool_connection_that_keeps_dropping_ends_the_rental() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let o = store
+            .create("wu".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        for _ in 0..UNACCEPTED_DROPS_LIMIT - 1 {
+            store.note_upstream_drop(&o.id);
+        }
+        assert!(store.take_finished(now_ms()).await.is_empty());
+        store.note_upstream_drop(&o.id);
+        let ended = store.take_finished(now_ms()).await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].end_reason, Some(EndReason::PoolConnectionUnstable));
+        assert_eq!(
+            store.get(&o.id).await.unwrap().end_reason,
+            Some(EndReason::PoolConnectionUnstable)
+        );
+    }
+
+    #[test]
+    fn end_reasons_round_trip_the_db_string() {
+        for r in [
+            EndReason::Deadline,
+            EndReason::Budget,
+            EndReason::Cancelled,
+            EndReason::PoolRejectsShares,
+            EndReason::PoolConnectionUnstable,
+        ] {
+            assert_eq!(EndReason::from_db(r.as_str()), Some(r));
+            assert_eq!(serde_json::to_value(r).unwrap(), r.as_str());
+        }
+        assert_eq!(EndReason::from_db("unknown"), None);
     }
 
     #[tokio::test]

@@ -213,12 +213,15 @@ pub(crate) fn parse_open_success(frame: &mut Sv2Frame) -> Option<ChannelInfo> {
 }
 
 /// The `request_id` of an `OpenMiningChannelError`, to route the failure back to
-/// the member whose pending open it answers.
-pub(super) fn parse_open_error_request_id(frame: &mut Sv2Frame) -> Option<u32> {
+/// the member whose pending open it answers, and the pool's `error_code`.
+pub(super) fn parse_open_error(frame: &mut Sv2Frame) -> Option<(u32, String)> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
-        Mining::OpenMiningChannelError(m) => Some(m.request_id),
+        Mining::OpenMiningChannelError(m) => Some((
+            m.request_id,
+            String::from_utf8_lossy(m.error_code.inner_as_ref()).into_owned(),
+        )),
         _ => None,
     }
 }
@@ -268,12 +271,16 @@ pub(crate) fn parse_set_new_prev_hash(
     }
 }
 
-/// The `sequence_number` of a `SubmitSharesError` (the rejected share's id).
-pub(crate) fn parse_submit_error_seq(frame: &mut Sv2Frame) -> Option<u32> {
+/// The `sequence_number` (the rejected share's id) and `error_code` of a
+/// `SubmitSharesError`.
+pub(crate) fn parse_submit_error(frame: &mut Sv2Frame) -> Option<(u32, String)> {
     let mt = wire::msg_type(frame)?;
     let payload = frame.payload();
     match Mining::try_from((mt, payload)).ok()? {
-        Mining::SubmitSharesError(m) => Some(m.sequence_number),
+        Mining::SubmitSharesError(m) => Some((
+            m.sequence_number,
+            String::from_utf8_lossy(m.error_code.inner_as_ref()).into_owned(),
+        )),
         _ => None,
     }
 }

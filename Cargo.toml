@@ -43,6 +43,10 @@ rand = "0.8"
 # 256-bit integer division for the bdiff difficulty<->target conversion in the
 # translator (translate.rs). Already present transitively via the SV2 stack.
 primitive-types = { version = "0.13", default-features = false }
+# TLS to the Electrum server that supplies the Bitcoin tip for the pool probe
+# (src/chain.rs). ring as the crypto provider: no cmake/NASM in the build.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

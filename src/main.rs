@@ -9,11 +9,13 @@
 //! rentals and the expiry task auto-reverts finished ones.
 
 mod api;
+mod chain;
 mod config;
 mod control;
 mod db;
 mod hashrate;
 mod orders;
+mod probe;
 mod proto;
 mod registry;
 mod session;
@@ -45,6 +47,17 @@ async fn main() -> anyhow::Result<()> {
     match &cfg.default_upstream {
         Some(u) => info!(bootstrap = %u.url, "SV1 handshake bootstrap configured (register-only routing)"),
         None => info!("no SV1 bootstrap (RENTAL_PROXY_POOL_URL unset) — SV2 register-only; SV1 miners rejected"),
+    }
+
+    // The Bitcoin tip the pool probe checks a buyer pool's first job against.
+    let chain = chain::Electrum::from_env()
+        .context("RENTAL_PROXY_ELECTRUM")?
+        .map(Arc::new);
+    match &chain {
+        Some(e) => {
+            info!(electrum = %e.describe(), "pool probe checks jobs against the Bitcoin tip")
+        }
+        None => warn!("RENTAL_PROXY_ELECTRUM unset — the pool probe does not check the chain"),
     }
 
     let registry = registry::Registry::new();
@@ -87,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
             orders: orders.clone(),
             hashrate: hashrate.clone(),
             api_token: api_token.clone(),
+            chain,
         };
         tokio::spawn(async move {
             if let Err(e) = api::serve(api_addr, state).await {

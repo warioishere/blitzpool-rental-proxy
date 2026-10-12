@@ -292,7 +292,11 @@ pub(crate) async fn open_on(
                     .ok_or_else(|| anyhow!("malformed OpenMiningChannelSuccess"));
             }
             Some(mining::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR) => {
-                bail!("upstream rejected OpenMiningChannel")
+                let code = parse_open_error(&mut f).map_or_else(String::new, |(_, c)| c);
+                return Err(crate::proto::LoginRefused(format!(
+                    "OpenMiningChannel refused: {code}"
+                ))
+                .into());
             }
             _ => {
                 // A frame for a channel opened EARLIER on this connection.
@@ -1027,7 +1031,7 @@ impl Sv2Session {
         // An additional open was rejected: pass the error back to the member that
         // asked for it (or fan out if the request is unknown, so no miner hangs).
         if mt == mining::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR {
-            match parse_open_error_request_id(&mut frame).and_then(|req| i.pending.remove(&req)) {
+            match parse_open_error(&mut frame).and_then(|(req, _)| i.pending.remove(&req)) {
                 Some((member, spec)) => {
                     // Rebuild with the miner's original request_id (the upstream
                     // error echoes the proxy-assigned one the miner won't know).
@@ -1109,6 +1113,12 @@ impl Sv2Session {
         // Accounting: weight accepted shares by the channel's current
         // difficulty (proxy-authoritative) and credit the active rental.
         let mut order_credit: Option<(String, f64, u64)> = None;
+        let mut order_reject: Option<(String, String)> = None;
+        if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_ERROR {
+            if let Some((_, code)) = parse_submit_error(&mut frame) {
+                order_reject = i.routing.order_id().map(|o| (o.to_string(), code));
+            }
+        }
         if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {
             let count = parse_submit_success(&mut frame).map_or(0, |(_, n)| n);
             let diff = i
@@ -1165,6 +1175,9 @@ impl Sv2Session {
         if let Some((order_id, work, shares)) = order_credit {
             self.orders.add_work(&order_id, work, shares);
         }
+        if let Some((order_id, reason)) = order_reject {
+            self.orders.note_rejected(&order_id, reason);
+        }
     }
 
     pub async fn status(&self) -> SessionStatus {
@@ -1175,6 +1188,10 @@ impl Sv2Session {
 
     async fn worker_label(&self) -> String {
         self.inner.lock().await.label.clone()
+    }
+
+    pub(crate) fn orders(&self) -> &OrderStore {
+        &self.orders
     }
 
     /// Whether the rig's upstream is an SV1 pool reached via translation (can't
@@ -1543,8 +1560,9 @@ async fn handle_sv1_line(
             let f = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesSuccess(ok)));
             session.send_translate_frame(generation, f).await;
         } else {
-            let reason = m.error.clone().unwrap_or(Value::Null);
+            let reason = m.reject_reason();
             warn!(error = %reason, "sv1 pool rejected a share");
+            session.note_translate_rejected(generation, reason).await;
             if let Ok(error_code) = Str0255::try_from("rejected".to_string()) {
                 let err = mining::SubmitSharesError {
                     channel_id: down_cid,
@@ -1611,6 +1629,21 @@ impl Sv2Session {
         };
         if let Some((order_id, work, shares)) = credit {
             self.orders.add_work(&order_id, work, shares);
+        }
+    }
+
+    /// Remember a translated pool's reject reason on the active rental.
+    /// Generation-guarded.
+    async fn note_translate_rejected(&self, generation: u64, reason: String) {
+        let order_id = {
+            let i = self.inner.lock().await;
+            if generation != i.active.generation {
+                return;
+            }
+            i.routing.order_id().map(str::to_string)
+        };
+        if let Some(order_id) = order_id {
+            self.orders.note_rejected(&order_id, reason);
         }
     }
 

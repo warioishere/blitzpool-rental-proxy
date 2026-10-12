@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, created_ms, until_ms, status, ended_ms, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE status = 'active'",
+  "query": "SELECT id, worker, target_url, target_user, target_password, target_authority, fallback_url, fallback_user, fallback_password, fallback_authority, created_ms, until_ms, status, ended_ms, end_reason, end_detail, delivered_work, accepted_shares, submitted_shares, price_per_th_day, budget FROM orders WHERE id = ?",
   "describe": {
     "columns": [
       {
@@ -74,33 +74,43 @@
         "type_info": "Integer"
       },
       {
-        "name": "delivered_work",
+        "name": "end_reason",
         "ordinal": 14,
+        "type_info": "Text"
+      },
+      {
+        "name": "end_detail",
+        "ordinal": 15,
+        "type_info": "Text"
+      },
+      {
+        "name": "delivered_work",
+        "ordinal": 16,
         "type_info": "Float"
       },
       {
         "name": "accepted_shares",
-        "ordinal": 15,
+        "ordinal": 17,
         "type_info": "Integer"
       },
       {
         "name": "submitted_shares",
-        "ordinal": 16,
+        "ordinal": 18,
         "type_info": "Integer"
       },
       {
         "name": "price_per_th_day",
-        "ordinal": 17,
+        "ordinal": 19,
         "type_info": "Float"
       },
       {
         "name": "budget",
-        "ordinal": 18,
+        "ordinal": 20,
         "type_info": "Float"
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       false,
@@ -117,6 +127,8 @@
       false,
       false,
       false,
+      true,
+      true,
       false,
       false,
       false,
@@ -124,5 +136,5 @@
       false
     ]
   },
-  "hash": "dc69f3588d335e8d49d2e8544b01ffb38cf7f6c017515c649c5850d59a031923"
+  "hash": "4387b15e01fc4f045ebd2781790fbc252f94af9b24a47cbe153516bcd020ac9d"
 }
