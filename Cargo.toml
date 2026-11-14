@@ -21,21 +21,20 @@ axum = "0.8"
 # lets the build run without a live DB (SQLX_OFFLINE).
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 
-# Stratum V2 protocol + Noise transport. Pulled from the upstream
-# stratum-mining git repos (NOT crates.io): the crates.io releases at current majors don't
-# compile together (mining_sv2's derives reference `super::binary_sv2`), whereas
-# the git workspaces are internally consistent.
+# Stratum V2 protocol + Noise transport.
 #   - stratum-core re-exports the protocol set (codec_sv2 + noise_sv2 +
-#     parsers_sv2 + mining_sv2 + common_messages_sv2 + binary_sv2).
+#     parsers_sv2 + mining_sv2 + common_messages_sv2 + binary_sv2 +
+#     channels_sv2). The `translation` feature adds the stratum_translation +
+#     sv1_api sub-crates: SV1<->SV2 message conversion + the SV1 protocol types,
+#     used by the bidirectional translator that lets a buyer pool speak either
+#     protocol regardless of the rig.
 #   - stratum-apps::network_helpers gives the Noise TCP transport
-#     (connect_with_noise / accept_noise_connection → NoiseTcpStream).
-# stratum-core and stratum-apps' transitive stratum-core unify on branch=main;
-# the exact rev is pinned in Cargo.lock (kept in sync with the sv2-apps rev).
-# The `translation` feature adds the stratum_translation + sv1_api sub-crates:
-# SV1↔SV2 message conversion + the SV1 protocol types, used by the bidirectional
-# translator that lets a buyer pool speak either protocol regardless of the rig.
-stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main", features = ["translation"] }
-stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps", rev = "27985c63f7c47310281289d4da17b90780bb11fd", default-features = false, features = ["network", "std"] }
+#     (connect_with_noise / accept_noise_connection -> NoiseTcpStream).
+# UPSTREAM-PIN: stratum-mining/sv2-apps tag v0.9.2, and stratum-core exactly
+# the crates.io version that tag pins (0.7.0), so Cargo builds one
+# stratum-core graph.
+stratum-core = { version = "=0.7.0", features = ["translation"] }
+stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps", tag = "v0.9.2", default-features = false, features = ["network", "std"] }
 # secp256k1 matched to noise_sv2's version so the keypair types line up; rand
 # for key generation.
 secp256k1 = { version = "0.28", features = ["rand", "alloc"] }

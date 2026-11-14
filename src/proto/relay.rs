@@ -36,14 +36,15 @@ use super::sv1::{self, PoolConn, RpcMessage};
 use super::ProxyContext;
 use crate::control::{AnySession, SessionStatus};
 use crate::session::{Delivery, Routing, UpstreamTarget};
+use crate::share_gate::{Sv1Gate, Verdict};
 
 // Translation path (combo 3: SV1 miner ↔ SV2 buyer pool).
 use crate::proto::sv2::wire;
 use crate::proto::translate;
 use std::collections::VecDeque;
-use stratum_core::bitcoin::hashes::hex::DisplayHex;
+use stratum_core::bitcoin::hashes::hex::{DisplayHex, FromHex};
 use stratum_core::mining_sv2 as mining;
-use stratum_core::parsers_sv2::{AnyMessage, Mining};
+use stratum_core::parsers_sv2::{AnyMessageOwned, MiningOwned};
 use stratum_core::sv1_api::{json_rpc as sv1_json, methods::client_to_server, utils::HexU32Be};
 
 type Tx = mpsc::UnboundedSender<String>;
@@ -132,6 +133,60 @@ struct Inner {
     /// Set once the miner has sent `mining.subscribe` — until then, translated
     /// jobs are stashed as prelude so a job never precedes the subscribe reply.
     subscribed: bool,
+    /// The miner's share gate (its own difficulty, the shares it judges). Set
+    /// by the first upstream install; every line to the miner and every submit
+    /// from it passes through it.
+    gate: Option<Sv1Gate>,
+}
+
+impl Inner {
+    /// Pass a line bound for the miner through the gate: jobs are tracked, the
+    /// pool's difficulty becomes the miner's. `None` drops the line (a
+    /// difficulty the miner already has).
+    fn line_to_miner(&mut self, line: String) -> Option<String> {
+        match self.gate.as_mut() {
+            Some(g) => g.line_to_miner(line),
+            None => Some(line),
+        }
+    }
+
+    /// Deliver a line to the miner, or stash it as prelude until the miner has
+    /// subscribed (a job or difficulty must not precede the subscribe reply).
+    /// Every path that writes to the miner after the handshake goes through
+    /// here with the session lock held, so the miner sees lines in the order
+    /// the gate produced them. Returns `false` when the miner is gone.
+    fn emit(&mut self, to_miner: &Tx, line: String) -> bool {
+        if self.subscribed {
+            to_miner.send(line).is_ok()
+        } else {
+            self.pending_prelude.push(line);
+            true
+        }
+    }
+
+    /// Mark the miner subscribed and deliver what was stashed for it.
+    fn flush_prelude(&mut self, to_miner: &Tx) {
+        self.subscribed = true;
+        for line in std::mem::take(&mut self.pending_prelude) {
+            let _ = to_miner.send(line);
+        }
+    }
+
+    /// Whether the miner's gate can judge its shares. When it cannot, the
+    /// hashrate is measured from the pool's accepted work instead.
+    fn gate_tracking(&self) -> bool {
+        self.gate.as_ref().is_some_and(Sv1Gate::is_tracking)
+    }
+}
+
+/// The typed `mining.submit` inside a miner message, if it is one.
+fn parse_submit(msg: &RpcMessage) -> Option<client_to_server::Submit> {
+    let req = sv1_json::StandardRequest {
+        id: msg.id.as_ref().and_then(|v| v.as_u64()).unwrap_or(0),
+        method: "mining.submit".to_string(),
+        params: msg.params.clone().unwrap_or(Value::Null),
+    };
+    client_to_server::Submit::try_from(req).ok()
 }
 
 /// A live seller-miner session. Held by the relay tasks and the registry.
@@ -253,20 +308,11 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("switch: connect {}: {e}", target.url))?;
 
         // Swap atomically (the reader is spawned inside the lock so the new
-        // generation is visible before it can forward — no first-job drop).
-        let (en1, en2) = self
-            .install_raw(raw, generation, target.clone(), routing)
+        // generation is visible before it can forward — no first-job drop),
+        // and re-point the miner in the same hold of the lock.
+        self.install_raw(raw, generation, target.clone(), routing, capable)
             .await;
-
-        // Re-point the miner: new extranonce + the new upstream's initial
-        // set_difficulty/notify (else it keeps the old target → every share
-        // rejected as "Difficulty too low"). Modern ASICs honor set_extranonce
-        // live; non-capable miners take the reconnect path at authorize instead.
-        if capable {
-            let _ = self
-                .to_miner
-                .send(RpcMessage::set_extranonce(&en1, en2).to_line());
-        } else {
+        if !capable {
             // Left connected, this miner would keep building on an extranonce1
             // the new upstream does not know, and the pool would reject every
             // share. It cannot be told mid-session, so drop it and let it come
@@ -274,24 +320,21 @@ impl Session {
             warn!(upstream = %target.url, "miner not extranonce-capable; reconnecting it onto the new upstream");
             self.force_reconnect();
         }
-        let prelude = std::mem::take(&mut self.inner.lock().await.pending_prelude);
-        for line in prelude {
-            let _ = self.to_miner.send(line);
-        }
         info!(upstream = %target.url, generation, capable, "upstream switched");
         Ok(())
     }
 
-    /// Process a line from the upstream tagged `generation`; returns the line
-    /// to forward to the miner (or `None` to drop a stale-upstream line).
-    async fn on_upstream_msg(&self, generation: u64, msg: RpcMessage) -> Option<String> {
+    /// Process a line from the upstream tagged `generation` and pass it on to
+    /// the miner (a stale-upstream line is dropped). Returns `false` when the
+    /// miner is gone.
+    async fn on_upstream_msg(&self, generation: u64, msg: RpcMessage) -> bool {
         let mut order_credit: Option<(String, f64)> = None;
         let mut order_reject: Option<(String, String)> = None;
-        {
+        let alive = {
             let mut guard = self.inner.lock().await;
             let i = &mut *guard;
             if generation != i.active.generation {
-                return None; // stale upstream (already swapped away)
+                return true; // stale upstream (already swapped away)
             }
             match msg.method.as_deref() {
                 Some("mining.set_difficulty") => {
@@ -312,6 +355,9 @@ impl Session {
                     let ours = i.pending.remove(&idk).filter(|(g, _)| *g == generation);
                     if let Some((_, diff)) = ours {
                         if matches!(&msg.result, Some(Value::Bool(true))) {
+                            if !i.gate_tracking() {
+                                i.delivery.measured(diff);
+                            }
                             if i.delivery.accepted(diff, 1, &i.label) {
                                 order_credit = i.routing.order_id().map(|o| (o.to_string(), diff));
                             }
@@ -325,14 +371,18 @@ impl Session {
                 }
                 _ => {}
             }
-        }
+            match i.line_to_miner(msg.to_line()) {
+                Some(line) => i.emit(&self.to_miner, line),
+                None => true,
+            }
+        };
         if let Some((order_id, diff)) = order_credit {
             self.orders.add_work(&order_id, diff, 1);
         }
         if let Some((order_id, reason)) = order_reject {
             self.orders.note_rejected(&order_id, reason);
         }
-        Some(msg.to_line())
+        alive
     }
 
     /// Process a line from the miner; sends the (possibly rewritten) line to the
@@ -343,6 +393,24 @@ impl Session {
         {
             let mut guard = self.inner.lock().await;
             let i = &mut *guard;
+            if msg.method.as_deref() == Some("mining.submit") {
+                let verdict = match (i.gate.as_mut(), parse_submit(&msg)) {
+                    (Some(g), Some(submit)) => g.check(&submit),
+                    (Some(g), None) => g.unplaced(),
+                    (None, _) => Verdict::Forward { measured: None },
+                };
+                if let Some(d) = verdict.measured() {
+                    i.delivery.measured(d);
+                }
+                if let Verdict::Withhold { .. } = verdict {
+                    // Met the miner's target, not the pool's: the pool would
+                    // reject it, so the proxy answers it.
+                    let _ = self
+                        .to_miner
+                        .send(RpcMessage::response(msg.id.clone(), json!(true)).to_line());
+                    return;
+                }
+            }
             match msg.method.as_deref() {
                 Some("mining.authorize") => {
                     // The proxy authorizes upstream itself (with the pool/buyer
@@ -367,6 +435,24 @@ impl Session {
                         if let Some(first) = arr.first_mut() {
                             *first = json!(up_worker);
                         }
+                    }
+                }
+                Some("mining.suggest_difficulty") => {
+                    // The miner names the difficulty it wants: it sizes the
+                    // miner target until vardiff knows better. The pool still
+                    // receives it below.
+                    let suggested = msg
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_f64());
+                    let line = match (suggested, i.gate.as_mut()) {
+                        (Some(d), Some(g)) => g.suggest_difficulty(d),
+                        _ => None,
+                    };
+                    if let Some(line) = line {
+                        i.emit(&self.to_miner, line);
                     }
                 }
                 Some("mining.extranonce.subscribe") => {
@@ -521,6 +607,7 @@ impl Session {
         generation: u64,
         target: UpstreamTarget,
         routing: Routing,
+        extranonce_capable: bool,
     ) -> (String, u32) {
         let mut i = self.inner.lock().await;
         i.active.reader.abort();
@@ -569,6 +656,32 @@ impl Session {
                 )
             }
         };
+        // The miner's gate for this upstream, starting from the pool's
+        // difficulty: the last one in its handshake prelude (a translated SV2
+        // pool's is synthesized there too), or none yet when the pool sets it
+        // after the handshake. A renewed gate
+        // keeps the device's vardiff estimate across the switch. The prelude
+        // then passes through it like every later line, so the miner's first
+        // set_difficulty already carries the miner difficulty.
+        let start_difficulty = prelude
+            .iter()
+            .rev()
+            .find_map(|l| translate::set_difficulty_from_line(l));
+        let en1_bytes = Vec::<u8>::from_hex(&en1).unwrap_or_default();
+        let fresh = Sv1Gate::new(
+            &en1_bytes,
+            en2 as u16,
+            start_difficulty.map(translate::target_from_difficulty),
+        );
+        let mut gate = match i.gate.take() {
+            Some(old) => old.renewed(fresh),
+            None => fresh,
+        };
+        let prelude: Vec<String> = prelude
+            .into_iter()
+            .filter_map(|l| gate.line_to_miner(l))
+            .collect();
+        i.gate = Some(gate);
         i.active = ActiveUpstream {
             generation,
             target,
@@ -587,6 +700,21 @@ impl Session {
         // arrive with the new generation, so drop the orphaned credit entries.
         i.pending.clear();
         i.pending_prelude = prelude;
+        // A miner already past its subscribe is re-pointed here, in the same
+        // hold of the lock that installed the reader: the new extranonce, then
+        // the new upstream's initial set_difficulty/notify (else it keeps the
+        // old target and every share is rejected as "Difficulty too low").
+        // The reader waits on this lock, so none of its lines can overtake
+        // them. Modern ASICs honor set_extranonce live; a miner that can't is
+        // reconnected by the caller.
+        if i.subscribed {
+            if extranonce_capable {
+                let _ = self
+                    .to_miner
+                    .send(RpcMessage::set_extranonce(&en1, en2).to_line());
+            }
+            i.flush_prelude(&self.to_miner);
+        }
         (en1, en2)
     }
 }
@@ -620,12 +748,7 @@ fn spawn_sv2_translate_writer(
             if msg.method.as_deref() != Some("mining.submit") {
                 continue; // only shares cross to the SV2 pool
             }
-            let req = sv1_json::StandardRequest {
-                id: msg.id.as_ref().and_then(|v| v.as_u64()).unwrap_or(0),
-                method: "mining.submit".to_string(),
-                params: msg.params.clone().unwrap_or(Value::Null),
-            };
-            let Ok(submit) = client_to_server::Submit::try_from(req) else {
+            let Some(submit) = parse_submit(&msg) else {
                 continue;
             };
             let (channel_id, seq, job_version) = {
@@ -654,8 +777,9 @@ fn spawn_sv2_translate_writer(
                     continue;
                 }
             };
-            let frame =
-                wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesExtended(sv2_submit)));
+            let frame = wire::frame_from(AnyMessageOwned::Mining(
+                MiningOwned::SubmitSharesExtended(sv2_submit),
+            ));
             if write.write_frame(frame).await.is_err() {
                 break;
             }
@@ -677,15 +801,10 @@ fn spawn_sv2_translate_reader(
         parse_submit_success,
     };
     tokio::spawn(async move {
-        let mut prev: Option<mining::SetNewPrevHash<'static>> = None;
-        let mut job: Option<mining::NewExtendedMiningJob<'static>> = None;
-        while let Ok(frame) = read.read_frame().await {
-            let Some(mut f) = wire::into_sv2(frame) else {
-                continue;
-            };
-            let Some(mt) = wire::msg_type(&f) else {
-                continue;
-            };
+        let mut prev: Option<mining::SetNewPrevHashOwned> = None;
+        let mut job: Option<mining::NewExtendedMiningJobOwned> = None;
+        while let Ok(mut f) = read.read_frame().await {
+            let mt = wire::msg_type(&f);
             if mt == mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB {
                 if let Some(j) = parse_new_extended_job(&mut f) {
                     {
@@ -696,7 +815,7 @@ fn spawn_sv2_translate_reader(
                         s.job_versions.insert(j.job_id, j.version);
                         s.latest_version = j.version;
                     }
-                    if j.min_ntime.clone().into_inner().is_none() {
+                    if j.ntime_start.clone().into_inner().is_none() {
                         // Future job — wait for SetNewPrevHash to activate it.
                         job = Some(j);
                     } else {
@@ -755,8 +874,8 @@ fn spawn_sv2_translate_reader(
 async fn emit_translate_notify(
     session: &Arc<Session>,
     generation: u64,
-    prev: mining::SetNewPrevHash<'static>,
-    job: mining::NewExtendedMiningJob<'static>,
+    prev: mining::SetNewPrevHashOwned,
+    job: mining::NewExtendedMiningJobOwned,
     clean: bool,
 ) {
     match translate::sv2_job_to_sv1_notify(prev, job, clean) {
@@ -794,20 +913,12 @@ impl Session {
     /// subscribed yet (so a job never precedes the subscribe reply). No-op if the
     /// generation is stale (a swap happened).
     async fn send_or_stash(&self, generation: u64, line: String) {
-        let send = {
-            let mut i = self.inner.lock().await;
-            if generation != i.active.generation {
-                return;
-            }
-            if i.subscribed {
-                true
-            } else {
-                i.pending_prelude.push(line.clone());
-                false
-            }
-        };
-        if send {
-            let _ = self.to_miner.send(line);
+        let mut i = self.inner.lock().await;
+        if generation != i.active.generation {
+            return;
+        }
+        if let Some(line) = i.line_to_miner(line) {
+            i.emit(&self.to_miner, line);
         }
     }
 
@@ -833,6 +944,9 @@ impl Session {
             }
             let work = i.current_difficulty * count as f64;
             let shares = count as u64;
+            if !i.gate_tracking() {
+                i.delivery.measured(work);
+            }
             if i.delivery.accepted(work, shares, &i.label) {
                 i.routing.order_id().map(|o| (o.to_string(), work, shares))
             } else {
@@ -870,6 +984,24 @@ impl Session {
     }
 }
 
+/// Retarget the miner when its gate's vardiff says so. Runs for the life of
+/// the miner connection; a retarget waits for the subscribe reply, before
+/// which the miner takes no difficulty.
+async fn run_vardiff(session: Arc<Session>) {
+    let mut every = tokio::time::interval(crate::share_gate::VARDIFF_TICK);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let mut i = session.inner.lock().await;
+        if !i.subscribed {
+            continue;
+        }
+        if let Some(line) = i.gate.as_mut().and_then(Sv1Gate::tick) {
+            i.emit(&session.to_miner, line);
+        }
+    }
+}
+
 fn spawn_writer(
     mut half: OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<String>,
@@ -897,10 +1029,8 @@ fn spawn_upstream_reader(
             let Ok(msg) = RpcMessage::parse(&line) else {
                 continue;
             };
-            if let Some(out) = session.on_upstream_msg(generation, msg).await {
-                if session.to_miner.send(out).is_err() {
-                    break;
-                }
+            if !session.on_upstream_msg(generation, msg).await {
+                break;
             }
         }
         // The loop ended = the pool closed/errored (an intentional swap aborts
@@ -989,6 +1119,7 @@ pub async fn handle_seller_miner(
             extranonce2_size: 0,
             translating: false,
             subscribed: false,
+            gate: None,
         }),
     });
 
@@ -1001,13 +1132,20 @@ pub async fn handle_seller_miner(
         i.generation_counter
     };
     session
-        .install_raw(raw, generation, handshake_target.clone(), Routing::Idle)
+        .install_raw(
+            raw,
+            generation,
+            handshake_target.clone(),
+            Routing::Idle,
+            false,
+        )
         .await;
     // Supervisor: reconnect / fail over to the fallback if the upstream drops.
     let supervisor = tokio::spawn(crate::control::supervise_upstream(
         AnySession::Sv1(session.clone()),
         died_rx,
     ));
+    let vardiff = tokio::spawn(run_vardiff(session.clone()));
 
     info!(%peer, upstream = %handshake_target.url, "relay established (idle)");
 
@@ -1071,15 +1209,9 @@ pub async fn handle_seller_miner(
                     let _ = to_miner.send(reply.to_line());
                     // Mark subscribed + flush any prelude (the upstream's initial
                     // set_difficulty/notify, or translated jobs stashed before the
-                    // subscribe reply) atomically so a job never precedes it.
-                    let prelude = {
-                        let mut i = session.inner.lock().await;
-                        i.subscribed = true;
-                        std::mem::take(&mut i.pending_prelude)
-                    };
-                    for line in prelude {
-                        let _ = to_miner.send(line);
-                    }
+                    // subscribe reply) under the lock, so neither a job precedes
+                    // the reply nor a live line overtakes the stashed ones.
+                    session.inner.lock().await.flush_prelude(&to_miner);
                 }
                 Some("mining.extranonce.subscribe") => {
                     session.inner.lock().await.extranonce_capable = true;
@@ -1231,6 +1363,7 @@ pub async fn handle_seller_miner(
         .remove_if(&worker, &AnySession::Sv1(session.clone()))
         .await;
     supervisor.abort();
+    vardiff.abort();
     {
         let i = session.inner.lock().await;
         i.active.reader.abort();
@@ -1338,6 +1471,7 @@ mod tests {
                 extranonce2_size: 0,
                 translating: false,
                 subscribed: false,
+                gate: None,
             }),
         });
         let reader = spawn_upstream_reader(session.clone(), 0, conn.read);
@@ -1472,13 +1606,16 @@ pub(crate) mod sv2_translate_tests {
     use crate::proto::sv2::keys::NoiseKeys;
     use crate::proto::sv2::relay::{Read as PoolRead, Write as PoolWrite};
     use stratum_apps::network_helpers::accept_noise_connection;
-    use stratum_core::binary_sv2::{B032, B064K, U256};
+    use stratum_core::binary_sv2::{
+        B032Owned, B064KOwned, Seq0255Owned, Sv2OptionOwned, U256Owned,
+    };
     use stratum_core::common_messages_sv2 as common;
     use stratum_core::common_messages_sv2::SetupConnectionSuccess;
     use stratum_core::mining_sv2::{
-        NewExtendedMiningJob, OpenExtendedMiningChannelSuccess, SetNewPrevHash, SubmitSharesSuccess,
+        NewExtendedMiningJobOwned, OpenExtendedMiningChannelSuccessOwned, SetNewPrevHashOwned,
+        SubmitSharesSuccess,
     };
-    use stratum_core::parsers_sv2::{AnyMessage, CommonMessages};
+    use stratum_core::parsers_sv2::{CommonMessagesOwned, Mining};
 
     fn diff1_target() -> Vec<u8> {
         // The difficulty-1 target in the current (bdiff) convention.
@@ -1504,11 +1641,9 @@ pub(crate) mod sv2_translate_tests {
     }
 
     async fn pool_read_one(read: &mut PoolRead) -> anyhow::Result<wire::Sv2Frame> {
-        let frame = read
-            .read_frame()
+        read.read_frame()
             .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        wire::into_sv2(frame).ok_or_else(|| anyhow::anyhow!("handshake frame"))
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
     /// A mock SV2 pool: loop-accepts (so detection probes + the real connect are
@@ -1531,8 +1666,7 @@ pub(crate) mod sv2_translate_tests {
             let submits = submits.clone();
             tokio::spawn(async move {
                 let Ok(stream) =
-                    accept_noise_connection::<wire::Msg>(sock, keys.public(), keys.secret(), 3600)
-                        .await
+                    accept_noise_connection(sock, keys.public(), keys.secret(), 3600).await
                 else {
                     return; // detection probe / plaintext → handshake fails
                 };
@@ -1552,11 +1686,11 @@ pub(crate) mod sv2_translate_tests {
         // Wait for SetupConnection, then acknowledge.
         loop {
             let f = pool_read_one(read).await?;
-            if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+            if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION {
                 break;
             }
         }
-        let ack = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
+        let ack = AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(
             SetupConnectionSuccess {
                 used_version: 2,
                 flags: 0,
@@ -1568,57 +1702,55 @@ pub(crate) mod sv2_translate_tests {
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         while let Ok(mut f) = pool_read_one(read).await {
-            let Some(mt) = wire::msg_type(&f) else {
-                continue;
-            };
+            let mt = wire::msg_type(&f);
             if mt == mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL {
                 let payload = f.payload();
                 let request_id = match Mining::try_from((mt, payload)) {
                     Ok(Mining::OpenExtendedMiningChannel(m)) => m.request_id,
                     _ => continue,
                 };
-                let success = OpenExtendedMiningChannelSuccess {
+                let success = OpenExtendedMiningChannelSuccessOwned {
                     request_id,
                     channel_id: cid,
-                    target: U256::try_from(diff1_target()).unwrap(),
+                    target: U256Owned::try_from(diff1_target()).unwrap(),
                     extranonce_size: 4,
-                    extranonce_prefix: B032::try_from(prefix.clone()).unwrap(),
+                    extranonce_prefix: B032Owned::try_from(prefix.clone()).unwrap(),
                     group_channel_id: 0,
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(
-                        Mining::OpenExtendedMiningChannelSuccess(success),
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::OpenExtendedMiningChannelSuccess(success),
                     )))
                     .await
                     .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 // Future job, then its activating prev-hash (SV2 §7 ordering).
                 let (cb_prefix, cb_suffix) = legacy_cb();
-                let job = NewExtendedMiningJob {
+                let job = NewExtendedMiningJobOwned {
                     channel_id: cid,
                     job_id: 1,
-                    min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                    ntime_start: Sv2OptionOwned::new(None),
                     version: 0x2000_0000,
                     version_rolling_allowed: true,
-                    merkle_path: Vec::<U256>::new().into(),
-                    coinbase_tx_prefix: B064K::try_from(cb_prefix).unwrap(),
-                    coinbase_tx_suffix: B064K::try_from(cb_suffix).unwrap(),
+                    merkle_path: Seq0255Owned::new(Vec::new()).unwrap(),
+                    coinbase_tx_prefix: B064KOwned::try_from(cb_prefix).unwrap(),
+                    coinbase_tx_suffix: B064KOwned::try_from(cb_suffix).unwrap(),
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(
-                        Mining::NewExtendedMiningJob(job),
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::NewExtendedMiningJob(job),
                     )))
                     .await
                     .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                let prev = SetNewPrevHash {
+                let prev = SetNewPrevHashOwned {
                     channel_id: cid,
                     job_id: 1,
-                    prev_hash: U256::from([0x11u8; 32]),
-                    min_ntime: 0x6500_0000,
+                    prev_hash: U256Owned::from([0x11u8; 32]),
+                    ntime_start: 0x6500_0000,
                     nbits: 0x1707_2cf6,
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(
-                        Mining::SetNewPrevHash(prev),
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::SetNewPrevHash(prev),
                     )))
                     .await
                     .map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -1633,8 +1765,8 @@ pub(crate) mod sv2_translate_tests {
                         new_shares_sum: 1,
                     };
                     write
-                        .write_frame(wire::frame_from(AnyMessage::Mining(
-                            Mining::SubmitSharesSuccess(ok),
+                        .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                            MiningOwned::SubmitSharesSuccess(ok),
                         )))
                         .await
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?;

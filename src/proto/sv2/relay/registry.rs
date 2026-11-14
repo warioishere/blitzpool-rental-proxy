@@ -112,15 +112,35 @@ pub(super) async fn reap_idle_rig(
             return; // a member rejoined, or a newer idle round owns the reap
         }
     }
-    rigs.remove(&worker, &session).await;
+    retire_rig(&rigs, &registry, &session, &worker).await;
+    info!(%worker, "sv2 rig reaped after idle grace");
+}
+
+/// Take a rig out of service: drop it from the bundle registry and the session
+/// registry and abort its upstream tasks. Both removals are pointer-guarded, so
+/// a rig that was never (or is no longer) the registered one evicts nothing.
+/// Bumps the idle token, so a reaper already scheduled for this rig finds a
+/// newer round and leaves it alone, and marks the rig retired, so a switch
+/// retry still holding it installs no new upstream.
+pub(super) async fn retire_rig(
+    rigs: &Sv2RigRegistry,
+    registry: &crate::registry::Registry,
+    session: &Arc<Sv2Session>,
+    worker: &str,
+) {
+    rigs.remove(worker, session).await;
     registry
-        .remove_if(&worker, &AnySession::Sv2(session.clone()))
+        .remove_if(worker, &AnySession::Sv2(session.clone()))
         .await;
-    let i = session.inner.lock().await;
+    let mut i = session.inner.lock().await;
+    i.retired = true;
+    i.idle_token += 1;
     i.active.reader.abort();
     i.active.writer.abort();
     if let Some(sup) = &i.supervisor {
         sup.abort();
     }
-    info!(%worker, "sv2 rig reaped after idle grace");
+    if let Some(vardiff) = &i.vardiff {
+        vardiff.abort();
+    }
 }

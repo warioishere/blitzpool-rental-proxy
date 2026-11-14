@@ -45,22 +45,26 @@ use crate::proto::translate;
 
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
 use stratum_apps::network_helpers::{accept_noise_connection, connect_with_noise};
-use stratum_core::binary_sv2::{Str0255, U32AsRef, B032, U256};
+use stratum_core::binary_sv2::{B032Owned, Str0255Owned, U256Owned};
 use stratum_core::common_messages_sv2 as common;
-use stratum_core::common_messages_sv2::{Protocol, SetupConnection, SetupConnectionSuccess};
+use stratum_core::common_messages_sv2::{
+    Protocol, SetupConnectionOwned, SetupConnectionSuccessOwned,
+};
 use stratum_core::mining_sv2 as mining;
 use stratum_core::mining_sv2::{
-    OpenExtendedMiningChannel, OpenExtendedMiningChannelSuccess, OpenMiningChannelError,
-    OpenStandardMiningChannel, OpenStandardMiningChannelSuccess, SetExtranoncePrefix, SetTarget,
+    OpenExtendedMiningChannelOwned, OpenExtendedMiningChannelSuccessOwned,
+    OpenMiningChannelErrorOwned, OpenStandardMiningChannelOwned,
+    OpenStandardMiningChannelSuccessOwned, SetExtranoncePrefixOwned, SetTargetOwned,
 };
-use stratum_core::parsers_sv2::{AnyMessage, CommonMessages, Mining};
+use stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwned, Mining, MiningOwned};
 
 use super::keys::NoiseKeys;
-use super::wire::{self, EitherFrame, Msg, Sv2Frame};
+use super::wire::{self, Sv2Frame};
 use crate::control::{AnySession, SessionStatus};
 use crate::orders::OrderStore;
 use crate::proto::ProxyContext;
 use crate::session::{Delivery, Routing, UpstreamTarget};
+use crate::share_gate::{DeviceEstimate, ShareGate, Verdict};
 
 /// SV2 frame builders/parsers (split out for navigability).
 pub(crate) mod codec;
@@ -68,8 +72,8 @@ use codec::*;
 
 /// Same-rig bundle registry + idle reaper (split out for navigability).
 mod registry;
-use registry::reap_idle_rig;
 pub use registry::Sv2RigRegistry;
+use registry::{reap_idle_rig, retire_rig};
 
 /// How long the proxy's Noise certificate (responder side) is valid, seconds.
 const CERT_VALIDITY: u64 = 3600;
@@ -84,8 +88,8 @@ const SWITCH_RETRY_ESCALATE_AFTER: u32 = 8;
 /// a quick reconnect re-attaches without a fresh Noise handshake + channel reopen.
 const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
 
-pub(crate) type Read = NoiseTcpReadHalf<Msg>;
-pub(crate) type Write = NoiseTcpWriteHalf<Msg>;
+pub(crate) type Read = NoiseTcpReadHalf;
+pub(crate) type Write = NoiseTcpWriteHalf;
 
 /// The miner's channel-open request, captured to re-open against each upstream.
 #[derive(Clone)]
@@ -114,6 +118,41 @@ impl OpenSpec {
     fn is_extended(&self) -> bool {
         matches!(self, OpenSpec::Extended { .. })
     }
+
+    /// The share gate for a channel opened with this spec on an upstream that
+    /// assigned `extranonce_prefix`, `rollable_extranonce_size` and
+    /// `upstream_target` (`None` while a translated SV1 pool has not set a
+    /// difficulty yet).
+    fn gate(
+        &self,
+        extranonce_prefix: Vec<u8>,
+        rollable_extranonce_size: u16,
+        upstream_target: Option<&[u8]>,
+    ) -> ShareGate {
+        match self {
+            OpenSpec::Extended {
+                nominal_hash_rate,
+                max_target,
+                ..
+            } => ShareGate::extended(
+                extranonce_prefix,
+                rollable_extranonce_size,
+                upstream_target,
+                max_target,
+                *nominal_hash_rate,
+            ),
+            OpenSpec::Standard {
+                nominal_hash_rate,
+                max_target,
+                ..
+            } => ShareGate::standard(
+                extranonce_prefix,
+                upstream_target,
+                max_target,
+                *nominal_hash_rate,
+            ),
+        }
+    }
 }
 
 /// The miner's open + the worker name it authenticated with.
@@ -135,11 +174,9 @@ pub(crate) struct ChannelInfo {
 // ── transport helpers ───────────────────────────────────────────────
 
 async fn read_one(read: &mut Read) -> anyhow::Result<Sv2Frame> {
-    let frame = read
-        .read_frame()
+    read.read_frame()
         .await
-        .map_err(|e| anyhow!("read frame: {e:?}"))?;
-    wire::into_sv2(frame).ok_or_else(|| anyhow!("unexpected handshake frame post-handshake"))
+        .map_err(|e| anyhow!("read frame: {e:?}"))
 }
 
 /// Why an SV2 probe did not produce an upstream — and the distinction is the
@@ -237,7 +274,7 @@ pub(crate) async fn connect_setup(target: &UpstreamTarget) -> anyhow::Result<(Re
 async fn setup_over(tcp: TcpStream, target: &UpstreamTarget) -> anyhow::Result<(Read, Write)> {
     let _ = tcp.set_nodelay(true);
     let authority = super::keys::parse_authority(&target.authority_pubkey)?;
-    let stream = connect_with_noise::<Msg>(tcp, authority)
+    let stream = connect_with_noise(tcp, authority)
         .await
         .map_err(|e| anyhow!("upstream noise handshake: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
@@ -248,10 +285,10 @@ async fn setup_over(tcp: TcpStream, target: &UpstreamTarget) -> anyhow::Result<(
     loop {
         let f = read_one(&mut read).await?;
         match wire::msg_type(&f) {
-            Some(common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS) => {
+            common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS => {
                 return Ok((read, write));
             }
-            Some(common::MESSAGE_TYPE_SETUP_CONNECTION_ERROR) => {
+            common::MESSAGE_TYPE_SETUP_CONNECTION_ERROR => {
                 bail!("upstream rejected SetupConnection")
             }
             _ => continue,
@@ -286,12 +323,12 @@ pub(crate) async fn open_on(
     loop {
         let mut f = read_one(read).await?;
         match wire::msg_type(&f) {
-            Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS)
-            | Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS) => {
+            mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
+            | mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS => {
                 return parse_open_success(&mut f)
                     .ok_or_else(|| anyhow!("malformed OpenMiningChannelSuccess"));
             }
-            Some(mining::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR) => {
+            mining::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR => {
                 let code = parse_open_error(&mut f).map_or_else(String::new, |(_, c)| c);
                 return Err(crate::proto::LoginRefused(format!(
                     "OpenMiningChannel refused: {code}"
@@ -322,7 +359,7 @@ pub(crate) async fn open_on(
     }
 }
 
-fn spawn_writer(mut half: Write, mut rx: mpsc::UnboundedReceiver<EitherFrame>) -> JoinHandle<()> {
+fn spawn_writer(mut half: Write, mut rx: mpsc::UnboundedReceiver<Sv2Frame>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if half.write_frame(frame).await.is_err() {
@@ -352,9 +389,7 @@ fn spawn_upstream_reader(
             session.on_upstream_frame(generation, frame).await;
         }
         while let Ok(frame) = read.read_frame().await {
-            if let Some(sv2) = wire::into_sv2(frame) {
-                session.on_upstream_frame(generation, sv2).await;
-            }
+            session.on_upstream_frame(generation, frame).await;
         }
         // The loop ended = the pool closed/errored (an intentional swap aborts
         // this task before here). Tell the supervisor so it can reconnect/fail over.
@@ -367,7 +402,7 @@ fn spawn_upstream_reader(
 struct ActiveUpstream {
     generation: u64,
     target: UpstreamTarget,
-    to_up: mpsc::UnboundedSender<EitherFrame>,
+    to_up: mpsc::UnboundedSender<Sv2Frame>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
 }
@@ -396,13 +431,25 @@ struct Channel {
     /// across upstream swaps (the miner cannot be told a new one), so a re-issued
     /// upstream group id is mapped back onto this.
     down_group_id: u32,
+    /// The pool's group id for this channel whatever its kind (0 when
+    /// ungrouped). Standard channels keep `up_group_id` at 0 because group jobs
+    /// are not theirs, but a group-addressed `SetTarget` applies to them too.
+    pool_group_id: u32,
+    /// The miner's own target and the proxy's judgement of its shares.
+    gate: ShareGate,
 }
 
 impl Channel {
     /// The one synthesized channel of a translated SV1 upstream. Its upstream
     /// id is the downstream id (there is no SV2 channel behind it) and it is
     /// ungrouped (there is no SV2 group either).
-    fn translated(down_cid: u32, owner: u32, spec: OpenSpec, difficulty: f64) -> Self {
+    fn translated(
+        down_cid: u32,
+        owner: u32,
+        spec: OpenSpec,
+        difficulty: f64,
+        gate: ShareGate,
+    ) -> Self {
         Self {
             down_channel_id: down_cid,
             up_channel_id: down_cid,
@@ -411,6 +458,8 @@ impl Channel {
             owner,
             up_group_id: 0,
             down_group_id: 0,
+            pool_group_id: 0,
+            gate,
         }
     }
 }
@@ -452,7 +501,7 @@ struct Inner {
     /// upstream frames route to the owning member; group-broadcast jobs fan out
     /// to all members. Usually one (a 1:1 miner connection); more than one when
     /// several same-rig miners are bundled onto a single upstream.
-    members: std::collections::HashMap<u32, mpsc::UnboundedSender<EitherFrame>>,
+    members: std::collections::HashMap<u32, mpsc::UnboundedSender<Sv2Frame>>,
     /// Next member id to hand out.
     next_member_id: u32,
     routing: Routing,
@@ -470,6 +519,12 @@ struct Inner {
     /// not any one member, so it survives a single member leaving and is aborted
     /// only when the last member disconnects.
     supervisor: Option<JoinHandle<()>>,
+    /// The rig's vardiff ticker, retargeting each channel's miner. Owned and
+    /// aborted like the supervisor.
+    vardiff: Option<JoinHandle<()>>,
+    /// Set by [`retire_rig`]: the rig is out of service and takes no new
+    /// upstream, so a switch retry still holding it cannot bring it back.
+    retired: bool,
     /// Bumped each time the rig goes empty. A scheduled idle reaper only fires if
     /// the token still matches, so a rejoin-then-leave round can't be reaped by a
     /// stale earlier reaper.
@@ -495,7 +550,7 @@ impl Inner {
         &mut self,
         generation: u64,
         target: UpstreamTarget,
-        to_up: mpsc::UnboundedSender<EitherFrame>,
+        to_up: mpsc::UnboundedSender<Sv2Frame>,
         reader: JoinHandle<()>,
         writer: JoinHandle<()>,
     ) {
@@ -552,6 +607,8 @@ impl Inner {
         owner: u32,
         up_group_id: u32,
         down_group_id: u32,
+        pool_group_id: u32,
+        gate: ShareGate,
     ) {
         self.up_to_down.insert(up_cid, down_cid);
         self.channels.push(Channel {
@@ -562,7 +619,28 @@ impl Inner {
             owner,
             up_group_id,
             down_group_id,
+            pool_group_id,
+            gate,
         });
+    }
+
+    /// The channels a job or prev-hash addressed to upstream id `up_cid`
+    /// concerns: the one channel with that id, or every Extended channel of
+    /// that group.
+    fn channels_for_up(&mut self, up_cid: u32) -> impl Iterator<Item = &mut Channel> {
+        self.channels.iter_mut().filter(move |c| {
+            c.up_channel_id == up_cid
+                || (up_cid != 0 && c.up_group_id == up_cid && c.spec.is_extended())
+        })
+    }
+
+    /// The channels a `SetTarget` addressed to upstream id `up_cid` concerns:
+    /// the one channel with that id, or every channel of that group, Standard
+    /// ones included.
+    fn channels_for_target(&mut self, up_cid: u32) -> impl Iterator<Item = &mut Channel> {
+        self.channels.iter_mut().filter(move |c| {
+            c.up_channel_id == up_cid || (up_cid != 0 && c.pool_group_id == up_cid)
+        })
     }
 
     /// Who a frame addressed to upstream group `up_cid` must reach: one
@@ -594,7 +672,7 @@ impl Inner {
     /// Register a downstream miner connection as a member of this rig, returning
     /// its id. Each member has its own sink; per-channel upstream frames route to
     /// the owning member, group-broadcast jobs fan out to all members.
-    fn add_member(&mut self, sink: mpsc::UnboundedSender<EitherFrame>) -> u32 {
+    fn add_member(&mut self, sink: mpsc::UnboundedSender<Sv2Frame>) -> u32 {
         let id = self.next_member_id;
         self.next_member_id += 1;
         self.members.insert(id, sink);
@@ -602,12 +680,12 @@ impl Inner {
     }
 
     /// The sink of a given member, if still attached.
-    fn member_sink(&self, member: u32) -> Option<&mpsc::UnboundedSender<EitherFrame>> {
+    fn member_sink(&self, member: u32) -> Option<&mpsc::UnboundedSender<Sv2Frame>> {
         self.members.get(&member)
     }
 
     /// The sink of the member that owns the channel behind `up_cid`, if any.
-    fn member_sink_for_up(&self, up_cid: u32) -> Option<&mpsc::UnboundedSender<EitherFrame>> {
+    fn member_sink_for_up(&self, up_cid: u32) -> Option<&mpsc::UnboundedSender<Sv2Frame>> {
         let owner = self
             .channels
             .iter()
@@ -753,6 +831,27 @@ impl Sv2Session {
             .map(str::to_string)
     }
 
+    /// True when the rig has no members and its routing disagrees with
+    /// `desired` (the worker's active order, if any) or, without one, with the
+    /// seller's `idle` pool: the state between a single-device rig's member
+    /// leaving on a rent, cancel or idle-pool edit and reconnecting.
+    async fn is_empty_on_stale_routing(
+        &self,
+        desired: Option<&crate::orders::Order>,
+        idle: Option<&UpstreamTarget>,
+    ) -> bool {
+        let i = self.inner.lock().await;
+        if !i.members.is_empty() {
+            return false;
+        }
+        match desired {
+            Some(o) => i.routing.order_id() != Some(o.id.as_str()),
+            // Idle: stale when it still mines a rental, or a pool other than
+            // the seller's idle pool (the seller edited it).
+            None => i.routing.order_id().is_some() || idle != Some(&i.active.target),
+        }
+    }
+
     /// Align the shared upstream with the current order state before bundling
     /// a new member. A live rig can sit on a stale upstream across a rent or
     /// cancel: the other members hold the rig alive while one reconnects, and
@@ -804,6 +903,9 @@ impl Sv2Session {
                 let Some(session) = weak.upgrade() else {
                     return;
                 };
+                if session.inner.lock().await.retired {
+                    return;
+                }
                 let Some(order) = session
                     .orders
                     .active_for_worker(&worker, crate::orders::now_ms())
@@ -847,6 +949,9 @@ impl Sv2Session {
         // strictly one after another (the last to acquire wins). Released on
         // return.
         let _switch = self.switch.lock().await;
+        if self.inner.lock().await.retired {
+            bail!("rig is retired");
+        }
         // Snapshot the channels to re-open (down_channel_id + spec) + worker.
         // Each channel carries the downstream group id its miner already knows —
         // the new upstream re-issues its own group ids, and each must be mapped
@@ -856,10 +961,18 @@ impl Sv2Session {
         let (specs, generation, label, members) = {
             let mut i = self.inner.lock().await;
             i.generation_counter += 1;
-            let specs: Vec<(u32, u32, OpenSpec, u32)> = i
+            let specs: Vec<(u32, u32, OpenSpec, u32, DeviceEstimate)> = i
                 .channels
                 .iter()
-                .map(|c| (c.down_channel_id, c.owner, c.spec.clone(), c.down_group_id))
+                .map(|c| {
+                    (
+                        c.down_channel_id,
+                        c.owner,
+                        c.spec.clone(),
+                        c.down_group_id,
+                        c.gate.device(),
+                    )
+                })
                 .collect();
             (
                 specs,
@@ -872,13 +985,13 @@ impl Sv2Session {
         };
         // user_identity on the new pool: its account + the miner's worker, tagged.
         let up_ident = crate::proto::relay::upstream_worker(&target.user, &label);
-        // Zero channels is NOT an error: a rig can be swapped while its only
-        // member is mid-reconnect — the empty grace-window hull between the last
-        // member leaving and the next attaching. We still connect the new upstream
-        // and install it as `active` + set `routing` below (the re-open and
-        // re-point loops are no-ops on empty `specs`), so the member that attaches
-        // next opens its first channel straight on the new pool instead of
-        // bundling back onto the old (idle) one.
+        // Zero channels is NOT an error: the supervisor or a switch retry can
+        // swap a rig while its only member is mid-reconnect (the empty
+        // grace-window hull between the last member leaving and the next
+        // attaching). The new upstream is still connected and installed as
+        // `active` + `routing` below (the re-open and re-point loops are no-ops
+        // on empty `specs`), so the member that attaches next bundles onto the
+        // pool the rig now routes to.
 
         // Native first: re-open on SV2; if the new pool doesn't answer as SV2,
         // it's an SV1 buyer pool → translate the switch onto it. But an
@@ -901,7 +1014,7 @@ impl Sv2Session {
         // opening the next one — its initial job + prev-hash. Accumulated across
         // the whole loop and handed to the steady reader below.
         let mut deferred: Vec<Sv2Frame> = Vec::new();
-        for (down_cid, owner, spec, down_group_id) in &specs {
+        for (down_cid, owner, spec, down_group_id, device) in &specs {
             let info = open_on(&mut read, &mut write, spec, &up_ident, &mut deferred)
                 .await
                 .map_err(|e| anyhow!("switch reopen channel {down_cid}: {e}"))?;
@@ -927,6 +1040,13 @@ impl Sv2Session {
                     group_down.insert(up_group_id, *down_group_id);
                 }
             }
+            let gate = spec
+                .gate(
+                    info.extranonce_prefix.clone(),
+                    info.extranonce_size,
+                    Some(&info.target),
+                )
+                .with_device(*device);
             new_channels.push(Channel {
                 down_channel_id: *down_cid,
                 up_channel_id: info.up_channel_id,
@@ -935,14 +1055,21 @@ impl Sv2Session {
                 owner: *owner,
                 up_group_id,
                 down_group_id: *down_group_id,
+                pool_group_id: info.group_channel_id,
+                gate,
             });
-            repoint.push((*down_cid, *owner, info.extranonce_prefix, info.target));
+            repoint.push((*down_cid, *owner, info.extranonce_prefix));
         }
 
         let (to_up, up_rx) = mpsc::unbounded_channel();
 
         let abandoned: Vec<(u32, u32)> = {
             let mut i = self.inner.lock().await;
+            // Retired while this swap was connecting: install nothing, the
+            // new connection is dropped here.
+            if i.retired {
+                bail!("rig is retired");
+            }
             // Reader spawned inside the lock — see `Inner::install_active` for
             // why that ordering is required.
             let writer = spawn_writer(write, up_rx);
@@ -959,19 +1086,29 @@ impl Sv2Session {
             // means `probe_sv2` accepted the target: the SV1 case returned
             // through `swap_to_sv1_translate` above.
             i.translating = false;
+            // Re-point every channel: new extranonce prefix + target. The new
+            // upstream then streams jobs + prev-hash per channel, which the
+            // reader forwards. Downstream channel ids are unchanged, so the
+            // miner does not reconnect. Sent under the lock with each gate's
+            // target as it stands now, so a target the new reader already
+            // sent is not overwritten by an older one.
+            for (down_cid, owner, prefix) in repoint {
+                let target = i
+                    .channels
+                    .iter()
+                    .find(|c| c.down_channel_id == down_cid)
+                    .map(|c| c.gate.downstream_target());
+                if let (Some(sink), Some(target)) = (members.get(&owner), target) {
+                    if let Ok(f) = set_extranonce_prefix(down_cid, prefix) {
+                        let _ = sink.send(f);
+                    }
+                    if let Ok(f) = set_target(down_cid, target.to_vec()) {
+                        let _ = sink.send(f);
+                    }
+                }
+            }
             abandoned
         };
-
-        // Re-point every channel: new extranonce prefix + target. The new
-        // upstream then streams jobs + prev-hash per channel, which the reader
-        // forwards. Downstream channel ids are unchanged, so the miner does not
-        // reconnect.
-        for (down_cid, owner, prefix, tgt) in repoint {
-            if let Some(sink) = members.get(&owner) {
-                let _ = sink.send(set_extranonce_prefix(down_cid, prefix)?);
-                let _ = sink.send(set_target(down_cid, tgt)?);
-            }
-        }
         refuse_abandoned_opens(&members, abandoned);
         info!(upstream = %target.url, generation, channels = specs.len(), "sv2 upstream switched");
         Ok(())
@@ -981,9 +1118,7 @@ impl Sv2Session {
     /// the hashrate window on accepted shares and finalizing additional channel
     /// opens.
     async fn on_upstream_frame(&self, generation: u64, mut frame: Sv2Frame) {
-        let Some(mt) = wire::msg_type(&frame) else {
-            return;
-        };
+        let mt = wire::msg_type(&frame);
         let mut i = self.inner.lock().await;
         if generation != i.active.generation {
             return; // stale upstream (already swapped away)
@@ -994,7 +1129,7 @@ impl Sv2Session {
         if mt == mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
             || mt == mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS
         {
-            if let Some(info) = parse_open_success(&mut frame) {
+            if let Some(mut info) = parse_open_success(&mut frame) {
                 if let Some((member, spec)) = i.pending.remove(&info.request_id) {
                     let down_cid = i.next_down_cid;
                     i.next_down_cid += 1;
@@ -1007,6 +1142,13 @@ impl Sv2Session {
                     } else {
                         0
                     };
+                    let gate = spec.gate(
+                        info.extranonce_prefix.clone(),
+                        info.extranonce_size,
+                        Some(&info.target),
+                    );
+                    // The miner hashes against its gate's target, not the pool's.
+                    info.target = gate.downstream_target().to_vec();
                     i.register_channel(
                         down_cid,
                         info.up_channel_id,
@@ -1015,6 +1157,8 @@ impl Sv2Session {
                         member,
                         up_group_id,
                         down_group_id,
+                        info.group_channel_id,
+                        gate,
                     );
                     if let Ok(reply) =
                         open_success_downstream(&spec, down_cid, down_group_id, &info)
@@ -1045,7 +1189,7 @@ impl Sv2Session {
                 }
                 None => {
                     for sink in i.members.values() {
-                        let _ = sink.send(frame.clone().into());
+                        let _ = sink.send(frame.clone());
                     }
                 }
             }
@@ -1092,22 +1236,62 @@ impl Sv2Session {
             );
         }
 
-        // Vardiff: a new target changes this channel's share difficulty.
+        // The miners' gates mirror every job and prev-hash their miners hash.
+        match mt {
+            mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
+                if let Some(job) = parse_new_extended_job(&mut frame) {
+                    for c in i.channels_for_up(up_cid) {
+                        c.gate.on_extended_job(job.clone());
+                    }
+                }
+            }
+            mining::MESSAGE_TYPE_NEW_MINING_JOB => {
+                if let Some(job) = parse_new_mining_job(&mut frame) {
+                    for c in i.channels_for_up(up_cid) {
+                        c.gate.on_standard_job(job.clone());
+                    }
+                }
+            }
+            mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+                if let Some(prev) = parse_set_new_prev_hash(&mut frame) {
+                    for c in i.channels_for_up(up_cid) {
+                        c.gate.on_prev_hash(prev.clone());
+                    }
+                }
+            }
+            mining::MESSAGE_TYPE_SET_EXTRANONCE_PREFIX => {
+                if let Some(prefix) = parse_set_extranonce_prefix(&mut frame) {
+                    for c in i.channels_for_up(up_cid) {
+                        c.gate.set_extranonce_prefix(prefix.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // The pool's target is the gate's upstream bound and the bill's
+        // difficulty. The miner hears its own target, and only when it moved,
+        // so the pool's SetTarget itself goes no further.
         if mt == mining::MESSAGE_TYPE_SET_TARGET {
             if let Some(target) = parse_set_target(&mut frame) {
                 let diff = translate::difficulty_from_target(&target);
-                let mapped = i.up_to_down.get(&up_cid).copied();
-                debug!(
-                    worker = %i.label,
-                    up_cid,
-                    down_cid = ?mapped,
-                    diff,
-                    "sv2 SetTarget from upstream (forwarding to miner)"
-                );
-                if let Some(c) = i.channels.iter_mut().find(|c| c.up_channel_id == up_cid) {
+                debug!(worker = %i.label, up_cid, diff, "sv2 SetTarget from upstream");
+                let mut retarget = Vec::new();
+                for c in i.channels_for_target(up_cid) {
                     c.difficulty = diff;
+                    if let Some(t) = c.gate.set_upstream_target(&target) {
+                        retarget.push((c.owner, c.down_channel_id, t));
+                    }
+                }
+                for (owner, down_cid, t) in retarget {
+                    if let (Some(sink), Ok(f)) =
+                        (i.member_sink(owner), set_target(down_cid, t.to_vec()))
+                    {
+                        let _ = sink.send(f);
+                    }
                 }
             }
+            return;
         }
 
         // Accounting: weight accepted shares by the channel's current
@@ -1121,15 +1305,19 @@ impl Sv2Session {
         }
         if mt == mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {
             let count = parse_submit_success(&mut frame).map_or(0, |(_, n)| n);
-            let diff = i
+            let (diff, tracking) = i
                 .channels
                 .iter()
                 .find(|c| c.up_channel_id == up_cid)
-                .map(|c| c.difficulty)
-                .unwrap_or(0.0);
+                .map_or((0.0, true), |c| (c.difficulty, c.gate.is_tracking()));
             let work = diff * count as f64;
             let shares = count as u64;
             let inner = &mut *i;
+            // A channel its gate cannot judge is measured on what the pool
+            // accepted, as no share of it is ever measured otherwise.
+            if !tracking {
+                inner.delivery.measured(work);
+            }
             if inner.delivery.accepted(work, shares, &inner.label) {
                 order_credit = inner
                     .routing
@@ -1157,13 +1345,13 @@ impl Sv2Session {
                 if let Some(sink) = i.members.get(&member) {
                     let mut f = frame.clone();
                     wire::rewrite_channel_id(&mut f, down_group_id);
-                    let _ = sink.send(f.into());
+                    let _ = sink.send(f);
                 }
             }
         } else if let Some(&down_cid) = i.up_to_down.get(&up_cid) {
             wire::rewrite_channel_id(&mut frame, down_cid);
             if let Some(sink) = i.member_sink_for_up(up_cid) {
-                let _ = sink.send(frame.into());
+                let _ = sink.send(frame);
             } else {
                 debug!(up_cid, down_cid, "no member owns this channel; dropping");
             }
@@ -1206,7 +1394,7 @@ impl Sv2Session {
     /// `None` if the rig can't take more members (SV1-translated upstream).
     async fn attach_member(
         &self,
-        sink: mpsc::UnboundedSender<EitherFrame>,
+        sink: mpsc::UnboundedSender<Sv2Frame>,
         spec: &OpenSpec,
     ) -> Option<u32> {
         let mut i = self.inner.lock().await;
@@ -1232,20 +1420,12 @@ impl Sv2Session {
             .filter(|c| c.owner == member)
             .map(|c| c.up_channel_id)
             .collect();
-        // A translated upstream has no SV2 channel to close: it is one SV1
-        // connection, and `swap_to_sv1_translate` collapsed the rig onto a
-        // single channel of its own making. Sending the built CloseChannel
-        // there panics the translate writer, which calls `payload()` on
-        // everything it is handed — `wire`'s contract is that only handshake
-        // and channel-open messages are built rather than re-emitted
-        // already-serialized. The two channel-OPEN paths already refuse a
-        // translated upstream; this is the same rule for the close.
-        let notify_upstream = !i.translating;
+        // A translated upstream's writer passes only shares to the SV1 pool,
+        // so the close is dropped there; on an SV2 upstream it releases the
+        // channel.
         for up in up_cids {
-            if notify_upstream {
-                if let Ok(f) = close_channel_upstream(up) {
-                    let _ = i.active.to_up.send(f);
-                }
+            if let Ok(f) = close_channel_upstream(up) {
+                let _ = i.active.to_up.send(f);
             }
             i.up_to_down.remove(&up);
         }
@@ -1273,10 +1453,18 @@ struct Sv1UpConn {
     extranonce1: Vec<u8>,
     extranonce2_size: u16,
     version_mask: Option<u32>,
-    initial_diff: f64,
+    /// The pool's difficulty from the handshake, `None` when it sets one only
+    /// after the authorize.
+    initial_diff: Option<f64>,
     /// `set_difficulty`/`notify` notifications seen during the handshake (the
     /// initial difficulty + first job), replayed to the reader on start.
     prelude: Vec<String>,
+}
+
+/// A job the translator built for the miner, either channel kind.
+enum TranslatedJob {
+    Extended(mining::NewExtendedMiningJobOwned),
+    Standard(mining::NewMiningJobOwned),
 }
 
 /// Per-job state the proxy must remember to translate the miner's submit back to
@@ -1326,8 +1514,7 @@ async fn connect_sv1_upstream(
         .prelude
         .iter()
         .rev()
-        .find_map(|l| translate::set_difficulty_from_line(l))
-        .unwrap_or(1.0);
+        .find_map(|l| translate::set_difficulty_from_line(l));
     Ok(Sv1UpConn {
         extranonce1: Vec::<u8>::from_hex(&conn.extranonce1)
             .map_err(|e| anyhow!("bad extranonce hex: {e}"))?,
@@ -1346,16 +1533,11 @@ async fn connect_sv1_upstream(
 fn spawn_sv1_translate_writer(
     mut write: OwnedWriteHalf,
     state: Arc<Mutex<Sv1UpState>>,
-    mut rx: mpsc::UnboundedReceiver<EitherFrame>,
+    mut rx: mpsc::UnboundedReceiver<Sv2Frame>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            let Some(mut f) = wire::into_sv2(frame) else {
-                continue;
-            };
-            let Some(mt) = wire::msg_type(&f) else {
-                continue;
-            };
+        while let Some(mut f) = rx.recv().await {
+            let mt = wire::msg_type(&f);
             let payload = f.payload();
             let line = match Mining::try_from((mt, payload)) {
                 Ok(Mining::SubmitSharesExtended(submit)) => {
@@ -1499,44 +1681,42 @@ async fn handle_sv1_line(
             }
         };
         let built = if extended {
-            translate::sv1_notify_to_sv2_job(&notify, down_cid, sv2_job_id, as_future, vra).map(
-                |(j, p)| {
-                    (
-                        wire::frame_from(AnyMessage::Mining(Mining::NewExtendedMiningJob(j))),
-                        p,
-                    )
-                },
-            )
+            translate::sv1_notify_to_sv2_job(&notify, down_cid, sv2_job_id, as_future, vra)
+                .map(|(j, p)| (TranslatedJob::Extended(j), p))
         } else {
             translate::sv1_notify_to_sv2_standard_job(
                 &notify, down_cid, sv2_job_id, &en1, &en2, as_future,
             )
-            .map(|(j, p)| {
-                (
-                    wire::frame_from(AnyMessage::Mining(Mining::NewMiningJob(j))),
-                    p,
-                )
-            })
+            .map(|(j, p)| (TranslatedJob::Standard(j), p))
         };
         match built {
-            Ok((job_frame, prev)) => {
-                session.send_translate_frame(generation, job_frame).await;
-                if let Some(p) = prev {
-                    let prev_frame =
-                        wire::frame_from(AnyMessage::Mining(Mining::SetNewPrevHash(p)));
-                    session.send_translate_frame(generation, prev_frame).await;
+            Ok((job, prev)) => {
+                let job_frame = match &job {
+                    TranslatedJob::Extended(j) => wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::NewExtendedMiningJob(j.clone()),
+                    )),
+                    TranslatedJob::Standard(j) => wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::NewMiningJob(j.clone()),
+                    )),
+                };
+                let mut frames = vec![job_frame];
+                if let Some(p) = prev.clone() {
+                    frames.push(wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::SetNewPrevHash(p),
+                    )));
                 }
+                session
+                    .track_translate_job(generation, down_cid, job, prev, frames)
+                    .await;
             }
             Err(e) => warn!(error = %e, "sv1→sv2 job translation failed"),
         }
         return;
     }
-    // mining.set_difficulty → SetTarget.
+    // mining.set_difficulty → the gate's upstream bound; the miner hears its
+    // own target, and only when that moved.
     if let Some(diff) = translate::set_difficulty_from_line(line) {
         session.set_translate_diff(generation, down_cid, diff).await;
-        if let Ok(f) = set_target(down_cid, translate::target_from_difficulty(diff).to_vec()) {
-            session.send_translate_frame(generation, f).await;
-        }
         return;
     }
     // A submit response → SubmitSharesSuccess / SubmitSharesError for the miner.
@@ -1550,26 +1730,32 @@ async fn handle_sv1_line(
         let seq = state.lock().await.submit_seq.remove(&id);
         let Some(seq) = seq else { return };
         if matches!(&m.result, Some(Value::Bool(true))) {
-            session.credit_translate(generation, down_cid).await;
+            let Some(work) = session.credit_translate(generation, down_cid).await else {
+                return;
+            };
+            // Work units, like the proxy's own answers on this channel.
             let ok = mining::SubmitSharesSuccess {
                 channel_id: down_cid,
                 last_sequence_number: seq,
                 new_submits_accepted_count: 1,
-                new_shares_sum: 1,
+                new_shares_sum: work.round().max(1.0) as u64,
             };
-            let f = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesSuccess(ok)));
+            let f = wire::frame_from(AnyMessageOwned::Mining(MiningOwned::SubmitSharesSuccess(
+                ok,
+            )));
             session.send_translate_frame(generation, f).await;
         } else {
             let reason = m.reject_reason();
             warn!(error = %reason, "sv1 pool rejected a share");
             session.note_translate_rejected(generation, reason).await;
-            if let Ok(error_code) = Str0255::try_from("rejected".to_string()) {
-                let err = mining::SubmitSharesError {
+            if let Ok(error_code) = Str0255Owned::try_from("rejected".to_string()) {
+                let err = mining::SubmitSharesErrorOwned {
                     channel_id: down_cid,
                     sequence_number: seq,
                     error_code,
                 };
-                let f = wire::frame_from(AnyMessage::Mining(Mining::SubmitSharesError(err)));
+                let f =
+                    wire::frame_from(AnyMessageOwned::Mining(MiningOwned::SubmitSharesError(err)));
                 session.send_translate_frame(generation, f).await;
             }
         }
@@ -1578,21 +1764,58 @@ async fn handle_sv1_line(
 
 impl Sv2Session {
     /// Forward a synthesized frame to the miner if the generation is current.
-    async fn send_translate_frame(&self, generation: u64, frame: EitherFrame) {
+    async fn send_translate_frame(&self, generation: u64, frame: Sv2Frame) {
         let i = self.inner.lock().await;
         if generation != i.active.generation {
             return;
         }
-        // SV1 translation carries a single channel/member; deliver to it. (The
-        // transport `EitherFrame` isn't `Clone`, so there's no fan-out here — SV1
-        // upstreams are never bundled.)
+        // SV1 translation carries a single channel/member; deliver to it. SV1
+        // upstreams are never bundled, so there's no fan-out here.
         if let Some(sink) = i.members.values().next() {
             let _ = sink.send(frame);
         }
     }
 
-    /// Record the share difficulty implied by the SV1 pool's `set_difficulty`.
+    /// Record the share difficulty implied by the SV1 pool's `set_difficulty`
+    /// (the bill's, and the gate's upstream bound). Returns the miner's new
+    /// target when it moved.
     async fn set_translate_diff(&self, generation: u64, down_cid: u32, diff: f64) {
+        let mut i = self.inner.lock().await;
+        if generation != i.active.generation {
+            return;
+        }
+        let Some(c) = i
+            .channels
+            .iter_mut()
+            .find(|c| c.down_channel_id == down_cid)
+        else {
+            return;
+        };
+        c.difficulty = diff;
+        let moved = c
+            .gate
+            .set_upstream_target(&translate::target_from_difficulty(diff));
+        // Sent under the lock that moved the gate, so the miner sees targets in
+        // the order the gate produced them.
+        if let (Some(t), Some(sink)) = (moved, i.members.values().next()) {
+            if let Ok(f) = set_target(down_cid, t.to_vec()) {
+                let _ = sink.send(f);
+            }
+        }
+    }
+
+    /// Mirror a translated job (and its prev-hash) into the channel's gate and
+    /// send its `frames` to the miner, under one hold of the lock: the targets
+    /// the gate records for the job are the ones in force when it reaches the
+    /// miner.
+    async fn track_translate_job(
+        &self,
+        generation: u64,
+        down_cid: u32,
+        job: TranslatedJob,
+        prev: Option<mining::SetNewPrevHashOwned>,
+        frames: Vec<Sv2Frame>,
+    ) {
         let mut i = self.inner.lock().await;
         if generation != i.active.generation {
             return;
@@ -1602,34 +1825,53 @@ impl Sv2Session {
             .iter_mut()
             .find(|c| c.down_channel_id == down_cid)
         {
-            c.difficulty = diff;
+            match job {
+                TranslatedJob::Extended(j) => c.gate.on_extended_job(j),
+                TranslatedJob::Standard(j) => c.gate.on_standard_job(j),
+            }
+            if let Some(p) = prev {
+                c.gate.on_prev_hash(p);
+            }
+        }
+        // SV1 translation carries a single channel/member; deliver to it.
+        if let Some(sink) = i.members.values().next() {
+            for f in frames {
+                let _ = sink.send(f);
+            }
         }
     }
 
     /// Credit one accepted share (diff-weighted) to the hashrate window and, when
     /// rented, the order. Generation-guarded.
-    async fn credit_translate(&self, generation: u64, down_cid: u32) {
-        let credit = {
+    /// Returns the share's difficulty, or `None` for a stale generation.
+    async fn credit_translate(&self, generation: u64, down_cid: u32) -> Option<f64> {
+        let (work, credit) = {
             let mut guard = self.inner.lock().await;
             let i = &mut *guard;
             if generation != i.active.generation {
-                return;
+                return None;
             }
-            let work = i
+            let (work, tracking) = i
                 .channels
                 .iter()
                 .find(|c| c.down_channel_id == down_cid)
-                .map(|c| c.difficulty)
-                .unwrap_or(0.0);
-            if i.delivery.accepted(work, 1, &i.label) {
+                .map_or((0.0, true), |c| (c.difficulty, c.gate.is_tracking()));
+            // A channel its gate cannot judge is measured on what the pool
+            // accepted, as no share of it is ever measured otherwise.
+            if !tracking {
+                i.delivery.measured(work);
+            }
+            let credit = if i.delivery.accepted(work, 1, &i.label) {
                 i.routing.order_id().map(|o| (o.to_string(), work, 1))
             } else {
                 None
-            }
+            };
+            (work, credit)
         };
         if let Some((order_id, work, shares)) = credit {
             self.orders.add_work(&order_id, work, shares);
         }
+        Some(work)
     }
 
     /// Remember a translated pool's reject reason on the active rental.
@@ -1687,7 +1929,7 @@ impl Sv2Session {
         routing: Routing,
         member: u32,
     ) -> anyhow::Result<()> {
-        let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
+        let (to_up, up_rx) = mpsc::unbounded_channel::<Sv2Frame>();
         let writer = spawn_writer(write, up_rx);
         let mut i = self.inner.lock().await;
         // Nothing to replay: this path installs the FIRST channel of a fresh
@@ -1721,11 +1963,17 @@ impl Sv2Session {
         // Reply OpenSuccess to the member before any job (FIFO on its sink): the
         // SV1 extranonce1 is the channel's extranonce_prefix. The builder emits a
         // Standard or Extended success per the channel type the miner opened.
+        let pool_target = conn.initial_diff.map(translate::target_from_difficulty);
+        let gate = spec.gate(
+            conn.extranonce1.clone(),
+            conn.extranonce2_size,
+            pool_target.as_ref().map(|t| t.as_slice()),
+        );
         let info = ChannelInfo {
             request_id: spec.request_id(),
             up_channel_id: down_cid,
             extranonce_prefix: conn.extranonce1.clone(),
-            target: translate::target_from_difficulty(conn.initial_diff).to_vec(),
+            target: gate.downstream_target().to_vec(),
             extranonce_size: conn.extranonce2_size,
             group_channel_id: 0,
         };
@@ -1733,10 +1981,12 @@ impl Sv2Session {
             sink.send(open_success_downstream(&spec, down_cid, 0, &info)?)
                 .map_err(|_| anyhow!("miner writer gone"))?;
         }
-        let channel = Channel::translated(down_cid, member, spec, conn.initial_diff);
+        // SV1's difficulty is 1 until the pool sets one.
+        let difficulty = conn.initial_diff.unwrap_or(1.0);
+        let channel = Channel::translated(down_cid, member, spec, difficulty, gate);
         // A fresh session has no earlier upstream, so nothing was pending on it.
         self.install_sv1_translated(conn, up_ident, target, routing, 0, channel)
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -1748,7 +1998,7 @@ impl Sv2Session {
         generation: u64,
         up_ident: String,
     ) -> anyhow::Result<()> {
-        let (down_cid, owner, spec, members) = {
+        let (down_cid, owner, spec, members, device) = {
             let i = self.inner.lock().await;
             match i.channels.first() {
                 Some(c) => (
@@ -1756,6 +2006,7 @@ impl Sv2Session {
                     c.owner,
                     c.spec.clone(),
                     i.members.clone(),
+                    c.gate.device(),
                 ),
                 None => bail!("no channel to switch"),
             }
@@ -1763,17 +2014,39 @@ impl Sv2Session {
         let conn = connect_sv1_upstream(&target, &up_ident)
             .await
             .map_err(|e| anyhow!("switch to {}: {e}", target.url))?;
-        let initial_target = translate::target_from_difficulty(conn.initial_diff).to_vec();
+        let pool_target = conn.initial_diff.map(translate::target_from_difficulty);
+        let gate = spec
+            .gate(
+                conn.extranonce1.clone(),
+                conn.extranonce2_size,
+                pool_target.as_ref().map(|t| t.as_slice()),
+            )
+            .with_device(device);
         let extranonce1 = conn.extranonce1.clone();
-        let channel = Channel::translated(down_cid, owner, spec, conn.initial_diff);
+        let difficulty = conn.initial_diff.unwrap_or(1.0);
+        let channel = Channel::translated(down_cid, owner, spec, difficulty, gate);
         let abandoned = self
             .install_sv1_translated(conn, up_ident, target.clone(), routing, generation, channel)
-            .await;
-        // Re-point the channel's owner: new extranonce prefix + target; the reader
-        // streams the new pool's first job after.
-        if let Some(sink) = members.get(&owner) {
-            let _ = sink.send(set_extranonce_prefix(down_cid, extranonce1)?);
-            let _ = sink.send(set_target(down_cid, initial_target)?);
+            .await?;
+        // Re-point the channel's owner: new extranonce prefix + target; the
+        // reader streams the new pool's first job after. The target is read
+        // under the lock as it stands now, so one the reader already sent from
+        // the pool's first difficulty is not overwritten by an older one.
+        {
+            let i = self.inner.lock().await;
+            let target = i
+                .channels
+                .iter()
+                .find(|c| c.down_channel_id == down_cid)
+                .map(|c| c.gate.downstream_target());
+            if let (Some(sink), Some(target)) = (members.get(&owner), target) {
+                if let Ok(f) = set_extranonce_prefix(down_cid, extranonce1) {
+                    let _ = sink.send(f);
+                }
+                if let Ok(f) = set_target(down_cid, target.to_vec()) {
+                    let _ = sink.send(f);
+                }
+            }
         }
         refuse_abandoned_opens(&members, abandoned);
         info!(upstream = %target.url, generation, "sv2→sv1 upstream switched (translated)");
@@ -1782,7 +2055,7 @@ impl Sv2Session {
 
     /// Make the SV1 pool behind `conn` the active upstream, translated onto the
     /// single `channel`. Returns the opens that were still pending on the
-    /// upstream it replaces.
+    /// upstream it replaces; refuses a retired rig.
     async fn install_sv1_translated(
         self: &Arc<Self>,
         conn: Sv1UpConn,
@@ -1791,7 +2064,7 @@ impl Sv2Session {
         routing: Routing,
         generation: u64,
         channel: Channel,
-    ) -> Vec<(u32, u32)> {
+    ) -> anyhow::Result<Vec<(u32, u32)>> {
         let state = Arc::new(Mutex::new(Sv1UpState {
             version_mask: conn.version_mask,
             user_name: up_ident,
@@ -1802,10 +2075,15 @@ impl Sv2Session {
             next_submit_id: 1,
             ..Default::default()
         }));
-        let (to_up, up_rx) = mpsc::unbounded_channel::<EitherFrame>();
+        let mut i = self.inner.lock().await;
+        // Retired while this switch was connecting: install nothing, the new
+        // connection is dropped here.
+        if i.retired {
+            bail!("rig is retired");
+        }
+        let (to_up, up_rx) = mpsc::unbounded_channel::<Sv2Frame>();
         let writer = spawn_sv1_translate_writer(conn.write, state.clone(), up_rx);
         let down_cid = channel.down_channel_id;
-        let mut i = self.inner.lock().await;
         // Reader spawned inside the lock — see `Inner::install_active`.
         let reader = spawn_sv1_translate_reader(
             self.clone(),
@@ -1821,14 +2099,74 @@ impl Sv2Session {
         i.group_down.clear();
         i.routing = routing;
         i.translating = true;
-        i.take_pending_opens()
+        Ok(i.take_pending_opens())
+    }
+}
+
+/// Judge a miner's share frame with its channel's gate. Returns the verdict
+/// and the share's sequence number; anything the gate cannot read is
+/// forwarded unmeasured.
+fn judge_submit(i: &mut Inner, down_cid: u32, mt: u8, frame: &mut Sv2Frame) -> (Verdict, u32) {
+    let unplaced = (Verdict::Forward { measured: None }, 0);
+    let Some(c) = i
+        .channels
+        .iter_mut()
+        .find(|c| c.down_channel_id == down_cid)
+    else {
+        return unplaced;
+    };
+    match Mining::try_from((mt, frame.payload())) {
+        Ok(Mining::SubmitSharesExtended(share)) => {
+            let share = share.into_owned();
+            (c.gate.check_extended(&share), share.sequence_number)
+        }
+        Ok(Mining::SubmitSharesStandard(share)) => {
+            (c.gate.check_standard(&share), share.sequence_number)
+        }
+        _ => (c.gate.unplaced(), 0),
+    }
+}
+
+/// Apply a miner's `UpdateChannel` to its channel's gate. Returns the new
+/// miner target when it moved.
+fn update_device(i: &mut Inner, down_cid: u32, frame: &mut Sv2Frame) -> Option<[u8; 32]> {
+    let c = i
+        .channels
+        .iter_mut()
+        .find(|c| c.down_channel_id == down_cid)?;
+    match Mining::try_from((mining::MESSAGE_TYPE_UPDATE_CHANNEL, frame.payload())) {
+        Ok(Mining::UpdateChannel(m)) => c
+            .gate
+            .update_device(m.nominal_hash_rate, m.max_target.as_bytes()),
+        _ => None,
+    }
+}
+
+/// Retarget each channel's miner when its gate's vardiff says so. Runs for the
+/// life of the rig.
+async fn run_vardiff(session: Arc<Sv2Session>) {
+    let mut every = tokio::time::interval(crate::share_gate::VARDIFF_TICK);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let mut i = session.inner.lock().await;
+        let retarget: Vec<(u32, u32, [u8; 32])> = i
+            .channels
+            .iter_mut()
+            .filter_map(|c| c.gate.tick().map(|t| (c.owner, c.down_channel_id, t)))
+            .collect();
+        for (owner, down_cid, t) in retarget {
+            if let (Some(sink), Ok(f)) = (i.member_sink(owner), set_target(down_cid, t.to_vec())) {
+                let _ = sink.send(f);
+            }
+        }
     }
 }
 
 /// Answer every open that was pending on a replaced upstream with an error,
 /// so the member that asked reopens instead of waiting forever.
 fn refuse_abandoned_opens(
-    members: &HashMap<u32, mpsc::UnboundedSender<EitherFrame>>,
+    members: &HashMap<u32, mpsc::UnboundedSender<Sv2Frame>>,
     abandoned: Vec<(u32, u32)>,
 ) {
     for (member, request_id) in abandoned {
@@ -1850,21 +2188,21 @@ pub async fn handle_seller_miner_sv2(
     keys: NoiseKeys,
 ) -> anyhow::Result<()> {
     let _ = miner.set_nodelay(true);
-    let stream = accept_noise_connection::<Msg>(miner, keys.public(), keys.secret(), CERT_VALIDITY)
+    let stream = accept_noise_connection(miner, keys.public(), keys.secret(), CERT_VALIDITY)
         .await
         .map_err(|e| anyhow!("downstream noise accept: {e:?}"))?;
     let (mut down_read, down_write) = stream.into_split();
 
     // 1. Miner SetupConnection.
     let setup = read_one(&mut down_read).await?;
-    if wire::msg_type(&setup) != Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+    if wire::msg_type(&setup) != common::MESSAGE_TYPE_SETUP_CONNECTION {
         bail!("expected SetupConnection from miner");
     }
 
     // 2. Acknowledge setup (flags=0, permissive). Register-only: no upstream is
     //    contacted yet — it is resolved from the worker in the OpenMiningChannel
     //    below, so SV2 needs no bootstrap/fallback pool at all.
-    let (to_miner, to_miner_rx) = mpsc::unbounded_channel::<EitherFrame>();
+    let (to_miner, to_miner_rx) = mpsc::unbounded_channel::<Sv2Frame>();
     let miner_writer = spawn_writer(down_write, to_miner_rx);
     to_miner
         .send(setup_success(0))
@@ -1875,16 +2213,28 @@ pub async fn handle_seller_miner_sv2(
     let MinerOpen { spec, worker } =
         parse_miner_open(&mut open_frame).ok_or_else(|| anyhow!("expected OpenMiningChannel"))?;
 
-    // 4. Register-only: the worker is admitted when it has a registered rig
-    //    (its idle pool) OR an active order, the same rule the SV1 relay applies,
-    //    so a rented rig is still served while the buyer's order runs.
-    let idle_target = ctx.sellers.default_pool(&worker).await;
+    // 4. Bundle onto this rig's existing SV2 upstream if one is live; else build
+    //    a fresh session (which becomes the rig if its upstream ends up SV2).
+    //    The per-worker gate serializes create-or-attach so two same-rig miners
+    //    connecting at once don't each build an upstream.
+    let gate = ctx.sv2_rigs.gate(&worker).await;
+    let _hold = gate.lock().await;
+    let rig = ctx.sv2_rigs.get(&worker).await;
+    // Subscribe to the live rig FIRST: a pool change firing from here on breaks
+    // the serve loop below, and one that fired earlier was persisted in the
+    // order store before the signal, so the resolve right after sees it.
+    let rig_rx = rig.as_ref().map(|r| r.subscribe_reconnect());
 
-    // 5. Decide where the first channel opens: straight on the buyer's pool if a
-    //    rental is already active (resume on reconnect without an open-then-switch
-    //    round-trip), else the rig's idle pool. `default_target` stays the idle
-    //    pool, so a release/revert returns there; with none, the revert drops
-    //    the members instead.
+    // 5. Register-only: the worker is admitted when it has a registered rig
+    //    (its idle pool) OR an active order, the same rule the SV1 relay
+    //    applies, so a rented rig is still served while the buyer's order runs.
+    //    The first channel opens straight on the buyer's pool if a rental is
+    //    active (resume on reconnect without an open-then-switch round-trip),
+    //    else on the rig's idle pool. `default_target` stays the idle pool, so a
+    //    release/revert returns there; with none, the revert drops the members
+    //    instead. Resolved under the gate, so a bundle, a retire and a fresh
+    //    build all act on the same state.
+    let idle_target = ctx.sellers.default_pool(&worker).await;
     let active_order = ctx
         .orders
         .active_for_worker(&worker, crate::orders::now_ms())
@@ -1903,32 +2253,33 @@ pub async fn handle_seller_miner_sv2(
         }
     };
 
-    // 6. Bundle onto this rig's existing SV2 upstream if one is live; else build a
-    //    fresh session (which becomes the rig if its upstream ends up SV2). The
-    //    per-worker gate serializes create-or-attach so two same-rig miners
-    //    connecting at once don't each build an upstream.
-    let gate = ctx.sv2_rigs.gate(&worker).await;
-    let _hold = gate.lock().await;
-
-    let attached = match ctx.sv2_rigs.get(&worker).await {
-        Some(rig) => {
-            // Subscribe FIRST: a pool change firing from here on breaks the
-            // serve loop below, and one that fired earlier was persisted in the
-            // order store before the signal — the reconcile resolve sees it.
-            let reconnect_rx = rig.subscribe_reconnect();
-            // Re-resolve NOW (the resolve at the top of this function predates
-            // the subscription) and align the rig's shared upstream with it, so
-            // this member can't bundle onto a stale pre-rent/post-cancel pool.
-            let desired = ctx
-                .orders
-                .active_for_worker(&worker, crate::orders::now_ms())
-                .await;
-            rig.reconcile_routing(desired.as_ref()).await;
-            rig.attach_member(to_miner.clone(), &spec)
+    let attached = match (rig, rig_rx) {
+        (Some(rig), Some(reconnect_rx)) => {
+            if rig
+                .is_empty_on_stale_routing(active_order.as_ref(), idle_target.as_ref())
                 .await
-                .map(|member| (rig, member, reconnect_rx))
+            {
+                // A memberless rig only exists to keep its upstream warm for
+                // a reconnect onto the SAME pool. Routed elsewhere now, it has
+                // nothing to offer: retire it and build fresh below, which
+                // connects the right pool (SV2 or translated SV1) in one step.
+                // Re-pointing it instead fails for an SV1 target (a translated
+                // upstream is built around a channel, and an empty rig has
+                // none), and the miner would bundle onto the idle pool until a
+                // retry moves the rig and drops it a second time.
+                retire_rig(&ctx.sv2_rigs, &ctx.registry, &rig, &worker).await;
+                info!(%peer, %worker, "empty rig on a stale upstream retired; connecting fresh");
+                None
+            } else {
+                // Align the rig's shared upstream with the resolve, so this
+                // member can't bundle onto a stale pre-rent/post-cancel pool.
+                rig.reconcile_routing(active_order.as_ref()).await;
+                rig.attach_member(to_miner.clone(), &spec)
+                    .await
+                    .map(|member| (rig, member, reconnect_rx))
+            }
         }
-        None => None,
+        _ => None,
     };
 
     let (session, member_id, mut reconnect_rx) = match attached {
@@ -1942,7 +2293,7 @@ pub async fn handle_seller_miner_sv2(
             // install the real one — SV2 passthrough or SV1 translation,
             // auto-detected. On primary failure, fall back to the order's pool.
             let (died_tx, died_rx) = mpsc::unbounded_channel::<u64>();
-            let (placeholder_to_up, _placeholder_rx) = mpsc::unbounded_channel::<EitherFrame>();
+            let (placeholder_to_up, _placeholder_rx) = mpsc::unbounded_channel::<Sv2Frame>();
             let session = Arc::new(Sv2Session {
                 switch: Mutex::new(()),
                 died_tx,
@@ -1972,6 +2323,8 @@ pub async fn handle_seller_miner_sv2(
                     label: worker.clone(),
                     translating: false,
                     supervisor: None,
+                    vardiff: None,
+                    retired: false,
                     idle_token: 0,
                 }),
             });
@@ -1998,19 +2351,44 @@ pub async fn handle_seller_miner_sv2(
                 Some(o) => o.connect_with_fallback(install).await?,
                 None => {
                     install(open_target.clone()).await?;
-                    open_target
+                    open_target.clone()
                 }
             };
 
             ctx.registry
                 .insert(worker.clone(), AnySession::Sv2(session.clone()))
                 .await;
-            // Supervisor owned by the rig (aborted only on last-member teardown).
+            // A rent, cancel or idle-pool edit persisted between the resolve
+            // and this registration signalled the sessions registered then,
+            // not this one. Resolve again; if the miner's place moved, send it
+            // round again so it reconnects onto the right pool.
+            let order_now = ctx
+                .orders
+                .active_for_worker(&worker, crate::orders::now_ms())
+                .await;
+            let moved = match &order_now {
+                Some(o) => routing.order_id() != Some(o.id.as_str()),
+                None => {
+                    routing.order_id().is_some()
+                        || ctx.sellers.default_pool(&worker).await.as_ref() != Some(&open_target)
+                }
+            };
+            if moved {
+                info!(%peer, %worker, "order or idle pool changed while connecting; reconnecting the miner");
+                session.force_reconnect();
+            }
+            // Supervisor and vardiff ticker owned by the rig (aborted only on
+            // last-member teardown).
             let supervisor = tokio::spawn(crate::control::supervise_upstream(
                 AnySession::Sv2(session.clone()),
                 died_rx,
             ));
-            session.inner.lock().await.supervisor = Some(supervisor);
+            let vardiff = tokio::spawn(run_vardiff(session.clone()));
+            {
+                let mut i = session.inner.lock().await;
+                i.supervisor = Some(supervisor);
+                i.vardiff = Some(vardiff);
+            }
 
             // Become the bundle target for this worker only if the upstream is SV2
             // (a translated SV1 rig can't multiplex) and the slot is still free.
@@ -2045,16 +2423,11 @@ pub async fn handle_seller_miner_sv2(
                     break;
                 }
                 read = down_read.read_frame() => match read {
-                    Ok(f) => match wire::into_sv2(f) {
-                        Some(f) => f,
-                        None => continue,
-                    },
+                    Ok(f) => f,
                     Err(_) => break,
                 },
             };
-            let Some(mt) = wire::msg_type(&frame) else {
-                continue;
-            };
+            let mt = wire::msg_type(&frame);
             if mt == mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL
                 || mt == mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL
             {
@@ -2094,13 +2467,41 @@ pub async fn handle_seller_miner_sv2(
                         continue;
                     };
                     if let Some(up_cid) = i.up_for_down(down_cid) {
+                        if mt == mining::MESSAGE_TYPE_UPDATE_CHANNEL {
+                            // The device's new nominal hashrate and easiest
+                            // target size its miner target too; the pool still
+                            // receives the update below.
+                            if let Some(t) = update_device(&mut i, down_cid, &mut frame) {
+                                if let Ok(f) = set_target(down_cid, t.to_vec()) {
+                                    let _ = to_miner.send(f);
+                                }
+                            }
+                        }
                         if is_submit {
                             let inner = &mut *i;
+                            let (verdict, seq) = judge_submit(inner, down_cid, mt, &mut frame);
+                            if let Some(d) = verdict.measured() {
+                                inner.delivery.measured(d);
+                            }
+                            if let Verdict::Withhold { measured } = verdict {
+                                // Met the miner's target, not the pool's: the
+                                // pool would reject it, so the proxy answers it.
+                                let ok = mining::SubmitSharesSuccess {
+                                    channel_id: down_cid,
+                                    last_sequence_number: seq,
+                                    new_submits_accepted_count: 1,
+                                    new_shares_sum: measured.round().max(1.0) as u64,
+                                };
+                                let _ = to_miner.send(wire::frame_from(AnyMessageOwned::Mining(
+                                    MiningOwned::SubmitSharesSuccess(ok),
+                                )));
+                                continue;
+                            }
                             inner.delivery.submitted(&inner.label);
                             submit_order = inner.routing.order_id().map(str::to_string);
                         }
                         wire::rewrite_channel_id(&mut frame, up_cid);
-                        let _ = i.active.to_up.send(frame.into());
+                        let _ = i.active.to_up.send(frame);
                     } else {
                         debug!(
                             down_cid,
@@ -2150,15 +2551,7 @@ pub async fn handle_seller_miner_sv2(
         } else {
             // Standalone session (not a bundle target): close immediately — a
             // reconnect couldn't re-attach to it anyway.
-            ctx.registry
-                .remove_if(&label, &AnySession::Sv2(session.clone()))
-                .await;
-            let i = session.inner.lock().await;
-            i.active.reader.abort();
-            i.active.writer.abort();
-            if let Some(sup) = &i.supervisor {
-                sup.abort();
-            }
+            retire_rig(&ctx.sv2_rigs, &ctx.registry, &session, &label).await;
             info!(%peer, %label, "sv2 session closed");
         }
     } else {

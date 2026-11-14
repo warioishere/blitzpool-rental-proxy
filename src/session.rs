@@ -85,6 +85,11 @@ impl Routing {
 /// What one session has delivered: the live hashrate window, lifetime
 /// counters, and the accept-ratio health signal over them. Every relay path
 /// (SV1, SV2, and both translations) books through this one type.
+///
+/// Two sources, kept apart: the hashrate window measures every share the
+/// proxy validated against the miner's target ([`Delivery::measured`]), the
+/// counters and the bill take only what the pool accepted
+/// ([`Delivery::accepted`]).
 pub struct Delivery {
     hashrate: HashrateWindow,
     /// Lifetime delivered work, diff-1 share units (Σ accepted share difficulty).
@@ -124,18 +129,25 @@ impl Delivery {
         }
     }
 
-    /// Credit `shares` accepted shares worth `work` diff-1 units in total.
-    /// Returns `false`, crediting nothing, when `work` is not positive: the
-    /// share difficulty is unknown, so there is no measured work to bill.
+    /// Credit `shares` pool-accepted shares worth `work` diff-1 units in
+    /// total. Returns `false`, crediting nothing, when `work` is not positive:
+    /// the share difficulty is unknown, so there is no measured work to bill.
     pub fn accepted(&mut self, work: f64, shares: u64, worker: &str) -> bool {
         if work <= 0.0 {
             return false;
         }
-        self.hashrate.record(work);
         self.delivered_work += work;
         self.accepted_shares += shares;
-        debug!(%worker, shares, hashrate = self.hashrate.hashes_per_second(), "accepted shares");
+        debug!(%worker, shares, work, "accepted shares");
         true
+    }
+
+    /// Feed the hashrate window one share the proxy validated against the
+    /// miner's target, credited at that target's `difficulty`.
+    pub fn measured(&mut self, difficulty: f64) {
+        if difficulty > 0.0 {
+            self.hashrate.record(difficulty);
+        }
     }
 
     /// Snapshot for the control API.
@@ -166,7 +178,7 @@ impl Delivery {
     }
 }
 
-/// Rolling window of accepted-share difficulty → hashrate estimate.
+/// Rolling window of measured-share difficulty → hashrate estimate.
 /// `hashrate = Σ(share_diff) * 2^32 / elapsed_seconds`, where `elapsed` is the
 /// real span covered by the samples (capped at the window), so the estimate is
 /// right within about a minute of (re)connect instead of taking the whole window
@@ -188,7 +200,7 @@ impl HashrateWindow {
         }
     }
 
-    /// Record an accepted share credited at `difficulty`.
+    /// Record a measured share credited at `difficulty`.
     pub fn record(&mut self, difficulty: f64) {
         self.record_at(Instant::now(), difficulty);
     }
@@ -218,11 +230,19 @@ impl HashrateWindow {
     /// actual span (not the fixed window) means the estimate is correct shortly
     /// after (re)connect; once mining longer than the window, pruning keeps the
     /// oldest sample ~`window` back, so it settles to a rolling window average.
+    ///
+    /// Samples older than the window are skipped here as well as pruned on
+    /// record: a miner that stops submitting reads 0 once its last share has
+    /// aged out, instead of holding its last value until the next share.
     fn hashes_per_second_at(&self, now: Instant) -> f64 {
-        let Some(&(oldest, _)) = self.samples.front() else {
+        let mut live = self
+            .samples
+            .iter()
+            .filter(|(t, _)| now.duration_since(*t) <= self.window);
+        let Some(&(oldest, first)) = live.next() else {
             return 0.0;
         };
-        let sum: f64 = self.samples.iter().map(|(_, d)| d).sum();
+        let sum: f64 = first + live.map(|(_, d)| d).sum::<f64>();
         let span = now
             .duration_since(oldest)
             .as_secs_f64()
@@ -263,6 +283,19 @@ mod tests {
     }
 
     #[test]
+    fn hashrate_reads_zero_once_the_last_share_ages_out() {
+        // One share, then silence: past the window the estimate is 0, not the
+        // last share spread over the window forever.
+        let mut w = HashrateWindow::new(Duration::from_secs(600));
+        let start = Instant::now();
+        w.record_at(start, 1_000_000.0);
+        let inside = start + Duration::from_secs(300);
+        assert!(w.hashes_per_second_at(inside) > 0.0);
+        let after = start + Duration::from_secs(601);
+        assert_eq!(w.hashes_per_second_at(after), 0.0);
+    }
+
+    #[test]
     fn hashrate_caps_at_window_when_mining_longer() {
         let mut w = HashrateWindow::new(Duration::from_secs(600));
         let start = Instant::now();
@@ -287,6 +320,8 @@ mod delivery_tests {
         let mut d = Delivery::new();
         d.submitted("w");
         d.submitted("w");
+        d.measured(256.0);
+        d.measured(256.0);
         assert!(d.accepted(512.0, 2, "w"));
         let rented = Routing::Rented {
             order_id: "o1".into(),
@@ -298,6 +333,23 @@ mod delivery_tests {
         assert_eq!(st.routing, "rented");
         assert_eq!(st.order_id.as_deref(), Some("o1"));
         assert!(st.hashrate_hs > 0.0);
+    }
+
+    #[test]
+    fn the_hashrate_comes_from_measured_shares_not_from_the_bill() {
+        // Pool-accepted work alone moves the bill, not the hashrate; a measured
+        // share alone moves the hashrate, not the bill.
+        let mut billed = Delivery::new();
+        assert!(billed.accepted(1_000_000.0, 1, "w"));
+        let st = billed.status("w", &Routing::Idle, "pool:3333", "sv2");
+        assert_eq!(st.hashrate_hs, 0.0);
+        assert_eq!(st.delivered_work, 1_000_000.0);
+
+        let mut measured = Delivery::new();
+        measured.measured(4096.0);
+        let st = measured.status("w", &Routing::Idle, "pool:3333", "sv2");
+        assert!(st.hashrate_hs > 0.0);
+        assert_eq!(st.delivered_work, 0.0);
     }
 
     #[test]

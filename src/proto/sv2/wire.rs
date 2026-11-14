@@ -10,40 +10,33 @@
 //! already-serialized frame. Only the handshake and channel-open messages are
 //! parsed/built as typed structs.
 
-use stratum_core::codec_sv2::{StandardEitherFrame, StandardSv2Frame};
-use stratum_core::framing_sv2::framing::Frame;
+use stratum_core::codec_sv2::{EncodableFrame, MessageFrame, SerializedFrame};
 use stratum_core::mining_sv2 as mining;
-use stratum_core::parsers_sv2::{AnyMessage, IsSv2Message};
+use stratum_core::parsers_sv2::{AnyMessageOwned, IsSv2Message};
 
-/// The message type carried by frames on the wire.
-pub type Msg = AnyMessage<'static>;
-/// A frame as produced/consumed by the Noise transport.
-pub type EitherFrame = StandardEitherFrame<Msg>;
-/// A decoded (or to-be-encoded) SV2 frame.
-pub type Sv2Frame = StandardSv2Frame<Msg>;
+/// An SV2 frame as the Noise transport reads and writes it: the header followed
+/// by the serialized payload.
+pub type Sv2Frame = SerializedFrame;
 
-/// Wrap a typed message into a transport frame.
-pub fn frame_from(msg: Msg) -> EitherFrame {
+/// Serialize a typed message into a transport frame. The bytes are the ones the
+/// encoder writes for the message itself (header + payload), so a built frame
+/// and a forwarded one take the same path to the socket.
+pub fn frame_from(msg: AnyMessageOwned) -> Sv2Frame {
     let msg_type = msg.message_type();
     let channel_bit = msg.channel_bit();
     let ext = msg.extension_type();
-    let frame = StandardSv2Frame::from_message(msg, msg_type, ext, channel_bit)
+    let frame = MessageFrame::from_message(msg, msg_type, ext, channel_bit)
         .expect("message fits in one SV2 frame");
-    frame.into()
-}
-
-/// Extract the SV2 frame from a transport frame (post-handshake frames are SV2,
-/// not handshake frames).
-pub fn into_sv2(frame: EitherFrame) -> Option<Sv2Frame> {
-    match frame {
-        Frame::Sv2(f) => Some(f),
-        Frame::HandShake(_) => None,
-    }
+    let mut bytes = vec![0u8; frame.encoded_length()];
+    frame
+        .encode_into(&mut bytes)
+        .expect("a message frame encodes into its own encoded length");
+    SerializedFrame::from_bytes(bytes).expect("an encoded frame holds exactly one frame")
 }
 
 /// The message type byte of a decoded frame.
-pub fn msg_type(frame: &Sv2Frame) -> Option<u8> {
-    frame.get_header().map(|h| h.msg_type())
+pub fn msg_type(frame: &Sv2Frame) -> u8 {
+    frame.header().msg_type()
 }
 
 /// Overwrite the `channel_id` (first 4 LE bytes of the payload) of a decoded,
@@ -97,27 +90,27 @@ pub fn is_channel_scoped(msg_type: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratum_core::binary_sv2::B032;
-    use stratum_core::mining_sv2::SubmitSharesExtended;
-    use stratum_core::parsers_sv2::Mining;
+    use stratum_core::binary_sv2::B032Owned;
+    use stratum_core::mining_sv2::SubmitSharesExtendedOwned;
+    use stratum_core::parsers_sv2::MiningOwned;
 
     #[test]
     fn channel_id_rewrite_roundtrips_through_serialization() {
         // Build a real channel-scoped message (channel_id = 1), serialize it,
         // decode it, rewrite channel_id → 42, and confirm via re-read.
-        let submit = SubmitSharesExtended {
+        let submit = SubmitSharesExtendedOwned {
             channel_id: 1,
             sequence_number: 5,
             job_id: 9,
             nonce: 0xdead_beef,
             ntime: 0x6500_0000,
             version: 0x2000_0000,
-            extranonce: B032::try_from(vec![1u8, 2, 3, 4]).unwrap(),
+            extranonce: B032Owned::try_from(vec![1u8, 2, 3, 4]).unwrap(),
         };
-        let msg = AnyMessage::Mining(Mining::SubmitSharesExtended(submit));
+        let msg = AnyMessageOwned::Mining(MiningOwned::SubmitSharesExtended(submit));
         assert!(is_channel_scoped(msg.message_type()));
 
-        let bytes = encode_to_vec(into_sv2(frame_from(msg)).expect("sv2 frame"));
+        let bytes = encode_to_vec(frame_from(msg));
         let mut decoded = decode_from_bytes(&bytes);
 
         assert_eq!(read_channel_id(&mut decoded), Some(1));
@@ -140,23 +133,23 @@ mod tests {
 
     fn encode_to_vec(frame: Sv2Frame) -> Vec<u8> {
         use stratum_core::codec_sv2::Encoder;
-        let mut enc = Encoder::<Msg>::new();
-        let s = enc.encode(frame).expect("encode");
-        AsRef::<[u8]>::as_ref(&s).to_vec()
+        let mut enc = Encoder::new();
+        enc.encode(frame).expect("encode")
     }
 
     fn decode_from_bytes(bytes: &[u8]) -> Sv2Frame {
-        use stratum_core::codec_sv2::StandardDecoder;
-        let mut dec = StandardDecoder::<Msg>::new();
+        use stratum_core::codec_sv2::{Decoded, Decoder};
+        let mut dec = Decoder::new();
         let mut off = 0;
         loop {
-            let w = dec.writable();
+            if let Decoded::Frame(f) = dec.next_frame().expect("decode") {
+                return f;
+            }
+            let w = dec.read_buf();
             let n = w.len().min(bytes.len() - off);
             w[..n].copy_from_slice(&bytes[off..off + n]);
             off += n;
-            if let Ok(f) = dec.next_frame() {
-                return f;
-            }
+            dec.advance(n).expect("advance within the read window");
         }
     }
 }

@@ -250,8 +250,8 @@ struct SellerQuery {
 }
 
 /// A rig is rentable only while it's actually delivering hashrate. The live
-/// windowed estimate reads 0 h/s when a worker is disconnected or hasn't landed
-/// an accepted share recently, so `> 0` means "online and delivering".
+/// windowed estimate reads 0 h/s when a worker is disconnected or hasn't sent a
+/// share meeting its target recently, so `> 0` means "online and delivering".
 fn is_delivering(hashrate_hs: f64) -> bool {
     hashrate_hs > 0.0
 }

@@ -19,6 +19,7 @@ mod probe;
 mod proto;
 mod registry;
 mod session;
+mod share_gate;
 mod store;
 
 use std::sync::Arc;

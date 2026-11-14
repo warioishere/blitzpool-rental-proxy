@@ -4,9 +4,10 @@
 use super::*;
 use serde_json::json;
 use std::collections::HashSet;
-use stratum_core::binary_sv2::{Seq0255, Sv2Option, B032, B064K};
+use stratum_core::binary_sv2::{B032Owned, B064KOwned, Seq0255Owned, Sv2OptionOwned};
 use stratum_core::mining_sv2::{
-    NewExtendedMiningJob, SetNewPrevHash, SubmitSharesExtended, SubmitSharesSuccess, UpdateChannel,
+    NewExtendedMiningJobOwned, SetNewPrevHashOwned, SubmitSharesExtendedOwned, SubmitSharesSuccess,
+    UpdateChannelOwned,
 };
 use tokio::net::TcpListener;
 
@@ -48,29 +49,31 @@ fn diff1_target() -> Vec<u8> {
 /// The mock pool has to do this to be a pool at all: a harness that opens
 /// channels and then goes silent cannot catch `open_on` mishandling the frames
 /// of an already-opened channel while the next one is still opening.
-fn initial_job_frames(channel_id: u32, job_id: u32) -> [EitherFrame; 2] {
-    let job = NewExtendedMiningJob {
+fn initial_job_frames(channel_id: u32, job_id: u32) -> [Sv2Frame; 2] {
+    let job = NewExtendedMiningJobOwned {
         channel_id,
         job_id,
         // Future job: it becomes mineable with the SetNewPrevHash below, which
         // is the order a real pool uses at channel open.
-        min_ntime: Sv2Option::new(None),
+        ntime_start: Sv2OptionOwned::new(None),
         version: 0x2000_0000,
         version_rolling_allowed: true,
-        merkle_path: Seq0255::new(Vec::<U256>::new()).expect("empty merkle path"),
-        coinbase_tx_prefix: B064K::try_from(vec![0x01u8; 8]).expect("prefix fits"),
-        coinbase_tx_suffix: B064K::try_from(vec![0x02u8; 8]).expect("suffix fits"),
+        merkle_path: Seq0255Owned::new(Vec::<U256Owned>::new()).expect("empty merkle path"),
+        coinbase_tx_prefix: B064KOwned::try_from(vec![0x01u8; 8]).expect("prefix fits"),
+        coinbase_tx_suffix: B064KOwned::try_from(vec![0x02u8; 8]).expect("suffix fits"),
     };
-    let prev = SetNewPrevHash {
+    let prev = SetNewPrevHashOwned {
         channel_id,
         job_id,
-        prev_hash: U256::from([0x11u8; 32]),
-        min_ntime: 1,
+        prev_hash: U256Owned::from([0x11u8; 32]),
+        ntime_start: 1,
         nbits: 0x1702_353d,
     };
     [
-        wire::frame_from(AnyMessage::Mining(Mining::NewExtendedMiningJob(job))),
-        wire::frame_from(AnyMessage::Mining(Mining::SetNewPrevHash(prev))),
+        wire::frame_from(AnyMessageOwned::Mining(MiningOwned::NewExtendedMiningJob(
+            job,
+        ))),
+        wire::frame_from(AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(prev))),
     ]
 }
 
@@ -88,7 +91,7 @@ async fn mock_pool(
 ) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+    let stream = accept_noise_connection(sock, keys.public(), keys.secret(), CERT_VALIDITY)
         .await
         .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (read, write) = stream.into_split();
@@ -109,10 +112,9 @@ async fn mock_pool_multi(
     loop {
         let (sock, _) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
-        let stream =
-            accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
-                .await
-                .map_err(|e| anyhow!("pool noise: {e:?}"))?;
+        let stream = accept_noise_connection(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+            .await
+            .map_err(|e| anyhow!("pool noise: {e:?}"))?;
         let (read, write) = stream.into_split();
         let cid = base_cid + n * 10;
         n += 1;
@@ -138,7 +140,7 @@ async fn serve_pool_conn(
     // SetupConnection → success.
     loop {
         let f = read_one(&mut read).await?;
-        if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+        if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION {
             break;
         }
     }
@@ -151,8 +153,8 @@ async fn serve_pool_conn(
     let mut next_cid = base_cid;
     while let Ok(mut f) = read_one(&mut read).await {
         match wire::msg_type(&f) {
-            Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL)
-            | Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL) => {
+            mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL
+            | mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL => {
                 let Some(open) = parse_miner_open(&mut f) else {
                     continue;
                 };
@@ -183,7 +185,7 @@ async fn serve_pool_conn(
                     write.write_frame(f).await.map_err(|e| anyhow!("{e:?}"))?;
                 }
             }
-            Some(mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED) => {
+            mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED => {
                 let Some(cid) = wire::read_channel_id(&mut f) else {
                     continue;
                 };
@@ -195,23 +197,25 @@ async fn serve_pool_conn(
                     new_shares_sum: 1,
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(
-                        Mining::SubmitSharesSuccess(ok),
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::SubmitSharesSuccess(ok),
                     )))
                     .await
                     .map_err(|e| anyhow!("{e:?}"))?;
             }
-            Some(mining::MESSAGE_TYPE_UPDATE_CHANNEL) => {
+            mining::MESSAGE_TYPE_UPDATE_CHANNEL => {
                 // Vardiff: answer the miner's hashrate update with a target.
                 let Some(cid) = wire::read_channel_id(&mut f) else {
                     continue;
                 };
-                let st = SetTarget {
+                let st = SetTargetOwned {
                     channel_id: cid,
-                    maximum_target: U256::from([0x33u8; 32]),
+                    target: U256Owned::from([0x33u8; 32]),
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(Mining::SetTarget(st))))
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::SetTarget(st),
+                    )))
                     .await
                     .map_err(|e| anyhow!("{e:?}"))?;
             }
@@ -230,13 +234,16 @@ struct MockMiner {
     /// test client that discarded those could not tell a delivered job from a
     /// dropped one. Drained by [`MockMiner::channels_with_a_job`].
     stash: Vec<Sv2Frame>,
+    /// The target of the last channel-open success: what the miner hashes
+    /// against until a `SetTarget` moves it.
+    open_target: Option<Vec<u8>>,
 }
 
 impl MockMiner {
     async fn connect(addr: std::net::SocketAddr) -> anyhow::Result<Self> {
         let tcp = TcpStream::connect(addr).await?;
         let _ = tcp.set_nodelay(true);
-        let stream = connect_with_noise::<Msg>(tcp, None)
+        let stream = connect_with_noise(tcp, None)
             .await
             .map_err(|e| anyhow!("miner noise: {e:?}"))?;
         let (read, write) = stream.into_split();
@@ -244,6 +251,7 @@ impl MockMiner {
             read,
             write,
             stash: Vec::new(),
+            open_target: None,
         })
     }
 
@@ -254,7 +262,7 @@ impl MockMiner {
             .map_err(|e| anyhow!("{e:?}"))?;
         loop {
             let f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS) {
+            if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS {
                 return Ok(());
             }
         }
@@ -314,8 +322,10 @@ impl MockMiner {
     async fn await_open_success(&mut self, want_mt: u8) -> anyhow::Result<ChannelInfo> {
         loop {
             let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f) == Some(want_mt) {
-                return parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"));
+            if wire::msg_type(&f) == want_mt {
+                let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad success"))?;
+                self.open_target = Some(info.target.clone());
+                return Ok(info);
             }
             self.stash.push(f);
         }
@@ -349,15 +359,15 @@ impl MockMiner {
     }
 
     async fn update_channel(&mut self, channel_id: u32) -> anyhow::Result<()> {
-        let m = UpdateChannel {
+        let m = UpdateChannelOwned {
             channel_id,
             nominal_hash_rate: 2.0e12,
-            maximum_target: U256::from([0xffu8; 32]),
+            max_target: U256Owned::from([0xffu8; 32]),
         };
         self.write
-            .write_frame(wire::frame_from(AnyMessage::Mining(Mining::UpdateChannel(
-                m,
-            ))))
+            .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                MiningOwned::UpdateChannel(m),
+            )))
             .await
             .map_err(|e| anyhow!("{e:?}"))
     }
@@ -366,29 +376,29 @@ impl MockMiner {
     async fn read_until_set_target(&mut self) -> anyhow::Result<(u32, Vec<u8>)> {
         loop {
             let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_SET_TARGET) {
-                let mt = wire::msg_type(&f).unwrap();
+            if wire::msg_type(&f) == mining::MESSAGE_TYPE_SET_TARGET {
+                let mt = wire::msg_type(&f);
                 let payload = f.payload();
                 if let Ok(Mining::SetTarget(m)) = Mining::try_from((mt, payload)) {
-                    return Ok((m.channel_id, m.maximum_target.inner_as_ref().to_vec()));
+                    return Ok((m.channel_id, m.target.as_bytes().to_vec()));
                 }
             }
         }
     }
 
     async fn submit(&mut self, channel_id: u32, seq: u32) -> anyhow::Result<()> {
-        let m = SubmitSharesExtended {
+        let m = SubmitSharesExtendedOwned {
             channel_id,
             sequence_number: seq,
             job_id: 1,
             nonce: 0,
             ntime: 0,
             version: 0x2000_0000,
-            extranonce: B032::try_from(vec![0u8; 8]).unwrap(),
+            extranonce: B032Owned::try_from(vec![0u8; 8]).unwrap(),
         };
         self.write
-            .write_frame(wire::frame_from(AnyMessage::Mining(
-                Mining::SubmitSharesExtended(m),
+            .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                MiningOwned::SubmitSharesExtended(m),
             )))
             .await
             .map_err(|e| anyhow!("{e:?}"))
@@ -404,8 +414,8 @@ impl MockMiner {
             version: 0x2000_0000,
         };
         self.write
-            .write_frame(wire::frame_from(AnyMessage::Mining(
-                Mining::SubmitSharesStandard(m),
+            .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                MiningOwned::SubmitSharesStandard(m),
             )))
             .await
             .map_err(|e| anyhow!("{e:?}"))
@@ -415,7 +425,7 @@ impl MockMiner {
     async fn read_until_cid(&mut self, want: u8) -> anyhow::Result<u32> {
         loop {
             let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f) == Some(want) {
+            if wire::msg_type(&f) == want {
                 if let Some(cid) = wire::read_channel_id(&mut f) {
                     return Ok(cid);
                 }
@@ -453,7 +463,7 @@ impl MockMiner {
     ) -> HashSet<u32> {
         let mut seen = HashSet::new();
         for mut f in std::mem::take(&mut self.stash) {
-            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB) {
+            if wire::msg_type(&f) == mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB {
                 if let Some(job) = parse_new_extended_job(&mut f) {
                     seen.insert(job.channel_id);
                 }
@@ -464,7 +474,7 @@ impl MockMiner {
                 let Ok(mut f) = read_one(&mut self.read).await else {
                     break;
                 };
-                if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB) {
+                if wire::msg_type(&f) == mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB {
                     if let Some(job) = parse_new_extended_job(&mut f) {
                         seen.insert(job.channel_id);
                     }
@@ -479,11 +489,11 @@ impl MockMiner {
     async fn read_until_set_extranonce(&mut self) -> anyhow::Result<(u32, Vec<u8>)> {
         loop {
             let mut f = read_one(&mut self.read).await?;
-            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_SET_EXTRANONCE_PREFIX) {
-                let mt = wire::msg_type(&f).unwrap();
+            if wire::msg_type(&f) == mining::MESSAGE_TYPE_SET_EXTRANONCE_PREFIX {
+                let mt = wire::msg_type(&f);
                 let payload = f.payload();
                 if let Ok(Mining::SetExtranoncePrefix(m)) = Mining::try_from((mt, payload)) {
-                    return Ok((m.channel_id, m.extranonce_prefix.inner_as_ref().to_vec()));
+                    return Ok((m.channel_id, m.extranonce_prefix.as_bytes().to_vec()));
                 }
             }
         }
@@ -737,13 +747,13 @@ async fn mock_pool_stall(
 ) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+    let stream = accept_noise_connection(sock, keys.public(), keys.secret(), CERT_VALIDITY)
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
-        if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+        if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION {
             break;
         }
     }
@@ -755,8 +765,8 @@ async fn mock_pool_stall(
     while let Ok(mut f) = read_one(&mut read).await {
         let is_open = matches!(
             wire::msg_type(&f),
-            Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL)
-                | Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL)
+            mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL
+                | mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL
         );
         if !is_open {
             continue;
@@ -1044,13 +1054,13 @@ async fn unregistered_worker_is_rejected() {
 async fn mock_pool_group(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+    let stream = accept_noise_connection(sock, keys.public(), keys.secret(), CERT_VALIDITY)
         .await
         .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
-        if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+        if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION {
             break;
         }
     }
@@ -1059,39 +1069,40 @@ async fn mock_pool_group(listener: TcpListener, keys: NoiseKeys) -> anyhow::Resu
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
     while let Ok(mut f) = read_one(&mut read).await {
-        if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
+        if wire::msg_type(&f) == mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL {
             let Some(open) = parse_miner_open(&mut f) else {
                 continue;
             };
             // Channel id 10, a DISTINCT group id 77 (mimics the pool's group).
-            let success =
-                Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+            let success = MiningOwned::OpenExtendedMiningChannelSuccess(
+                OpenExtendedMiningChannelSuccessOwned {
                     request_id: open.spec.request_id(),
                     channel_id: 10,
-                    target: U256::try_from(diff1_target()).unwrap(),
+                    target: U256Owned::try_from(diff1_target()).unwrap(),
                     extranonce_size: 8,
-                    extranonce_prefix: B032::try_from(vec![0xCC; 8]).unwrap(),
+                    extranonce_prefix: B032Owned::try_from(vec![0xCC; 8]).unwrap(),
                     group_channel_id: 77,
-                });
+                },
+            );
             write
-                .write_frame(wire::frame_from(AnyMessage::Mining(success)))
+                .write_frame(wire::frame_from(AnyMessageOwned::Mining(success)))
                 .await
                 .map_err(|e| anyhow!("{e:?}"))?;
             // The job is broadcast to the GROUP id (77), not the channel (10).
-            let empty_path: Vec<U256> = vec![];
-            let job = mining::NewExtendedMiningJob {
+            let empty_path: Vec<U256Owned> = vec![];
+            let job = mining::NewExtendedMiningJobOwned {
                 channel_id: 77,
                 job_id: 1,
-                min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                ntime_start: Sv2OptionOwned::new(None),
                 version: 0x2000_0000,
                 version_rolling_allowed: true,
-                merkle_path: empty_path.into(),
-                coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
-                coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                merkle_path: Seq0255Owned::new(empty_path).unwrap(),
+                coinbase_tx_prefix: B064KOwned::try_from(vec![]).unwrap(),
+                coinbase_tx_suffix: B064KOwned::try_from(vec![]).unwrap(),
             };
             write
-                .write_frame(wire::frame_from(AnyMessage::Mining(
-                    Mining::NewExtendedMiningJob(job),
+                .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                    MiningOwned::NewExtendedMiningJob(job),
                 )))
                 .await
                 .map_err(|e| anyhow!("{e:?}"))?;
@@ -1175,13 +1186,13 @@ const GROUP_LARGE: u32 = 88;
 async fn mock_pool_two_groups(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+    let stream = accept_noise_connection(sock, keys.public(), keys.secret(), CERT_VALIDITY)
         .await
         .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
-        if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+        if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION {
             break;
         }
     }
@@ -1192,7 +1203,7 @@ async fn mock_pool_two_groups(listener: TcpListener, keys: NoiseKeys) -> anyhow:
     let mut next_cid = 10u32;
     let mut opened = 0u32;
     while let Ok(mut f) = read_one(&mut read).await {
-        if wire::msg_type(&f) != Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
+        if wire::msg_type(&f) != mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL {
             continue;
         }
         let Some(open) = parse_miner_open(&mut f) else {
@@ -1208,34 +1219,35 @@ async fn mock_pool_two_groups(listener: TcpListener, keys: NoiseKeys) -> anyhow:
         let group = if size <= 2 { GROUP_SMALL } else { GROUP_LARGE };
         let cid = next_cid;
         next_cid += 1;
-        let success = Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
-            request_id: open.spec.request_id(),
-            channel_id: cid,
-            target: U256::try_from(diff1_target()).unwrap(),
-            extranonce_size: size,
-            extranonce_prefix: B032::try_from(vec![0xCC; 8]).unwrap(),
-            group_channel_id: group,
-        });
+        let success =
+            MiningOwned::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccessOwned {
+                request_id: open.spec.request_id(),
+                channel_id: cid,
+                target: U256Owned::try_from(diff1_target()).unwrap(),
+                extranonce_size: size,
+                extranonce_prefix: B032Owned::try_from(vec![0xCC; 8]).unwrap(),
+                group_channel_id: group,
+            });
         write
-            .write_frame(wire::frame_from(AnyMessage::Mining(success)))
+            .write_frame(wire::frame_from(AnyMessageOwned::Mining(success)))
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
         opened += 1;
         if opened == 2 {
-            let empty_path: Vec<U256> = vec![];
-            let job = mining::NewExtendedMiningJob {
+            let empty_path: Vec<U256Owned> = vec![];
+            let job = mining::NewExtendedMiningJobOwned {
                 channel_id: GROUP_SMALL,
                 job_id: 1,
-                min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                ntime_start: Sv2OptionOwned::new(None),
                 version: 0x2000_0000,
                 version_rolling_allowed: true,
-                merkle_path: empty_path.into(),
-                coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
-                coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                merkle_path: Seq0255Owned::new(empty_path).unwrap(),
+                coinbase_tx_prefix: B064KOwned::try_from(vec![]).unwrap(),
+                coinbase_tx_suffix: B064KOwned::try_from(vec![]).unwrap(),
             };
             write
-                .write_frame(wire::frame_from(AnyMessage::Mining(
-                    Mining::NewExtendedMiningJob(job),
+                .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                    MiningOwned::NewExtendedMiningJob(job),
                 )))
                 .await
                 .map_err(|e| anyhow!("{e:?}"))?;
@@ -1344,13 +1356,13 @@ async fn a_group_job_reaches_only_the_members_of_its_own_group() {
 async fn mock_pool_job_after_open(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+    let stream = accept_noise_connection(sock, keys.public(), keys.secret(), CERT_VALIDITY)
         .await
         .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
-        if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+        if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION {
             break;
         }
     }
@@ -1359,7 +1371,7 @@ async fn mock_pool_job_after_open(listener: TcpListener, keys: NoiseKeys) -> any
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
     while let Ok(mut f) = read_one(&mut read).await {
-        if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
+        if wire::msg_type(&f) == mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL {
             let Some(open) = parse_miner_open(&mut f) else {
                 continue;
             };
@@ -1376,20 +1388,20 @@ async fn mock_pool_job_after_open(listener: TcpListener, keys: NoiseKeys) -> any
                 .await
                 .map_err(|e| anyhow!("{e:?}"))?;
             // Bootstrap job, sent right after OpenSuccess to the channel id.
-            let empty_path: Vec<U256> = vec![];
-            let job = mining::NewExtendedMiningJob {
+            let empty_path: Vec<U256Owned> = vec![];
+            let job = mining::NewExtendedMiningJobOwned {
                 channel_id: 99,
                 job_id: 7,
-                min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                ntime_start: Sv2OptionOwned::new(None),
                 version: 0x2000_0000,
                 version_rolling_allowed: true,
-                merkle_path: empty_path.into(),
-                coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
-                coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                merkle_path: Seq0255Owned::new(empty_path).unwrap(),
+                coinbase_tx_prefix: B064KOwned::try_from(vec![]).unwrap(),
+                coinbase_tx_suffix: B064KOwned::try_from(vec![]).unwrap(),
             };
             write
-                .write_frame(wire::frame_from(AnyMessage::Mining(
-                    Mining::NewExtendedMiningJob(job),
+                .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                    MiningOwned::NewExtendedMiningJob(job),
                 )))
                 .await
                 .map_err(|e| anyhow!("{e:?}"))?;
@@ -1479,13 +1491,13 @@ async fn switch_delivers_new_upstream_initial_job() {
 async fn mock_pool_drop_once(listener: TcpListener, keys: NoiseKeys) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+    let stream = accept_noise_connection(sock, keys.public(), keys.secret(), CERT_VALIDITY)
         .await
         .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
-        if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+        if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION {
             break;
         }
     }
@@ -1494,7 +1506,7 @@ async fn mock_pool_drop_once(listener: TcpListener, keys: NoiseKeys) -> anyhow::
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
     while let Ok(mut f) = read_one(&mut read).await {
-        if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) {
+        if wire::msg_type(&f) == mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL {
             let Some(open) = parse_miner_open(&mut f) else {
                 continue;
             };
@@ -2535,13 +2547,13 @@ async fn mock_pool_mixed(
 ) -> anyhow::Result<()> {
     let (sock, _) = listener.accept().await?;
     let _ = sock.set_nodelay(true);
-    let stream = accept_noise_connection::<Msg>(sock, keys.public(), keys.secret(), CERT_VALIDITY)
+    let stream = accept_noise_connection(sock, keys.public(), keys.secret(), CERT_VALIDITY)
         .await
         .map_err(|e| anyhow!("pool noise: {e:?}"))?;
     let (mut read, mut write) = stream.into_split();
     loop {
         let f = read_one(&mut read).await?;
-        if wire::msg_type(&f) == Some(common::MESSAGE_TYPE_SETUP_CONNECTION) {
+        if wire::msg_type(&f) == common::MESSAGE_TYPE_SETUP_CONNECTION {
             break;
         }
     }
@@ -2551,63 +2563,65 @@ async fn mock_pool_mixed(
         .map_err(|e| anyhow!("{e:?}"))?;
     while let Ok(mut f) = read_one(&mut read).await {
         match wire::msg_type(&f) {
-            Some(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) => {
+            mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
                 let Some(open) = parse_miner_open(&mut f) else {
                     continue;
                 };
                 // Extended channel 10, grouped under group id 77.
-                let success =
-                    Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+                let success = MiningOwned::OpenExtendedMiningChannelSuccess(
+                    OpenExtendedMiningChannelSuccessOwned {
                         request_id: open.spec.request_id(),
                         channel_id: 10,
-                        target: U256::try_from(diff1_target()).unwrap(),
+                        target: U256Owned::try_from(diff1_target()).unwrap(),
                         extranonce_size: 8,
-                        extranonce_prefix: B032::try_from(vec![0xAA; 8]).unwrap(),
+                        extranonce_prefix: B032Owned::try_from(vec![0xAA; 8]).unwrap(),
                         group_channel_id: 77,
-                    });
+                    },
+                );
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(success)))
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(success)))
                     .await
                     .map_err(|e| anyhow!("{e:?}"))?;
                 // Broadcast a job addressed to the GROUP id (77).
-                let empty_path: Vec<U256> = vec![];
-                let job = mining::NewExtendedMiningJob {
+                let empty_path: Vec<U256Owned> = vec![];
+                let job = mining::NewExtendedMiningJobOwned {
                     channel_id: 77,
                     job_id: 1,
-                    min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                    ntime_start: Sv2OptionOwned::new(None),
                     version: 0x2000_0000,
                     version_rolling_allowed: true,
-                    merkle_path: empty_path.into(),
-                    coinbase_tx_prefix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
-                    coinbase_tx_suffix: stratum_core::binary_sv2::B064K::try_from(vec![]).unwrap(),
+                    merkle_path: Seq0255Owned::new(empty_path).unwrap(),
+                    coinbase_tx_prefix: B064KOwned::try_from(vec![]).unwrap(),
+                    coinbase_tx_suffix: B064KOwned::try_from(vec![]).unwrap(),
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(
-                        Mining::NewExtendedMiningJob(job),
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::NewExtendedMiningJob(job),
                     )))
                     .await
                     .map_err(|e| anyhow!("{e:?}"))?;
             }
-            Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL) => {
+            mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL => {
                 let Some(open) = parse_miner_open(&mut f) else {
                     continue;
                 };
                 // Standard channel 20, UNGROUPED (group_channel_id 0).
-                let success =
-                    Mining::OpenStandardMiningChannelSuccess(OpenStandardMiningChannelSuccess {
-                        request_id: U32AsRef::from(open.spec.request_id()),
+                let success = MiningOwned::OpenStandardMiningChannelSuccess(
+                    OpenStandardMiningChannelSuccessOwned {
+                        request_id: open.spec.request_id(),
                         channel_id: 20,
-                        target: U256::try_from(diff1_target()).unwrap(),
-                        extranonce_prefix: B032::try_from(vec![0xBB; 8]).unwrap(),
+                        target: U256Owned::try_from(diff1_target()).unwrap(),
+                        extranonce_prefix: B032Owned::try_from(vec![0xBB; 8]).unwrap(),
                         group_channel_id: 0,
-                    });
+                    },
+                );
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(success)))
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(success)))
                     .await
                     .map_err(|e| anyhow!("{e:?}"))?;
             }
-            Some(mining::MESSAGE_TYPE_SUBMIT_SHARES_STANDARD)
-            | Some(mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED) => {
+            mining::MESSAGE_TYPE_SUBMIT_SHARES_STANDARD
+            | mining::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED => {
                 let Some(cid) = wire::read_channel_id(&mut f) else {
                     continue;
                 };
@@ -2619,8 +2633,8 @@ async fn mock_pool_mixed(
                     new_shares_sum: 1,
                 };
                 write
-                    .write_frame(wire::frame_from(AnyMessage::Mining(
-                        Mining::SubmitSharesSuccess(ok),
+                    .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+                        MiningOwned::SubmitSharesSuccess(ok),
                     )))
                     .await
                     .map_err(|e| anyhow!("{e:?}"))?;
@@ -2998,27 +3012,27 @@ async fn mine_and_submit_one(
 
     let mut job: Option<(u32, u32, Vec<u8>, Vec<u8>)> = None; // job_id, version, cb_prefix, cb_suffix
     let mut prev: Option<([u8; 32], u32, u32)> = None; // prev_hash, min_ntime, nbits
-    let mut target: Option<Vec<u8>> = None;
+    let mut target: Option<Vec<u8>> = miner.open_target.clone();
     for _ in 0..50 {
         let mut f = read_one(&mut miner.read).await?;
         match wire::msg_type(&f) {
-            Some(mt) if mt == mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
+            mt if mt == mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB => {
                 if let Some(m) = parse_new_extended_job(&mut f) {
                     job = Some((
                         m.job_id,
                         m.version,
-                        m.coinbase_tx_prefix.inner_as_ref().to_vec(),
-                        m.coinbase_tx_suffix.inner_as_ref().to_vec(),
+                        m.coinbase_tx_prefix.as_bytes().to_vec(),
+                        m.coinbase_tx_suffix.as_bytes().to_vec(),
                     ));
                 }
             }
-            Some(mt) if mt == mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+            mt if mt == mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
                 if let Some(m) = parse_set_new_prev_hash(&mut f) {
-                    let ph: [u8; 32] = m.prev_hash.inner_as_ref().try_into().unwrap();
-                    prev = Some((ph, m.min_ntime, m.nbits));
+                    let ph: [u8; 32] = m.prev_hash.as_bytes().try_into().unwrap();
+                    prev = Some((ph, m.ntime_start, m.nbits));
                 }
             }
-            Some(mt) if mt == mining::MESSAGE_TYPE_SET_TARGET => {
+            mt if mt == mining::MESSAGE_TYPE_SET_TARGET => {
                 if let Some(t) = parse_set_target(&mut f) {
                     target = Some(t);
                 }
@@ -3059,19 +3073,19 @@ async fn mine_and_submit_one(
     }
     let nonce = nonce.ok_or_else(|| anyhow!("no winning nonce"))?;
 
-    let m = SubmitSharesExtended {
+    let m = SubmitSharesExtendedOwned {
         channel_id,
         sequence_number: 0,
         job_id,
         nonce,
         ntime: min_ntime,
         version,
-        extranonce: B032::try_from(miner_extranonce).unwrap(),
+        extranonce: B032Owned::try_from(miner_extranonce).unwrap(),
     };
     miner
         .write
-        .write_frame(wire::frame_from(AnyMessage::Mining(
-            Mining::SubmitSharesExtended(m),
+        .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+            MiningOwned::SubmitSharesExtended(m),
         )))
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
@@ -3082,20 +3096,32 @@ async fn mine_and_submit_one(
 /// coinbase (`coinb1 + extranonce1 + extranonce2 + coinb2`), the merkle root,
 /// and the 80-byte header, and accepts only if SHA256d ≤ the share target.
 async fn validating_sv1_pool(listener: TcpListener, accepted: mpsc::UnboundedSender<bool>) {
+    validating_sv1_pool_at(listener, accepted, 1e-9).await
+}
+
+/// [`validating_sv1_pool`] at share difficulty `difficulty`. At 1.0 no CPU
+/// meets it: a pool whose difficulty is far above the device, the way a solo
+/// pool's is above a small miner's.
+async fn validating_sv1_pool_at(
+    listener: TcpListener,
+    accepted: mpsc::UnboundedSender<bool>,
+    difficulty: f64,
+) {
     use stratum_core::bitcoin::hashes::{sha256d, Hash};
     use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
     use stratum_core::sv1_api::utils::PrevHash as Sv1PrevHash;
 
     const MASK: u32 = 0x1fff_e000;
     const VERSION: u32 = 0x2000_0000;
-    const NBITS: u32 = 0x207f_ffff;
+    // Network difficulty 1: no test share solves a block, so the proxy
+    // judges each one by the share targets alone.
+    const NBITS: u32 = 0x1d00_ffff;
     const NTIME: u32 = 0x6500_0000;
-    const DIFFICULTY: f64 = 1e-9;
     let en1: Vec<u8> = vec![0xaa, 0xbb, 0xcc, 0xdd];
     let (coinb1, coinb2) = legacy_cb_reserving(en1.len() + 4);
     let pv = [0x11u8; 32]; // internal byte order
-    let pv_str = String::from(Sv1PrevHash(U256::from(pv)));
-    let share_target = translate::target_from_difficulty(DIFFICULTY).to_vec();
+    let pv_str = String::from(Sv1PrevHash(U256Owned::from(pv)));
+    let share_target = translate::target_from_difficulty(difficulty).to_vec();
 
     loop {
         let Ok((sock, _)) = listener.accept().await else {
@@ -3130,7 +3156,7 @@ async fn validating_sv1_pool(listener: TcpListener, accepted: mpsc::UnboundedSen
                     "mining.subscribe" => {
                         let reply = json!({"id": id, "result": [[["mining.notify", "1"]], hex_string(&en1), 4], "error": Value::Null});
                         let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
-                        let sd = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [DIFFICULTY]});
+                        let sd = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [difficulty]});
                         let _ = w.write_all(format!("{sd}\n").as_bytes()).await;
                         let notify = json!({"id": Value::Null, "method": "mining.notify", "params": [
                             "j1", pv_str, hex_string(&coinb1), hex_string(&coinb2), [],
@@ -3309,24 +3335,24 @@ async fn mine_standard_and_submit_one(
 
     let mut job: Option<([u8; 32], u32, u32)> = None; // merkle_root, version, job_id
     let mut prev: Option<([u8; 32], u32, u32)> = None; // prev_hash, min_ntime, nbits
-    let mut target: Option<Vec<u8>> = None;
+    let mut target: Option<Vec<u8>> = miner.open_target.clone();
     for _ in 0..50 {
         let mut f = read_one(&mut miner.read).await?;
         match wire::msg_type(&f) {
-            Some(mt) if mt == mining::MESSAGE_TYPE_NEW_MINING_JOB => {
+            mt if mt == mining::MESSAGE_TYPE_NEW_MINING_JOB => {
                 let payload = f.payload();
                 if let Ok(Mining::NewMiningJob(m)) = Mining::try_from((mt, payload)) {
-                    let root: [u8; 32] = m.merkle_root.inner_as_ref().try_into().unwrap();
+                    let root: [u8; 32] = m.merkle_root.as_bytes().try_into().unwrap();
                     job = Some((root, m.version, m.job_id));
                 }
             }
-            Some(mt) if mt == mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
+            mt if mt == mining::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH => {
                 if let Some(m) = parse_set_new_prev_hash(&mut f) {
-                    let ph: [u8; 32] = m.prev_hash.inner_as_ref().try_into().unwrap();
-                    prev = Some((ph, m.min_ntime, m.nbits));
+                    let ph: [u8; 32] = m.prev_hash.as_bytes().try_into().unwrap();
+                    prev = Some((ph, m.ntime_start, m.nbits));
                 }
             }
-            Some(mt) if mt == mining::MESSAGE_TYPE_SET_TARGET => {
+            mt if mt == mining::MESSAGE_TYPE_SET_TARGET => {
                 if let Some(t) = parse_set_target(&mut f) {
                     target = Some(t);
                 }
@@ -3369,8 +3395,8 @@ async fn mine_standard_and_submit_one(
     };
     miner
         .write
-        .write_frame(wire::frame_from(AnyMessage::Mining(
-            Mining::SubmitSharesStandard(m),
+        .write_frame(wire::frame_from(AnyMessageOwned::Mining(
+            MiningOwned::SubmitSharesStandard(m),
         )))
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
@@ -3414,31 +3440,35 @@ async fn sv2_standard_miner_onto_sv1_pool_is_cryptographically_valid() {
     let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
     miner.setup().await.unwrap();
     // Open a STANDARD channel (the miner can't roll extranonce).
-    let open = Mining::OpenStandardMiningChannel(OpenStandardMiningChannel {
-        request_id: U32AsRef::from(1u32),
-        user_identity: Str0255::try_from("bc1qSELLER.rig1".to_string()).unwrap(),
+    let open = MiningOwned::OpenStandardMiningChannel(OpenStandardMiningChannelOwned {
+        request_id: 1u32,
+        user_identity: Str0255Owned::try_from("bc1qSELLER.rig1".to_string()).unwrap(),
         nominal_hash_rate: 1.0e12,
-        max_target: U256::from([0xffu8; 32]),
+        max_target: U256Owned::from([0xffu8; 32]),
     });
     miner
         .write
-        .write_frame(wire::frame_from(AnyMessage::Mining(open)))
+        .write_frame(wire::frame_from(AnyMessageOwned::Mining(open)))
         .await
         .unwrap();
 
-    let (channel_id, prefix) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (channel_id, prefix, open_target) = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let mut f = read_one(&mut miner.read).await?;
-            if wire::msg_type(&f) == Some(mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS)
-            {
+            if wire::msg_type(&f) == mining::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS {
                 let info = parse_open_success(&mut f).ok_or_else(|| anyhow!("bad open success"))?;
-                return Ok::<_, anyhow::Error>((info.up_channel_id, info.extranonce_prefix));
+                return Ok::<_, anyhow::Error>((
+                    info.up_channel_id,
+                    info.extranonce_prefix,
+                    info.target,
+                ));
             }
         }
     })
     .await
     .expect("standard open did not complete")
     .unwrap();
+    miner.open_target = Some(open_target);
     assert_eq!(
         prefix,
         vec![0xaa, 0xbb, 0xcc, 0xdd],
@@ -3781,6 +3811,146 @@ async fn reattach_into_empty_grace_hull_routes_to_active_rental() {
     );
 }
 
+#[tokio::test]
+async fn reattach_into_empty_grace_hull_routes_to_an_sv1_rental_in_one_connect() {
+    // The empty-hull reattach again, with the rental on an SV1 pool. The empty
+    // rig cannot be re-pointed onto a translated upstream (it has no channel to
+    // build one around), so the reconnecting member must connect fresh straight
+    // onto the SV1 pool: first OpenSuccess already carries the SV1 extranonce1,
+    // not idle A's prefix followed by a second forced reconnect.
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_a,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        a_tx,
+    ));
+    let sv1_buyer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let buyer_addr = sv1_buyer.local_addr().unwrap();
+    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<()>();
+    tokio::spawn(mock_sv1_pool_translate(sv1_buyer, sub_tx));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let sv2_rigs: Arc<Sv2RigRegistry> = Default::default();
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: sv2_rigs.clone(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.solo",
+        ext_target(&a_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (_c1, p1) = m1.open("bc1qSELLER.solo", 1).await.unwrap();
+    assert_eq!(p1, vec![0xAA; 8]);
+    loop {
+        if registry.get_all("bc1qSELLER.solo").await.len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    orders
+        .create(
+            "bc1qSELLER.solo".to_string(),
+            ext_target(&buyer_addr.to_string(), "acctBuyer"),
+            None,
+            crate::orders::now_ms() + 60_000,
+            1.0,
+            1.0,
+        )
+        .await
+        .unwrap();
+
+    drop(m1);
+    let hull = loop {
+        if let Some(rig) = sv2_rigs.get("bc1qSELLER.solo").await {
+            if rig.inner.lock().await.members.is_empty() {
+                break rig;
+            }
+        }
+        tokio::task::yield_now().await;
+    };
+
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    m2.setup().await.unwrap();
+    let (c2, p2) = m2.open("bc1qSELLER.solo", 1).await.unwrap();
+    assert_eq!(
+        p2,
+        vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe],
+        "the first OpenSuccess after the reattach must already be the SV1 pool's"
+    );
+
+    // The hull is gone from both registries; only the fresh translated
+    // session serves the worker (and, translated, is no bundle target).
+    assert!(sv2_rigs.get("bc1qSELLER.solo").await.is_none());
+    let sessions = registry.get_all("bc1qSELLER.solo").await;
+    assert_eq!(sessions.len(), 1, "only the fresh session is registered");
+    assert!(
+        !sessions[0].ptr_eq(&AnySession::Sv2(hull.clone())),
+        "the registered session is not the retired hull"
+    );
+    // Retired for good: its tasks have stopped, and a switch retry still
+    // holding it cannot install a new upstream on it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        let i = hull.inner.lock().await;
+        assert!(i.retired);
+        assert!(i.active.reader.is_finished() && i.active.writer.is_finished());
+        assert!(i.supervisor.as_ref().is_none_or(|h| h.is_finished()));
+        assert!(i.vardiff.as_ref().is_none_or(|h| h.is_finished()));
+    }
+    assert!(
+        hull.switch_to(
+            "o-retired".into(),
+            ext_target(&buyer_addr.to_string(), "acctBuyer")
+        )
+        .await
+        .is_err(),
+        "a retired rig takes no new upstream"
+    );
+
+    // Still connected past the old retry's first backoff, and mining for B.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        m2.read_until_cid(mining::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB),
+    )
+    .await
+    .expect("translated job on the fresh session")
+    .unwrap();
+    m2.submit(c2, 0).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), sub_rx.recv())
+        .await
+        .expect("share reached the SV1 buyer pool")
+        .unwrap();
+}
+
 // ── the SV2 probe: "down" is not "speaks SV1" ────────────────────────
 //
 // The probe answers two questions at once and only one is about protocols.
@@ -4102,125 +4272,6 @@ async fn a_rig_that_came_back_from_translation_bundles_again() {
     );
 }
 
-/// A member leaving a TRANSLATED rig must not panic the upstream writer.
-///
-/// `detach_member` sends `close_channel_upstream` for each of the member's
-/// channels, and that frame is BUILT, not received — `wire`'s contract is that
-/// only handshake and channel-open messages are built as typed structs, every
-/// other frame is re-emitted already-serialized. The SV1 translate writer calls
-/// `payload()` on everything it is handed, which panics on a built frame.
-///
-/// Both channel-OPEN paths refuse a translated upstream (`attach_member`
-/// returns `None`, the serve loop answers "additional channels are not
-/// supported on an SV1 upstream"); `detach_member` must not send a close there
-/// either, or the writer dies with `Sv2Frame is not yet serialized.`
-///
-/// The writer runs in a spawned task, so its death is invisible to the test
-/// harness — the assertion goes through a panic hook instead, chained so a
-/// concurrent test still prints its own.
-#[tokio::test]
-async fn a_member_leaving_a_translated_rig_does_not_panic_the_writer() {
-    let sv2_idle = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let idle_addr = sv2_idle.local_addr().unwrap();
-    let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<u32>();
-    tokio::spawn(mock_pool_multi(
-        sv2_idle,
-        vec![0xAA; 8],
-        7,
-        NoiseKeys::generate(),
-        idle_tx,
-    ));
-    let sv1_buyer = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let sv1_addr = sv1_buyer.local_addr().unwrap();
-    let (sub_tx, _sub_rx) = mpsc::unbounded_channel::<()>();
-    tokio::spawn(mock_sv1_pool_translate(sv1_buyer, sub_tx));
-
-    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy.local_addr().unwrap();
-    let registry = crate::registry::Registry::new();
-    let db = crate::db::test_pool().await;
-    let orders = crate::orders::OrderStore::new(db.clone());
-    let ctx = ProxyContext {
-        default_target: None,
-        registry: registry.clone(),
-        sv2_rigs: Default::default(),
-        sellers: crate::store::SellerStore::new(db.clone()),
-        orders: orders.clone(),
-    };
-    register_rig(
-        &ctx.sellers,
-        "bc1qSELLER.farm",
-        ext_target(&idle_addr.to_string(), "acctA"),
-    )
-    .await;
-    let keys = NoiseKeys::generate();
-    tokio::spawn(async move {
-        loop {
-            let (sock, peer) = proxy.accept().await.unwrap();
-            let ctx = ctx.clone();
-            let keys = keys.clone();
-            tokio::spawn(async move {
-                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
-            });
-        }
-    });
-
-    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
-    m1.setup().await.unwrap();
-    m1.open("bc1qSELLER.farm", 1).await.unwrap();
-    let sess = loop {
-        if let Some(s) = registry.get_all("bc1qSELLER.farm").await.into_iter().next() {
-            break s;
-        }
-        tokio::task::yield_now().await;
-    };
-    let crate::control::AnySession::Sv2(rig) = sess.clone() else {
-        panic!("the rig must be an SV2 session");
-    };
-
-    // Rent onto the SV1 pool → the member's channel now sits on a translated
-    // upstream, which is the only state in which the close frame is mishandled.
-    let buyer = ext_target(&sv1_addr.to_string(), "acctBuyer");
-    let order = orders
-        .create("bc1qSELLER.farm".into(), buyer.clone(), None, 0, 0.0, 0.0)
-        .await
-        .unwrap();
-    sess.switch_to(order.id.clone(), buyer).await.unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(15), m1.read_until_set_extranonce())
-        .await
-        .expect("set_extranonce after the translated switch")
-        .unwrap();
-    assert!(
-        rig.is_translating().await,
-        "precondition: the rig must be translating when the member leaves"
-    );
-
-    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let sink = seen.clone();
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        sink.lock().unwrap().push(info.to_string());
-        prev(info);
-    }));
-
-    // The member owning the translated rig's only channel leaves.
-    drop(m1);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = std::panic::take_hook();
-
-    let hits: Vec<String> = seen
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|m| m.contains("Sv2Frame is not yet serialized"))
-        .cloned()
-        .collect();
-    assert!(
-        hits.is_empty(),
-        "detaching a member from a translated rig panicked the upstream writer: {hits:?}"
-    );
-}
-
 #[tokio::test]
 async fn a_failed_attach_switch_is_retried_until_the_rental_pool_answers() {
     // Members attach while the one TCP connect to the rental pool fails. The
@@ -4408,4 +4459,330 @@ async fn a_worker_with_an_active_order_but_no_seller_row_is_admitted_onto_the_re
         Ok(()) => m2.open("bc1qSELLER.farm", 1).await.is_err(),
     };
     assert!(refused, "without order or rig the worker is unregistered");
+}
+
+// ── a pool difficulty far above the device ──────────────────────────
+//
+// The field case: a ~1.4 TH/s rig rented onto a solo pool that sets
+// difficulty 1M, one accepted share every ~50 minutes. Here the pool sets
+// difficulty 1.0, which a CPU never meets. The miner must get a target it can
+// hit, have those shares answered by the proxy and measured, while the pool
+// sees only shares that meet its own target: none.
+
+#[tokio::test]
+async fn an_sv2_miner_under_a_high_pool_difficulty_is_measured_on_its_own_target() {
+    let sv1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sv1_addr = sv1.local_addr().unwrap();
+    let (acc_tx, mut acc_rx) = mpsc::unbounded_channel::<bool>();
+    tokio::spawn(validating_sv1_pool_at(sv1, acc_tx, 1.0));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: crate::orders::OrderStore::new(db.clone()),
+    };
+    register_rig(
+        &ctx.sellers,
+        "bc1qSELLER.rig1",
+        ext_target(&sv1_addr.to_string(), "acctSV1"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        let (sock, peer) = proxy.accept().await.unwrap();
+        let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+    });
+
+    let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+    miner.setup().await.unwrap();
+    // A small device (1 kH/s): its vardiff target is CPU-mineable.
+    let spec = OpenSpec::Extended {
+        request_id: 1,
+        nominal_hash_rate: 1.0e3,
+        max_target: vec![0xffu8; 32],
+        min_extranonce_size: 4,
+    };
+    miner
+        .write
+        .write_frame(open_channel_upstream(&spec, "bc1qSELLER.rig1", 1).unwrap())
+        .await
+        .unwrap();
+    let info = tokio::time::timeout(
+        Duration::from_secs(15),
+        miner.await_open_success(mining::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS),
+    )
+    .await
+    .expect("open did not complete")
+    .unwrap();
+    let down_cid = info.up_channel_id;
+    assert!(
+        translate::difficulty_from_target(&info.target) < 1.0,
+        "the miner's target is its own, not the pool's difficulty 1"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        mine_and_submit_one(&mut miner, down_cid, info.extranonce_prefix),
+    )
+    .await
+    .expect("mining timed out: the miner never got a target it can meet")
+    .unwrap();
+
+    // The proxy answers the share itself.
+    let ok_cid = tokio::time::timeout(
+        Duration::from_secs(5),
+        miner.read_until_cid(mining::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS),
+    )
+    .await
+    .expect("the share was never answered")
+    .unwrap();
+    assert_eq!(ok_cid, down_cid);
+
+    // The pool saw nothing: the share is far below its target.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        acc_rx.try_recv().is_err(),
+        "a share below the pool's target must not reach the pool"
+    );
+
+    // Measured, not billed.
+    let st = registry.aggregated_status("bc1qSELLER.rig1").await.unwrap();
+    assert!(st.hashrate_hs > 0.0, "the withheld share is measured");
+    assert_eq!(
+        st.delivered_work, 0.0,
+        "nothing the pool accepted, nothing billed"
+    );
+    assert_eq!(st.submitted_shares, 0, "nothing was submitted to the pool");
+}
+
+/// Read SV1 lines until `pred` matches one, returning it.
+async fn sv1_read_until(
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
+    loop {
+        let line = lines.next_line().await.unwrap().expect("proxy closed");
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if pred(&v) {
+                return v;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_sv1_miner_under_a_high_pool_difficulty_is_measured_on_its_own_target() {
+    use stratum_core::bitcoin::hashes::{sha256d, Hash};
+    use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
+
+    let pool = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pool_addr = pool.local_addr().unwrap();
+    let (acc_tx, mut acc_rx) = mpsc::unbounded_channel::<bool>();
+    tokio::spawn(validating_sv1_pool_at(pool, acc_tx, 1.0));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let pool_target = ext_target(&pool_addr.to_string(), "acctSV1");
+    let ctx = ProxyContext {
+        default_target: Some(pool_target.clone()),
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: crate::orders::OrderStore::new(db.clone()),
+    };
+    // Idle pool = the handshake pool, so the authorize needs no switch.
+    register_rig(&ctx.sellers, "bc1qSELLER.rig1", pool_target).await;
+    tokio::spawn(async move {
+        let (sock, peer) = proxy.accept().await.unwrap();
+        let _ = crate::proto::relay::handle_seller_miner(sock, peer.to_string(), ctx).await;
+    });
+
+    let sock = TcpStream::connect(proxy_addr).await.unwrap();
+    let (r, mut w) = sock.into_split();
+    let mut lines = BufReader::new(r).lines();
+    w.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+        .await
+        .unwrap();
+    let sub = sv1_read_until(&mut lines, |v| v.get("id") == Some(&json!(1))).await;
+    let en1 = hex_bytes(sub["result"][1].as_str().unwrap());
+    w.write_all(
+        b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"bc1qSELLER.rig1\",\"x\"]}\n",
+    )
+    .await
+    .unwrap();
+    let notify = tokio::time::timeout(
+        Duration::from_secs(10),
+        sv1_read_until(&mut lines, |v| {
+            v.get("method") == Some(&json!("mining.notify"))
+        }),
+    )
+    .await
+    .expect("no job reached the miner");
+    let p = notify["params"].as_array().unwrap();
+    let job_id = p[0].as_str().unwrap().to_string();
+    let coinb1 = hex_bytes(p[2].as_str().unwrap());
+    let coinb2 = hex_bytes(p[3].as_str().unwrap());
+    let version = u32::from_str_radix(p[5].as_str().unwrap(), 16).unwrap();
+    let nbits = u32::from_str_radix(p[6].as_str().unwrap(), 16).unwrap();
+    let ntime = u32::from_str_radix(p[7].as_str().unwrap(), 16).unwrap();
+    let pv = [0x11u8; 32]; // the mock pool's prev-hash, internal byte order
+
+    // The miner names the difficulty it wants, as AxeOS does; the proxy sizes
+    // the miner difficulty from it, far below the pool's.
+    w.write_all(b"{\"id\":4,\"method\":\"mining.suggest_difficulty\",\"params\":[0.0001]}\n")
+        .await
+        .unwrap();
+    let sd = tokio::time::timeout(
+        Duration::from_secs(5),
+        sv1_read_until(&mut lines, |v| {
+            v.get("method") == Some(&json!("mining.set_difficulty"))
+                && v["params"][0].as_f64().is_some_and(|d| d < 1.0)
+        }),
+    )
+    .await
+    .expect("the miner never got a difficulty it can meet");
+    let miner_target = translate::target_from_difficulty(sd["params"][0].as_f64().unwrap());
+
+    // A share meeting the miner's target but not the pool's difficulty-1
+    // target.
+    let en2 = vec![0u8, 0, 0, 1];
+    let mut full_en = en1.clone();
+    full_en.extend_from_slice(&en2);
+    let root = merkle_root_from_path(&coinb1, &coinb2, &full_en, &Vec::<Vec<u8>>::new()).unwrap();
+    let pool_target = translate::target_from_difficulty(1.0);
+    let nonce = (0u32..)
+        .find(|n| {
+            let mut h = Vec::with_capacity(80);
+            h.extend_from_slice(&version.to_le_bytes());
+            h.extend_from_slice(&pv);
+            h.extend_from_slice(&root);
+            h.extend_from_slice(&ntime.to_le_bytes());
+            h.extend_from_slice(&nbits.to_le_bytes());
+            h.extend_from_slice(&n.to_le_bytes());
+            let hash = sha256d::Hash::hash(&h).to_byte_array();
+            le_leq(&hash, &miner_target) && !le_leq(&hash, &pool_target)
+        })
+        .unwrap();
+    let submit = json!({"id": 3, "method": "mining.submit", "params": [
+        "bc1qSELLER.rig1", job_id, hex_string(&en2), format!("{ntime:08x}"), format!("{nonce:08x}")
+    ]});
+    w.write_all(format!("{submit}\n").as_bytes()).await.unwrap();
+
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        sv1_read_until(&mut lines, |v| v.get("id") == Some(&json!(3))),
+    )
+    .await
+    .expect("the share was never answered");
+    assert_eq!(
+        reply["result"],
+        json!(true),
+        "the proxy accepts the share: {reply}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        acc_rx.try_recv().is_err(),
+        "a share below the pool's target must not reach the pool"
+    );
+    let st = registry.aggregated_status("bc1qSELLER.rig1").await.unwrap();
+    assert!(st.hashrate_hs > 0.0, "the withheld share is measured");
+    assert_eq!(st.delivered_work, 0.0);
+    assert_eq!(st.submitted_shares, 0);
+}
+
+#[tokio::test]
+async fn an_idle_pool_edit_reaches_a_single_device_rig() {
+    // The seller moves the rig's idle pool from A to B. The API drops the
+    // miner; its rig stays warm on A as an empty hull. The reconnect must land
+    // on B, not bundle back onto the hull's A.
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_addr = pool_b.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+    let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_a,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        a_tx,
+    ));
+    tokio::spawn(mock_pool_multi(
+        pool_b,
+        vec![0xBB; 8],
+        9,
+        NoiseKeys::generate(),
+        b_tx,
+    ));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let sv2_rigs: Arc<Sv2RigRegistry> = Default::default();
+    let sellers = crate::store::SellerStore::new(db.clone());
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: sv2_rigs.clone(),
+        sellers: sellers.clone(),
+        orders: crate::orders::OrderStore::new(db.clone()),
+    };
+    register_rig(
+        &sellers,
+        "bc1qSELLER.solo",
+        ext_target(&a_addr.to_string(), "acctA"),
+    )
+    .await;
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (_c1, p1) = m1.open("bc1qSELLER.solo", 1).await.unwrap();
+    assert_eq!(p1, vec![0xAA; 8]);
+
+    register_rig(
+        &sellers,
+        "bc1qSELLER.solo",
+        ext_target(&b_addr.to_string(), "acctB"),
+    )
+    .await;
+    drop(m1);
+    loop {
+        if let Some(rig) = sv2_rigs.get("bc1qSELLER.solo").await {
+            if rig.inner.lock().await.members.is_empty() {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    m2.setup().await.unwrap();
+    let (_c2, p2) = m2.open("bc1qSELLER.solo", 1).await.unwrap();
+    assert_eq!(
+        p2,
+        vec![0xBB; 8],
+        "the reconnect lands on the edited idle pool B"
+    );
 }

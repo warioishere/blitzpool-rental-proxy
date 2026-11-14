@@ -234,17 +234,14 @@ async fn sv2_first_job(
         }
     }
     let wait = async {
-        let mut job: Option<mining::NewExtendedMiningJob<'static>> = None;
-        let mut prev: Option<mining::SetNewPrevHash<'static>> = None;
+        let mut job: Option<mining::NewExtendedMiningJobOwned> = None;
+        let mut prev: Option<mining::SetNewPrevHashOwned> = None;
         let mut pending = frames.into_iter();
         loop {
             let mut f = match pending.next() {
                 Some(f) => f,
                 None => match read.read_frame().await {
-                    Ok(frame) => match crate::proto::sv2::wire::into_sv2(frame) {
-                        Some(f) => f,
-                        None => continue,
-                    },
+                    Ok(frame) => frame,
                     Err(e) => return Err(format!("{e:?}")),
                 },
             };
@@ -272,14 +269,14 @@ async fn sv2_first_job(
     }
 }
 
-fn job_from_notify(n: &Notify<'_>, protocol: &'static str) -> Result<PoolJob, PoolRefusal> {
+fn job_from_notify(n: &Notify, protocol: &'static str) -> Result<PoolJob, PoolRefusal> {
     let height = bip34_height(n.coin_base1.as_ref()).ok_or_else(|| {
         refuse(
             RefusalCode::WrongChain,
             "the first job's coinbase carries no BIP34 block height",
         )
     })?;
-    let prev: [u8; 32] = n.prev_hash.0.inner_as_ref().try_into().map_err(|_| {
+    let prev: [u8; 32] = n.prev_hash.0.as_bytes().try_into().map_err(|_| {
         refuse(
             RefusalCode::WrongChain,
             "the first job's previous block hash is not 32 bytes",

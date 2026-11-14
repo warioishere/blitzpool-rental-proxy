@@ -25,16 +25,17 @@
 use anyhow::{anyhow, Result};
 
 use primitive_types::U256 as BigU256;
-use stratum_core::binary_sv2::{Seq0255, Sv2Option, U256};
+use stratum_core::binary_sv2::{Seq0255Owned, Sv2OptionOwned, U256Owned};
 use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
 use stratum_core::mining_sv2::{
-    NewExtendedMiningJob, NewMiningJob, SetNewPrevHash, SubmitSharesExtended, SubmitSharesStandard,
+    NewExtendedMiningJobOwned, NewMiningJobOwned, SetNewPrevHashOwned, SubmitSharesExtended,
+    SubmitSharesStandard,
 };
 use stratum_core::stratum_translation::sv2_to_sv1;
 use stratum_core::sv1_api::{
     json_rpc,
     methods::{client_to_server, server_to_client},
-    utils::{Extranonce, HexU32Be, MerkleNode, PrevHash},
+    utils::{Extranonce, HexU32Be},
 };
 
 /// How long to wait for a native-protocol upstream connect before concluding the
@@ -71,9 +72,11 @@ pub fn difficulty_from_target(target: &[u8]) -> f64 {
 /// The 32-byte little-endian target for a share `difficulty`, in the Bitcoin
 /// bdiff convention: `target = floor(diff1 / difficulty)` where `diff1` is the
 /// difficulty-1 target `0x00000000FFFF0000…0000` (= rust-bitcoin `Target::MAX`).
-/// Exact inverse of [`difficulty_from_target`]. A non-positive / non-finite
-/// difficulty (or one rounding below the representable minimum) yields the
-/// maximum target (no threshold).
+/// Inverse of [`difficulty_from_target`], exact for difficulties that are
+/// multiples of 1/65536; any other difficulty yields the next easier target,
+/// never a harder one, so a share the pool's exact target accepts is never
+/// judged short of it. A non-positive / non-finite difficulty (or one below the
+/// representable minimum) yields the maximum target (no threshold).
 pub fn target_from_difficulty(difficulty: f64) -> [u8; 32] {
     if !difficulty.is_finite() || difficulty <= 0.0 {
         return [0xff; 32];
@@ -83,7 +86,7 @@ pub fn target_from_difficulty(difficulty: f64) -> [u8; 32] {
     // division is exact-integer; SCALE = 2^16 gives ample sub-integer resolution
     // and keeps diff1*SCALE (~2^240) comfortably within 256 bits.
     const SCALE: u64 = 1 << 16;
-    let denom = (difficulty * SCALE as f64).round();
+    let denom = (difficulty * SCALE as f64).floor();
     if denom < 1.0 {
         return [0xff; 32]; // difficulty below ~1/SCALE → no real threshold
     }
@@ -97,16 +100,16 @@ pub fn target_from_difficulty(difficulty: f64) -> [u8; 32] {
 /// Convert an SV2 job + prev-hash into an SV1 `mining.notify` (handles the SV2
 /// coinbase's BIP141 stripping internally).
 pub fn sv2_job_to_sv1_notify(
-    prev_hash: SetNewPrevHash<'static>,
-    job: NewExtendedMiningJob<'static>,
+    prev_hash: SetNewPrevHashOwned,
+    job: NewExtendedMiningJobOwned,
     clean_jobs: bool,
-) -> Result<server_to_client::Notify<'static>> {
+) -> Result<server_to_client::Notify> {
     sv2_to_sv1::build_sv1_notify_from_sv2(prev_hash, job, clean_jobs)
         .map_err(|e| anyhow!("sv2 job → sv1 notify: {e:?}"))
 }
 
 /// Serialize an SV1 `mining.notify` to a wire line (newline-terminated).
-pub fn notify_to_line(notify: server_to_client::Notify<'static>) -> String {
+pub fn notify_to_line(notify: server_to_client::Notify) -> String {
     let msg: json_rpc::Message = notify.into();
     let mut s = serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into());
     s.push('\n');
@@ -127,81 +130,67 @@ pub fn set_difficulty_to_line(value: f64) -> String {
 /// Parse an SV1 `mining.notify` line into a typed notify (the prev-hash word
 /// swap is undone by the `PrevHash` newtype). Returns `None` if the line is not
 /// a well-formed `mining.notify`.
-pub fn notify_from_line(line: &str) -> Option<server_to_client::Notify<'static>> {
-    let msg: json_rpc::Message = serde_json::from_str(line.trim()).ok()?;
-    let json_rpc::Message::Notification(n) = msg else {
-        return None;
-    };
-    if n.method != "mining.notify" {
-        return None;
+pub fn notify_from_line(line: &str) -> Option<server_to_client::Notify> {
+    let mut params = notification_params(line, "mining.notify")?;
+    // The nine standard params; anything a pool appends is not the job.
+    if let Some(a) = params.as_array_mut() {
+        a.truncate(9);
     }
-    let parsed = server_to_client::Notify::try_from(n).ok()?;
-    // Re-own every borrowed field so the notify is 'static (storable + sendable).
-    Some(server_to_client::Notify {
-        job_id: parsed.job_id,
-        prev_hash: PrevHash(parsed.prev_hash.0.into_static()),
-        coin_base1: parsed.coin_base1,
-        coin_base2: parsed.coin_base2,
-        merkle_branch: parsed
-            .merkle_branch
-            .into_iter()
-            .map(|m| MerkleNode(m.0.into_static()))
-            .collect(),
-        version: parsed.version,
-        bits: parsed.bits,
-        time: parsed.time,
-        clean_jobs: parsed.clean_jobs,
+    server_to_client::Notify::try_from(json_rpc::Notification {
+        method: "mining.notify".to_string(),
+        params,
     })
+    .ok()
 }
 
-/// Parse an SV1 `mining.set_difficulty` line into its difficulty value.
+/// Parse an SV1 `mining.set_difficulty` line into its difficulty value (the
+/// first parameter, a number or a numeric string).
 pub fn set_difficulty_from_line(line: &str) -> Option<f64> {
-    let msg: json_rpc::Message = serde_json::from_str(line.trim()).ok()?;
-    let json_rpc::Message::Notification(n) = msg else {
-        return None;
-    };
-    if n.method != "mining.set_difficulty" {
+    let params = notification_params(line, "mining.set_difficulty")?;
+    let first = params.as_array()?.first()?;
+    first
+        .as_f64()
+        .or_else(|| first.as_str()?.trim().parse::<f64>().ok())
+}
+
+/// The params of an SV1 line carrying `method`, read the way pools send it:
+/// an `id` field (null or not) is tolerated, as the relay's own line handling
+/// tolerates it. Each caller decides which params it needs.
+fn notification_params(line: &str, method: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("method")?.as_str()? != method {
         return None;
     }
-    server_to_client::SetDifficulty::try_from(n)
-        .ok()
-        .map(|d| d.value)
+    v.get("params").cloned()
 }
 
 /// Build an SV2 `NewExtendedMiningJob` (and, for a block change, the activating
 /// `SetNewPrevHash`) from an SV1 `mining.notify`.
 ///
 /// Per SV2 §7 a block-change job is a **future** job: it is sent first with an
-/// empty `min_ntime` and then activated by `SetNewPrevHash`. A same-block job is
-/// immediate (`min_ntime` set, no prev-hash). The caller decides `as_future`
+/// empty `ntime_start` and then activated by `SetNewPrevHash`. A same-block job is
+/// immediate (`ntime_start` set, no prev-hash). The caller decides `as_future`
 /// (true on a clean job or the first job of a channel, which has no prev-hash
 /// yet). `job_id` is the proxy-assigned SV2 id; the caller maps it back to the
 /// pool's string job id for the eventual `mining.submit`.
 pub fn sv1_notify_to_sv2_job(
-    notify: &server_to_client::Notify<'_>,
+    notify: &server_to_client::Notify,
     channel_id: u32,
     job_id: u32,
     as_future: bool,
     version_rolling_allowed: bool,
-) -> Result<(
-    NewExtendedMiningJob<'static>,
-    Option<SetNewPrevHash<'static>>,
-)> {
-    let merkle_path: Vec<U256<'static>> = notify
-        .merkle_branch
-        .iter()
-        .map(|m| m.0.clone().into_static())
-        .collect();
+) -> Result<(NewExtendedMiningJobOwned, Option<SetNewPrevHashOwned>)> {
+    let merkle_path: Vec<U256Owned> = notify.merkle_branch.iter().map(|m| m.0.clone()).collect();
     let coinbase_tx_prefix = Vec::<u8>::from(notify.coin_base1.clone());
     let coinbase_tx_suffix = Vec::<u8>::from(notify.coin_base2.clone());
 
-    let job = NewExtendedMiningJob {
+    let job = NewExtendedMiningJobOwned {
         channel_id,
         job_id,
-        min_ntime: Sv2Option::new(if as_future { None } else { Some(notify.time.0) }),
+        ntime_start: Sv2OptionOwned::new(if as_future { None } else { Some(notify.time.0) }),
         version: notify.version.0,
         version_rolling_allowed,
-        merkle_path: Seq0255::new(merkle_path).map_err(|e| anyhow!("merkle_path: {e:?}"))?,
+        merkle_path: Seq0255Owned::new(merkle_path).map_err(|e| anyhow!("merkle_path: {e:?}"))?,
         coinbase_tx_prefix: coinbase_tx_prefix
             .try_into()
             .map_err(|_| anyhow!("coinbase prefix too long"))?,
@@ -211,11 +200,11 @@ pub fn sv1_notify_to_sv2_job(
     };
 
     let prev_hash = if as_future {
-        Some(SetNewPrevHash {
+        Some(SetNewPrevHashOwned {
             channel_id,
             job_id,
-            prev_hash: notify.prev_hash.0.clone().into_static(),
-            min_ntime: notify.time.0,
+            prev_hash: notify.prev_hash.0.clone(),
+            ntime_start: notify.time.0,
             nbits: notify.bits.0,
         })
     } else {
@@ -232,13 +221,13 @@ pub fn sv1_notify_to_sv2_job(
 /// caller owns the `extranonce2` it chose for this job and replays it when the
 /// miner's `SubmitSharesStandard` is translated back to a `mining.submit`.
 pub fn sv1_notify_to_sv2_standard_job(
-    notify: &server_to_client::Notify<'_>,
+    notify: &server_to_client::Notify,
     channel_id: u32,
     job_id: u32,
     extranonce1: &[u8],
     extranonce2: &[u8],
     as_future: bool,
-) -> Result<(NewMiningJob<'static>, Option<SetNewPrevHash<'static>>)> {
+) -> Result<(NewMiningJobOwned, Option<SetNewPrevHashOwned>)> {
     let coinb1 = Vec::<u8>::from(notify.coin_base1.clone());
     let coinb2 = Vec::<u8>::from(notify.coin_base2.clone());
     let mut full_extranonce = extranonce1.to_vec();
@@ -246,24 +235,24 @@ pub fn sv1_notify_to_sv2_standard_job(
     let path: Vec<Vec<u8>> = notify
         .merkle_branch
         .iter()
-        .map(|m| m.0.inner_as_ref().to_vec())
+        .map(|m| m.0.as_bytes().to_vec())
         .collect();
     let root = merkle_root_from_path(&coinb1, &coinb2, &full_extranonce, &path)
         .ok_or_else(|| anyhow!("coinbase did not deserialize as a transaction"))?;
-    let merkle_root = U256::try_from(root).map_err(|e| anyhow!("merkle root: {e:?}"))?;
-    let job = NewMiningJob {
+    let merkle_root = U256Owned::from(root);
+    let job = NewMiningJobOwned {
         channel_id,
         job_id,
-        min_ntime: Sv2Option::new(if as_future { None } else { Some(notify.time.0) }),
+        ntime_start: Sv2OptionOwned::new(if as_future { None } else { Some(notify.time.0) }),
         version: notify.version.0,
         merkle_root,
     };
     let prev_hash = if as_future {
-        Some(SetNewPrevHash {
+        Some(SetNewPrevHashOwned {
             channel_id,
             job_id,
-            prev_hash: notify.prev_hash.0.clone().into_static(),
-            min_ntime: notify.time.0,
+            prev_hash: notify.prev_hash.0.clone(),
+            ntime_start: notify.time.0,
             nbits: notify.bits.0,
         })
     } else {
@@ -282,7 +271,7 @@ pub fn sv2_standard_submit_to_sv1(
     extranonce2: Vec<u8>,
     id: u64,
     version_rolling_mask: Option<u32>,
-) -> Result<client_to_server::Submit<'static>> {
+) -> Result<client_to_server::Submit> {
     let extra_nonce2 =
         Extranonce::try_from(extranonce2).map_err(|e| anyhow!("extranonce: {e:?}"))?;
     Ok(client_to_server::Submit {
@@ -309,8 +298,8 @@ pub fn sv2_submit_to_sv1(
     job_id: String,
     id: u64,
     version_rolling_mask: Option<u32>,
-) -> Result<client_to_server::Submit<'static>> {
-    let extra_nonce2 = Extranonce::try_from(submit.extranonce.inner_as_ref().to_vec())
+) -> Result<client_to_server::Submit> {
+    let extra_nonce2 = Extranonce::try_from(submit.extranonce.as_bytes().to_vec())
         .map_err(|e| anyhow!("extranonce: {e:?}"))?;
     Ok(client_to_server::Submit {
         user_name,
@@ -324,7 +313,7 @@ pub fn sv2_submit_to_sv1(
 }
 
 /// Serialize an SV1 `mining.submit` to a wire line (newline-terminated).
-pub fn submit_to_line(submit: client_to_server::Submit<'static>) -> String {
+pub fn submit_to_line(submit: client_to_server::Submit) -> String {
     let msg: json_rpc::Message = submit.into();
     let mut s = serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into());
     s.push('\n');
@@ -336,7 +325,7 @@ mod tests {
     use super::*;
     use stratum_core::bitcoin::hashes::{sha256d, Hash};
     use stratum_core::channels_sv2::merkle_root::merkle_root_from_path;
-    use stratum_core::sv1_api::utils::HexBytes;
+    use stratum_core::sv1_api::utils::{HexBytes, MerkleNode, PrevHash};
 
     /// Assemble a minimal valid legacy (non-witness) coinbase transaction whose
     /// scriptSig contains an `en_len`-byte extranonce region, and return its
@@ -368,14 +357,11 @@ mod tests {
         (coinb1, coinb2)
     }
 
-    fn sample_notify(
-        clean: bool,
-        merkle_branch: Vec<MerkleNode<'static>>,
-    ) -> server_to_client::Notify<'static> {
+    fn sample_notify(clean: bool, merkle_branch: Vec<MerkleNode>) -> server_to_client::Notify {
         let (coinb1, coinb2) = legacy_coinbase(8);
         server_to_client::Notify {
             job_id: "abc123".to_string(),
-            prev_hash: PrevHash(U256::from([0x11u8; 32])),
+            prev_hash: PrevHash(U256Owned::from([0x11u8; 32])),
             coin_base1: HexBytes::from(coinb1),
             coin_base2: HexBytes::from(coinb2),
             merkle_branch,
@@ -435,21 +421,22 @@ mod tests {
         // witness coinbase's txid. A wrong strip diverges the two → rejected share.
         let (wprefix, wsuffix) = witness_coinbase();
         let branch = [[0x07u8; 32], [0x5cu8; 32]]; // multi-branch merkle path
-        let job = NewExtendedMiningJob {
+        let job = NewExtendedMiningJobOwned {
             channel_id: 1,
             job_id: 1,
-            min_ntime: Sv2Option::new(None),
+            ntime_start: Sv2OptionOwned::new(None),
             version: 0x2000_0000,
             version_rolling_allowed: true,
-            merkle_path: Seq0255::new(branch.iter().map(|b| U256::from(*b)).collect()).unwrap(),
+            merkle_path: Seq0255Owned::new(branch.iter().map(|b| U256Owned::from(*b)).collect())
+                .unwrap(),
             coinbase_tx_prefix: wprefix.clone().try_into().unwrap(),
             coinbase_tx_suffix: wsuffix.clone().try_into().unwrap(),
         };
-        let prev = SetNewPrevHash {
+        let prev = SetNewPrevHashOwned {
             channel_id: 1,
             job_id: 1,
-            prev_hash: U256::from([0x11u8; 32]),
-            min_ntime: 0x6500_0000,
+            prev_hash: U256Owned::from([0x11u8; 32]),
+            ntime_start: 0x6500_0000,
             nbits: 0x207f_ffff,
         };
         let notify = sv2_job_to_sv1_notify(prev, job, true).unwrap();
@@ -519,7 +506,7 @@ mod tests {
         // job+prev-hash, then back via the authoritative SV2→SV1 builder, and
         // assert every field survives — this proves the inverse is byte-exact
         // (esp. the prev-hash word swap, version/bits/ntime, coinbase, merkle).
-        let original = sample_notify(true, vec![MerkleNode(U256::from([0x03u8; 32]))]);
+        let original = sample_notify(true, vec![MerkleNode(U256Owned::from([0x03u8; 32]))]);
         let (job, prev) = sv1_notify_to_sv2_job(&original, 1, 7, true, true).unwrap();
         let prev = prev.expect("clean job emits a SetNewPrevHash");
 
@@ -536,8 +523,8 @@ mod tests {
         assert_eq!(back.time, original.time);
         assert_eq!(back.merkle_branch.len(), 1);
         assert_eq!(
-            back.merkle_branch[0].0.inner_as_ref(),
-            original.merkle_branch[0].0.inner_as_ref()
+            back.merkle_branch[0].0.as_bytes(),
+            original.merkle_branch[0].0.as_bytes()
         );
         assert!(back.clean_jobs);
     }
@@ -548,7 +535,7 @@ mod tests {
         let (job, prev) = sv1_notify_to_sv2_job(&notify, 3, 9, false, true).unwrap();
         assert!(prev.is_none(), "same-block job emits no prev-hash");
         assert_eq!(
-            job.min_ntime.clone().into_inner(),
+            job.ntime_start.clone().into_inner(),
             Some(notify.time.0),
             "immediate job carries the job ntime"
         );
@@ -563,10 +550,7 @@ mod tests {
             nonce: 0xdead_beef,
             ntime: 0x6500_0001,
             version: 0x2123_4000,
-            extranonce: U256::from([0u8; 32]).inner_as_ref()[..4]
-                .to_vec()
-                .try_into()
-                .unwrap(),
+            extranonce: (&[0u8; 32][..4]).try_into().unwrap(),
         };
         let s = sv2_submit_to_sv1(
             &submit,
@@ -586,7 +570,7 @@ mod tests {
             s.version_bits.unwrap().0,
             0x2123_4000 & VERSION_ROLLING_MASK
         );
-        assert_eq!(s.extra_nonce2.0.inner_as_ref().len(), 4);
+        assert_eq!(s.extra_nonce2.0.as_bytes().len(), 4);
 
         // No mask negotiated → no version_bits.
         let s2 = sv2_submit_to_sv1(&submit, "w".into(), "j".into(), 1, None).unwrap();
@@ -606,8 +590,8 @@ mod tests {
         let extranonce: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00, 0x00, 0x00];
         let empty_path: Vec<Vec<u8>> = vec![];
         let merkle_root = merkle_root_from_path(
-            job.coinbase_tx_prefix.inner_as_ref(),
-            job.coinbase_tx_suffix.inner_as_ref(),
+            job.coinbase_tx_prefix.as_bytes(),
+            job.coinbase_tx_suffix.as_bytes(),
             &extranonce,
             &empty_path,
         )
@@ -617,9 +601,9 @@ mod tests {
         // Build the 80-byte header from the translated job/prev-hash fields.
         let mut header = Vec::with_capacity(80);
         header.extend_from_slice(&job.version.to_le_bytes());
-        header.extend_from_slice(prev.prev_hash.inner_as_ref()); // internal order
+        header.extend_from_slice(prev.prev_hash.as_bytes()); // internal order
         header.extend_from_slice(&merkle_root);
-        header.extend_from_slice(&prev.min_ntime.to_le_bytes());
+        header.extend_from_slice(&prev.ntime_start.to_le_bytes());
         header.extend_from_slice(&prev.nbits.to_le_bytes());
         let nonce_off = header.len();
         header.extend_from_slice(&0u32.to_le_bytes()); // nonce placeholder
@@ -655,7 +639,7 @@ mod tests {
 
     #[test]
     fn notify_line_serializes_and_parses_back() {
-        let original = sample_notify(true, vec![MerkleNode(U256::from([0x07u8; 32]))]);
+        let original = sample_notify(true, vec![MerkleNode(U256Owned::from([0x07u8; 32]))]);
         let line = notify_to_line(original.clone());
         assert!(line.ends_with('\n'), "wire line must be newline-terminated");
         let parsed = notify_from_line(&line).expect("round-trips back to a notify");
@@ -698,7 +682,7 @@ mod tests {
             nonce: 0x1234_5678,
             ntime: 0x6500_0000,
             version: 0x2000_0000,
-            extranonce: vec![1u8, 2, 3, 4].try_into().unwrap(),
+            extranonce: (&[1u8, 2, 3, 4]).try_into().unwrap(),
         };
         let s = sv2_submit_to_sv1(
             &submit,
@@ -728,8 +712,8 @@ mod tests {
         // from coinb1 + extranonce1 + extranonce2 + coinb2. Confirm it matches an
         // independent fold (multi-branch) and that the resulting header can mine.
         let branch = vec![
-            MerkleNode(U256::from([0x07u8; 32])),
-            MerkleNode(U256::from([0x5cu8; 32])),
+            MerkleNode(U256Owned::from([0x07u8; 32])),
+            MerkleNode(U256Owned::from([0x5cu8; 32])),
         ];
         let notify = sample_notify(true, branch); // legacy_coinbase reserves 8 extranonce bytes
         let en1 = [0xAA, 0xBB, 0xCC, 0xDD];
@@ -744,20 +728,20 @@ mod tests {
         let path: Vec<Vec<u8>> = notify
             .merkle_branch
             .iter()
-            .map(|m| m.0.inner_as_ref().to_vec())
+            .map(|m| m.0.as_bytes().to_vec())
             .collect();
         let expected = merkle_root_from_path(&coinb1, &coinb2, &full, &path).unwrap();
         assert_eq!(
-            job.merkle_root.inner_as_ref(),
+            job.merkle_root.as_bytes(),
             expected.as_slice(),
             "merkle root matches"
         );
 
         let mut header = Vec::with_capacity(80);
         header.extend_from_slice(&job.version.to_le_bytes());
-        header.extend_from_slice(prev.prev_hash.inner_as_ref());
-        header.extend_from_slice(job.merkle_root.inner_as_ref());
-        header.extend_from_slice(&prev.min_ntime.to_le_bytes());
+        header.extend_from_slice(prev.prev_hash.as_bytes());
+        header.extend_from_slice(job.merkle_root.as_bytes());
+        header.extend_from_slice(&prev.ntime_start.to_le_bytes());
         header.extend_from_slice(&prev.nbits.to_le_bytes());
         let noff = header.len();
         header.extend_from_slice(&0u32.to_le_bytes());
@@ -797,7 +781,7 @@ mod tests {
         assert_eq!(s.nonce.0, 0xabcd_1234);
         assert_eq!(s.time.0, 0x6500_0002);
         assert_eq!(
-            s.extra_nonce2.0.inner_as_ref(),
+            s.extra_nonce2.0.as_bytes(),
             &[9, 8, 7, 6],
             "extranonce2 is the proxy-chosen one"
         );
