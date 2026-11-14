@@ -65,7 +65,8 @@ pub enum EndReason {
     Budget,
     /// Cancelled through the API.
     Cancelled,
-    /// The buyer's pool accepted none of [`UNACCEPTED_SUBMITS_LIMIT`] shares.
+    /// The buyer's pool accepted none of [`UNACCEPTED_SUBMITS_LIMIT`] shares,
+    /// or, after it accepted some, rejected [`REJECTS_IN_A_ROW_LIMIT`] in a row.
     PoolRejectsShares,
     /// The buyer's pool connection dropped [`UNACCEPTED_DROPS_LIMIT`] times
     /// before it accepted a single share.
@@ -98,19 +99,27 @@ impl EndReason {
 
 /// Shares submitted on a rental, none of them accepted, after which the
 /// buyer's pool is judged unable to take this rig's work and the rental ends.
-/// A pool that accepts even one share is never judged by this.
 pub const UNACCEPTED_SUBMITS_LIMIT: u64 = 30;
+/// Shares the buyer's pool rejected in a row after it had accepted some, after
+/// which the rental ends: a pool that takes shares and then stops (a blocked
+/// worker, a changed login). Counted on rejects the pool sends, one per share,
+/// so a pool that acknowledges accepted shares in batches, and silence during
+/// an outage, never add to it.
+pub const REJECTS_IN_A_ROW_LIMIT: u64 = 30;
 /// Upstream drops on a rental, with no share accepted, after which the rental
 /// ends.
 pub const UNACCEPTED_DROPS_LIMIT: u32 = 10;
 
 /// What the relays saw of a rental's pool beyond the share counters: how often
-/// its connection dropped and the last reason it gave for rejecting a share.
-/// In memory only; a restart starts the count over.
+/// its connection dropped, the last reason it gave for rejecting a share, and
+/// how many it rejected since it last accepted one. In memory only; a restart
+/// starts the counts over.
 #[derive(Default, Clone)]
 struct PoolHealth {
     drops: u32,
     last_reject: Option<String>,
+    /// Shares the pool rejected since it last accepted one.
+    rejects_since_accept: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,8 +232,9 @@ impl Order {
     }
 
     /// Why this active order must end now, if it must. Deadline and budget come
-    /// first; the pool rules only judge a rental whose pool has not accepted a
-    /// single share, so a delivering rental is never ended by them.
+    /// first. Before the pool accepted a share, the pool rules judge submits
+    /// and drops; after, only a run of rejects the pool itself sends, so a
+    /// delivering rental is never ended by them.
     fn end_cause(&self, health: &PoolHealth, now: i64) -> Option<(EndReason, Option<String>)> {
         if self.until_ms > 0 && self.until_ms <= now {
             return Some((EndReason::Deadline, None));
@@ -233,6 +243,14 @@ impl Order {
             return Some((EndReason::Budget, None));
         }
         if self.accepted_shares > 0 {
+            if health.rejects_since_accept >= REJECTS_IN_A_ROW_LIMIT {
+                let reason = health.last_reject.as_deref().unwrap_or("no reason given");
+                let detail = format!(
+                    "{} shares rejected in a row after the pool had accepted some; pool said: {reason}",
+                    health.rejects_since_accept
+                );
+                return Some((EndReason::PoolRejectsShares, Some(detail)));
+            }
             return None;
         }
         if self.submitted_shares >= UNACCEPTED_SUBMITS_LIMIT {
@@ -515,10 +533,17 @@ impl OrderStore {
     /// Buffer measured delivered work + accepted shares for an order; written to
     /// the DB by [`OrderStore::flush`]. Hot-path: in-memory only, no DB write.
     pub fn add_work(&self, id: &str, work: f64, accepted_shares: u64) {
-        let mut p = self.pending.lock().unwrap();
-        let d = p.entry(id.to_string()).or_default();
-        d.work += work;
-        d.accepted += accepted_shares;
+        {
+            let mut p = self.pending.lock().unwrap();
+            let d = p.entry(id.to_string()).or_default();
+            d.work += work;
+            d.accepted += accepted_shares;
+        }
+        if accepted_shares > 0 {
+            if let Some(h) = self.health.lock().unwrap().get_mut(id) {
+                h.rejects_since_accept = 0;
+            }
+        }
     }
 
     /// Buffer submitted shares for an order (for the accept-ratio); written by
@@ -528,11 +553,13 @@ impl OrderStore {
         p.entry(id.to_string()).or_default().submitted += submitted;
     }
 
-    /// Remember the reason the rental's pool gave for rejecting a share; the
-    /// latest one becomes the end detail if the pool never accepts a share.
+    /// Count a share the rental's pool rejected and remember its reason; the
+    /// latest one becomes the end detail when a pool rule ends the rental.
     pub fn note_rejected(&self, id: &str, reason: String) {
         let mut h = self.health.lock().unwrap();
-        h.entry(id.to_string()).or_default().last_reject = Some(reason);
+        let e = h.entry(id.to_string()).or_default();
+        e.last_reject = Some(reason);
+        e.rejects_since_accept += 1;
     }
 
     /// Record that a share for this rental was validated at `at_ms`; see
@@ -652,8 +679,9 @@ impl OrderStore {
 }
 
 /// Background task: every 5s, revert sessions whose rental has finished
-/// (deadline reached, prepaid budget consumed, or a pool that takes none of
-/// the rig's shares).
+/// (deadline reached, prepaid budget consumed, or a pool rule: a pool that
+/// takes none of the rig's shares, or rejects them in a row after it took
+/// some).
 pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -857,7 +885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pool_rules_spare_a_rental_with_one_accepted_share() {
+    async fn the_submit_and_drop_rules_spare_a_rental_with_one_accepted_share() {
         let store = OrderStore::new(crate::db::test_pool().await);
         // Same counts on both: far past both limits. Only `delivering` has a
         // share accepted.
@@ -881,6 +909,58 @@ mod tests {
         assert_eq!(ended.len(), 1);
         assert_eq!(ended[0].id, dead.id);
         assert!(store.active_for_worker("wa", now_ms()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_pool_that_stops_accepting_ends_the_rental_after_a_run_of_rejects() {
+        // The pool took shares, then rejects every one (a blocked worker): the
+        // rental ends once the pool has rejected the limit in a row, and an
+        // accepted share in between starts the count over.
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let o = store
+            .create("ws".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        store.add_submitted(&o.id, 1);
+        store.add_work(&o.id, 1.0, 1);
+        for _ in 0..REJECTS_IN_A_ROW_LIMIT - 1 {
+            store.note_rejected(&o.id, "Stale (21)".into());
+        }
+        store.add_work(&o.id, 1.0, 1);
+        for _ in 0..REJECTS_IN_A_ROW_LIMIT - 1 {
+            store.note_rejected(&o.id, "Worker banned".into());
+        }
+        store.flush().await;
+        assert!(
+            store.take_finished(now_ms()).await.is_empty(),
+            "an accept in between starts the count over"
+        );
+        store.note_rejected(&o.id, "Worker banned".into());
+        let ended = store.take_finished(now_ms()).await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].end_reason, Some(EndReason::PoolRejectsShares));
+        let detail = store.get(&o.id).await.unwrap().end_detail.unwrap();
+        assert!(
+            detail.contains("rejected in a row") && detail.contains("Worker banned"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submits_without_an_answer_never_end_a_delivering_rental() {
+        // A pool that acknowledges accepted shares in batches, or an outage:
+        // many submits, no ack yet, no reject. A rental that already had a
+        // share accepted is not ended by that.
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let o = store
+            .create("wb".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        store.add_submitted(&o.id, 1);
+        store.add_work(&o.id, 1.0, 1);
+        store.add_submitted(&o.id, 10 * REJECTS_IN_A_ROW_LIMIT);
+        store.flush().await;
+        assert!(store.take_finished(now_ms()).await.is_empty());
     }
 
     #[tokio::test]
