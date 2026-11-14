@@ -4493,6 +4493,19 @@ async fn an_sv2_miner_under_a_high_pool_difficulty_is_measured_on_its_own_target
         ext_target(&sv1_addr.to_string(), "acctSV1"),
     )
     .await;
+    // Rented onto that pool: the withheld share must still mark the rental live.
+    let orders = ctx.orders.clone();
+    let order = orders
+        .create(
+            "bc1qSELLER.rig1".into(),
+            ext_target(&sv1_addr.to_string(), "acctBuyer"),
+            None,
+            0,
+            1.0,
+            0.0,
+        )
+        .await
+        .unwrap();
     let keys = NoiseKeys::generate();
     tokio::spawn(async move {
         let (sock, peer) = proxy.accept().await.unwrap();
@@ -4559,6 +4572,15 @@ async fn an_sv2_miner_under_a_high_pool_difficulty_is_measured_on_its_own_target
         "nothing the pool accepted, nothing billed"
     );
     assert_eq!(st.submitted_shares, 0, "nothing was submitted to the pool");
+    assert_eq!(st.routing, "rented");
+    // Billing is buffered; flush so the stored figure is the real one.
+    orders.flush().await;
+    let o = orders.get(&order.id).await.unwrap();
+    assert!(
+        o.last_share_ms.is_some(),
+        "the withheld share marks the rental live"
+    );
+    assert_eq!(o.delivered_work, 0.0, "and bills nothing");
 }
 
 /// Read SV1 lines until `pred` matches one, returning it.
@@ -4598,8 +4620,14 @@ async fn an_sv1_miner_under_a_high_pool_difficulty_is_measured_on_its_own_target
         sellers: crate::store::SellerStore::new(db.clone()),
         orders: crate::orders::OrderStore::new(db.clone()),
     };
-    // Idle pool = the handshake pool, so the authorize needs no switch.
-    register_rig(&ctx.sellers, "bc1qSELLER.rig1", pool_target).await;
+    // Idle pool = the handshake pool; the rental targets it too, so the
+    // authorize resumes the rental without a switch.
+    register_rig(&ctx.sellers, "bc1qSELLER.rig1", pool_target.clone()).await;
+    let orders = ctx.orders.clone();
+    let order = orders
+        .create("bc1qSELLER.rig1".into(), pool_target, None, 0, 1.0, 0.0)
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let (sock, peer) = proxy.accept().await.unwrap();
         let _ = crate::proto::relay::handle_seller_miner(sock, peer.to_string(), ctx).await;
@@ -4697,6 +4725,15 @@ async fn an_sv1_miner_under_a_high_pool_difficulty_is_measured_on_its_own_target
     assert!(st.hashrate_hs > 0.0, "the withheld share is measured");
     assert_eq!(st.delivered_work, 0.0);
     assert_eq!(st.submitted_shares, 0);
+    assert_eq!(st.routing, "rented");
+    // Billing is buffered; flush so the stored figure is the real one.
+    orders.flush().await;
+    let o = orders.get(&order.id).await.unwrap();
+    assert!(
+        o.last_share_ms.is_some(),
+        "the withheld share marks the rental live"
+    );
+    assert_eq!(o.delivered_work, 0.0, "and bills nothing");
 }
 
 #[tokio::test]

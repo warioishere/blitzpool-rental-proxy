@@ -393,6 +393,7 @@ fn spawn_upstream_reader(
         }
         // The loop ended = the pool closed/errored (an intentional swap aborts
         // this task before here). Tell the supervisor so it can reconnect/fail over.
+        session.mark_upstream_dead(generation).await;
         let _ = session.died_tx.send(generation);
     })
 }
@@ -525,6 +526,9 @@ struct Inner {
     /// Set by [`retire_rig`]: the rig is out of service and takes no new
     /// upstream, so a switch retry still holding it cannot bring it back.
     retired: bool,
+    /// True from an upstream's install until its reader ends; see
+    /// [`crate::session::live_rental`].
+    upstream_alive: bool,
     /// Bumped each time the rig goes empty. A scheduled idle reaper only fires if
     /// the token still matches, so a rejoin-then-leave round can't be reaped by a
     /// stale earlier reaper.
@@ -556,6 +560,7 @@ impl Inner {
     ) {
         self.active.reader.abort();
         self.active.writer.abort();
+        self.upstream_alive = true;
         self.active = ActiveUpstream {
             generation,
             target,
@@ -1316,7 +1321,11 @@ impl Sv2Session {
             // A channel its gate cannot judge is measured on what the pool
             // accepted, as no share of it is ever measured otherwise.
             if !tracking {
-                inner.delivery.measured(work);
+                inner.delivery.measured(
+                    work,
+                    crate::session::live_rental(&inner.routing, inner.upstream_alive),
+                    &self.orders,
+                );
             }
             if inner.delivery.accepted(work, shares, &inner.label) {
                 order_credit = inner
@@ -1372,6 +1381,15 @@ impl Sv2Session {
         let i = self.inner.lock().await;
         i.delivery
             .status(&i.label, &i.routing, &i.active.target.url, "sv2")
+    }
+
+    /// The upstream of `generation` ended; if it is still the active one, its
+    /// shares stop counting as a rental's sign of life until the next install.
+    async fn mark_upstream_dead(&self, generation: u64) {
+        let mut i = self.inner.lock().await;
+        if i.active.generation == generation {
+            i.upstream_alive = false;
+        }
     }
 
     async fn worker_label(&self) -> String {
@@ -1628,6 +1646,7 @@ fn spawn_sv1_translate_reader(
         };
         // Pool closed/errored (an intentional swap aborts this task first).
         warn!(gen = generation, %reason, last_line = %last, "sv1 upstream connection ended");
+        session.mark_upstream_dead(generation).await;
         let _ = session.died_tx.send(generation);
     })
 }
@@ -1859,7 +1878,11 @@ impl Sv2Session {
             // A channel its gate cannot judge is measured on what the pool
             // accepted, as no share of it is ever measured otherwise.
             if !tracking {
-                i.delivery.measured(work);
+                i.delivery.measured(
+                    work,
+                    crate::session::live_rental(&i.routing, i.upstream_alive),
+                    &self.orders,
+                );
             }
             let credit = if i.delivery.accepted(work, 1, &i.label) {
                 i.routing.order_id().map(|o| (o.to_string(), work, 1))
@@ -2325,6 +2348,7 @@ pub async fn handle_seller_miner_sv2(
                     supervisor: None,
                     vardiff: None,
                     retired: false,
+                    upstream_alive: false,
                     idle_token: 0,
                 }),
             });
@@ -2481,7 +2505,14 @@ pub async fn handle_seller_miner_sv2(
                             let inner = &mut *i;
                             let (verdict, seq) = judge_submit(inner, down_cid, mt, &mut frame);
                             if let Some(d) = verdict.measured() {
-                                inner.delivery.measured(d);
+                                inner.delivery.measured(
+                                    d,
+                                    crate::session::live_rental(
+                                        &inner.routing,
+                                        inner.upstream_alive,
+                                    ),
+                                    &session.orders,
+                                );
                             }
                             if let Verdict::Withhold { measured } = verdict {
                                 // Met the miner's target, not the pool's: the

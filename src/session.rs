@@ -142,11 +142,24 @@ impl Delivery {
         true
     }
 
-    /// Feed the hashrate window one share the proxy validated against the
-    /// miner's target, credited at that target's `difficulty`.
-    pub fn measured(&mut self, difficulty: f64) {
-        if difficulty > 0.0 {
-            self.hashrate.record(difficulty);
+    /// Feed the hashrate window one measured share, credited at the
+    /// `difficulty` of the miner target it met, and mark `rental` live
+    /// ([`crate::orders::Order::last_share_ms`]); see [`live_rental`] for which
+    /// rental a share counts for. The share was sent to the rental's pool or
+    /// answered on its behalf, a sign of life far sooner than a rarely
+    /// accepted pool share.
+    pub fn measured(
+        &mut self,
+        difficulty: f64,
+        rental: Option<&str>,
+        orders: &crate::orders::OrderStore,
+    ) {
+        if difficulty <= 0.0 {
+            return;
+        }
+        self.hashrate.record(difficulty);
+        if let Some(order_id) = rental {
+            orders.note_share(order_id, crate::orders::now_ms());
         }
     }
 
@@ -175,6 +188,18 @@ impl Delivery {
             accept_ratio_low: accept_ratio_low(self.accepted_shares, self.submitted_shares),
             protocol,
         }
+    }
+}
+
+/// The rental a measured share is a sign of life for: the order the session
+/// routes to, while its connection to that order's pool is up. Without the
+/// pool connection a miner keeps hashing its last job and the proxy keeps
+/// judging those shares, but nothing reaches the buyer, so they mark nothing.
+pub fn live_rental(routing: &Routing, upstream_alive: bool) -> Option<&str> {
+    if upstream_alive {
+        routing.order_id()
+    } else {
+        None
     }
 }
 
@@ -315,13 +340,27 @@ mod tests {
 mod delivery_tests {
     use super::*;
 
-    #[test]
-    fn accepted_work_is_booked_and_reported() {
+    async fn orders() -> std::sync::Arc<crate::orders::OrderStore> {
+        crate::orders::OrderStore::new(crate::db::test_pool().await)
+    }
+
+    fn target() -> UpstreamTarget {
+        UpstreamTarget {
+            url: "buyer:3333".into(),
+            user: "b".into(),
+            password: "x".into(),
+            authority_pubkey: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_work_is_booked_and_reported() {
+        let orders = orders().await;
         let mut d = Delivery::new();
         d.submitted("w");
         d.submitted("w");
-        d.measured(256.0);
-        d.measured(256.0);
+        d.measured(256.0, live_rental(&Routing::Idle, true), &orders);
+        d.measured(256.0, live_rental(&Routing::Idle, true), &orders);
         assert!(d.accepted(512.0, 2, "w"));
         let rented = Routing::Rented {
             order_id: "o1".into(),
@@ -335,8 +374,9 @@ mod delivery_tests {
         assert!(st.hashrate_hs > 0.0);
     }
 
-    #[test]
-    fn the_hashrate_comes_from_measured_shares_not_from_the_bill() {
+    #[tokio::test]
+    async fn the_hashrate_comes_from_measured_shares_not_from_the_bill() {
+        let orders = orders().await;
         // Pool-accepted work alone moves the bill, not the hashrate; a measured
         // share alone moves the hashrate, not the bill.
         let mut billed = Delivery::new();
@@ -346,10 +386,43 @@ mod delivery_tests {
         assert_eq!(st.delivered_work, 1_000_000.0);
 
         let mut measured = Delivery::new();
-        measured.measured(4096.0);
+        measured.measured(4096.0, live_rental(&Routing::Idle, true), &orders);
         let st = measured.status("w", &Routing::Idle, "pool:3333", "sv2");
         assert!(st.hashrate_hs > 0.0);
         assert_eq!(st.delivered_work, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_measured_share_marks_only_the_rental_it_runs_for() {
+        // A share measured while routed to rental A marks A live, not B; one
+        // measured while idle (a failed switch leaves the rig on the seller's
+        // pool) or while A's pool connection is down marks nothing, so a
+        // rental its rig never reaches stays silent.
+        let orders = orders().await;
+        let a = orders
+            .create("w.a".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let b = orders
+            .create("w.b".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let mut d = Delivery::new();
+        let rented_a = Routing::Rented {
+            order_id: a.id.clone(),
+        };
+        d.measured(512.0, live_rental(&Routing::Idle, true), &orders);
+        d.measured(512.0, live_rental(&rented_a, false), &orders);
+        assert_eq!(orders.get(&a.id).await.unwrap().last_share_ms, None);
+        assert_eq!(orders.get(&b.id).await.unwrap().last_share_ms, None);
+        d.measured(512.0, live_rental(&rented_a, true), &orders);
+        assert!(orders.get(&a.id).await.unwrap().last_share_ms.is_some());
+        assert_eq!(orders.get(&b.id).await.unwrap().last_share_ms, None);
+        assert!(orders
+            .list()
+            .await
+            .iter()
+            .any(|o| o.id == a.id && o.last_share_ms.is_some()));
     }
 
     #[test]

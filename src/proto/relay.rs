@@ -133,6 +133,9 @@ struct Inner {
     /// Set once the miner has sent `mining.subscribe` — until then, translated
     /// jobs are stashed as prelude so a job never precedes the subscribe reply.
     subscribed: bool,
+    /// True from an upstream's install until its reader ends; see
+    /// [`crate::session::live_rental`].
+    upstream_alive: bool,
     /// The miner's share gate (its own difficulty, the shares it judges). Set
     /// by the first upstream install; every line to the miner and every submit
     /// from it passes through it.
@@ -356,7 +359,11 @@ impl Session {
                     if let Some((_, diff)) = ours {
                         if matches!(&msg.result, Some(Value::Bool(true))) {
                             if !i.gate_tracking() {
-                                i.delivery.measured(diff);
+                                i.delivery.measured(
+                                    diff,
+                                    crate::session::live_rental(&i.routing, i.upstream_alive),
+                                    &self.orders,
+                                );
                             }
                             if i.delivery.accepted(diff, 1, &i.label) {
                                 order_credit = i.routing.order_id().map(|o| (o.to_string(), diff));
@@ -400,7 +407,11 @@ impl Session {
                     (None, _) => Verdict::Forward { measured: None },
                 };
                 if let Some(d) = verdict.measured() {
-                    i.delivery.measured(d);
+                    i.delivery.measured(
+                        d,
+                        crate::session::live_rental(&i.routing, i.upstream_alive),
+                        &self.orders,
+                    );
                 }
                 if let Verdict::Withhold { .. } = verdict {
                     // Met the miner's target, not the pool's: the pool would
@@ -682,6 +693,7 @@ impl Session {
             .filter_map(|l| gate.line_to_miner(l))
             .collect();
         i.gate = Some(gate);
+        i.upstream_alive = true;
         i.active = ActiveUpstream {
             generation,
             target,
@@ -866,6 +878,7 @@ fn spawn_sv2_translate_reader(
             }
         }
         // Pool closed/errored (an intentional swap aborts this task first).
+        session.mark_upstream_dead(generation).await;
         let _ = session.died_tx.send(generation);
     })
 }
@@ -945,7 +958,11 @@ impl Session {
             let work = i.current_difficulty * count as f64;
             let shares = count as u64;
             if !i.gate_tracking() {
-                i.delivery.measured(work);
+                i.delivery.measured(
+                    work,
+                    crate::session::live_rental(&i.routing, i.upstream_alive),
+                    &self.orders,
+                );
             }
             if i.delivery.accepted(work, shares, &i.label) {
                 i.routing.order_id().map(|o| (o.to_string(), work, shares))
@@ -970,6 +987,15 @@ impl Session {
         };
         if let Some(order_id) = order_id {
             self.orders.note_rejected(&order_id, reason);
+        }
+    }
+
+    /// The upstream of `generation` ended; if it is still the active one, its
+    /// shares stop counting as a rental's sign of life until the next install.
+    async fn mark_upstream_dead(&self, generation: u64) {
+        let mut i = self.inner.lock().await;
+        if i.active.generation == generation {
+            i.upstream_alive = false;
         }
     }
 
@@ -1035,6 +1061,7 @@ fn spawn_upstream_reader(
         }
         // The loop ended = the pool closed/errored (an intentional swap aborts
         // this task first). Tell the supervisor so it can reconnect / fail over.
+        session.mark_upstream_dead(generation).await;
         let _ = session.died_tx.send(generation);
     })
 }
@@ -1119,6 +1146,7 @@ pub async fn handle_seller_miner(
             extranonce2_size: 0,
             translating: false,
             subscribed: false,
+            upstream_alive: false,
             gate: None,
         }),
     });
@@ -1471,6 +1499,7 @@ mod tests {
                 extranonce2_size: 0,
                 translating: false,
                 subscribed: false,
+                upstream_alive: false,
                 gate: None,
             }),
         });

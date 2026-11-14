@@ -153,6 +153,14 @@ pub struct Order {
     /// `accepted_shares` gives the accept-ratio (a fraud/health signal).
     #[serde(default)]
     pub submitted_shares: u64,
+    /// When the proxy last measured a share this rental's miner found while
+    /// routed to it with its pool connection up (epoch ms): validated against
+    /// the miner's target, whether it met the pool's or not, or, for a channel
+    /// the proxy cannot validate, accepted by the pool. `None` until the first
+    /// one since the proxy started. A liveness signal for rentals whose pool
+    /// accepts shares rarely; not billed, not stored.
+    #[serde(default)]
+    pub last_share_ms: Option<i64>,
     /// Agreed price per TH/day (same currency unit as `budget`, e.g. sats).
     #[serde(default)]
     pub price_per_th_day: f64,
@@ -302,6 +310,7 @@ impl OrderRow {
             delivered_work: self.delivered_work,
             accepted_shares: self.accepted_shares as u64,
             submitted_shares: self.submitted_shares as u64,
+            last_share_ms: None,
             price_per_th_day: self.price_per_th_day,
             budget: self.budget,
         }
@@ -338,6 +347,9 @@ pub struct OrderStore {
     /// Per-order pool health the share counters do not carry, read by
     /// [`OrderStore::take_finished`].
     health: Mutex<HashMap<String, PoolHealth>>,
+    /// Per-order time of the last validated share, see
+    /// [`Order::last_share_ms`]. In memory only.
+    last_share: Mutex<HashMap<String, i64>>,
 }
 
 impl OrderStore {
@@ -346,7 +358,14 @@ impl OrderStore {
             pool,
             pending: Mutex::new(HashMap::new()),
             health: Mutex::new(HashMap::new()),
+            last_share: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// `order` with its in-memory [`Order::last_share_ms`] filled in.
+    fn with_last_share(&self, mut order: Order) -> Order {
+        order.last_share_ms = self.last_share.lock().unwrap().get(&order.id).copied();
+        order
     }
 
     /// Record a new active rental. Fails with [`CreateOrderError::AlreadyActive`]
@@ -416,6 +435,7 @@ impl OrderStore {
             delivered_work: 0.0,
             accepted_shares: 0,
             submitted_shares: 0,
+            last_share_ms: None,
             price_per_th_day,
             budget,
         })
@@ -434,7 +454,7 @@ impl OrderStore {
         .await
         .ok()
         .flatten()
-        .map(OrderRow::into_order)
+        .map(|r| self.with_last_share(r.into_order()))
     }
 
     pub async fn list(&self) -> Vec<Order> {
@@ -449,7 +469,7 @@ impl OrderStore {
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(OrderRow::into_order)
+        .map(|r| self.with_last_share(r.into_order()))
         .collect()
     }
 
@@ -468,7 +488,7 @@ impl OrderStore {
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(OrderRow::into_order)
+        .map(|r| self.with_last_share(r.into_order()))
         .collect()
     }
 
@@ -513,6 +533,14 @@ impl OrderStore {
     pub fn note_rejected(&self, id: &str, reason: String) {
         let mut h = self.health.lock().unwrap();
         h.entry(id.to_string()).or_default().last_reject = Some(reason);
+    }
+
+    /// Record that a share for this rental was validated at `at_ms`; see
+    /// [`Order::last_share_ms`]. Hot-path: in-memory only.
+    pub fn note_share(&self, id: &str, at_ms: i64) {
+        let mut m = self.last_share.lock().unwrap();
+        let t = m.entry(id.to_string()).or_insert(at_ms);
+        *t = (*t).max(at_ms);
     }
 
     /// Count a dropped connection to the rental's pool.
@@ -660,6 +688,20 @@ mod tests {
             password: "x".into(),
             authority_pubkey: None,
         }
+    }
+
+    #[tokio::test]
+    async fn last_share_ms_keeps_the_latest_and_starts_empty() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let o = store
+            .create("w".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(o.last_share_ms, None);
+        assert_eq!(store.get(&o.id).await.unwrap().last_share_ms, None);
+        store.note_share(&o.id, 2_000);
+        store.note_share(&o.id, 1_000);
+        assert_eq!(store.get(&o.id).await.unwrap().last_share_ms, Some(2_000));
     }
 
     #[tokio::test]
