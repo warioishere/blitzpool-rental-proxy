@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
              until a token is configured"
         );
     }
+    let sv2_rigs: Arc<proto::sv2::relay::Sv2RigRegistry> = Default::default();
     let api_addr = std::env::var("RENTAL_PROXY_API").unwrap_or_else(|_| "127.0.0.1:8080".into());
     {
         let state = api::AppState {
@@ -102,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             hashrate: hashrate.clone(),
             api_token: api_token.clone(),
             chain,
+            sv2_rigs: sv2_rigs.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = api::serve(api_addr, state).await {
@@ -119,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         registry,
         sellers,
         orders,
-        sv2_rigs: Default::default(),
+        sv2_rigs,
     };
 
     accept_loop(listener, ctx).await

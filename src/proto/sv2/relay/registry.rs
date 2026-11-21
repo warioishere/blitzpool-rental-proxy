@@ -77,6 +77,24 @@ impl Sv2RigRegistry {
         true
     }
 
+    /// Take `worker`'s bundle rig out of service and drop its miners, so each
+    /// reconnects onto a rig built from the worker's current order. For a
+    /// change of pools under the order the rig is routed to: its routing
+    /// names the order, not the pool, so a reconnecting miner would bundle
+    /// back onto the replaced pool. Waits on the worker's gate, so a miner
+    /// that resolved the order before the change has registered by the time
+    /// this returns. Returns whether a rig was retired.
+    pub async fn retire(&self, registry: &crate::registry::Registry, worker: &str) -> bool {
+        let gate = self.gate(worker).await;
+        let _hold = gate.lock().await;
+        let Some(rig) = self.get(worker).await else {
+            return false;
+        };
+        rig.force_reconnect();
+        retire_rig(self, registry, &rig, worker).await;
+        true
+    }
+
     /// Remove `rig` as the bundle target for `worker` — but only if it is still
     /// the registered one (a late teardown must not evict a fresh replacement).
     /// The per-worker gate is intentionally kept.

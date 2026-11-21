@@ -120,6 +120,12 @@ struct PoolHealth {
     last_reject: Option<String>,
     /// Shares the pool rejected since it last accepted one.
     rejects_since_accept: u64,
+    /// The order's accepted and submitted share counts when its pools were
+    /// last replaced; zero for an order still on the pools it was created
+    /// with. The pool rules judge the counts above these, so the current pools
+    /// answer for their own shares only.
+    accepted_before: u64,
+    submitted_before: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +240,8 @@ impl Order {
     /// Why this active order must end now, if it must. Deadline and budget come
     /// first. Before the pool accepted a share, the pool rules judge submits
     /// and drops; after, only a run of rejects the pool itself sends, so a
-    /// delivering rental is never ended by them.
+    /// delivering rental is never ended by them. "The pool" is the order's
+    /// current pools: shares counted before they were set are left out.
     fn end_cause(&self, health: &PoolHealth, now: i64) -> Option<(EndReason, Option<String>)> {
         if self.until_ms > 0 && self.until_ms <= now {
             return Some((EndReason::Deadline, None));
@@ -242,7 +249,11 @@ impl Order {
         if self.funding_exhausted() {
             return Some((EndReason::Budget, None));
         }
-        if self.accepted_shares > 0 {
+        let accepted = self.accepted_shares.saturating_sub(health.accepted_before);
+        let submitted = self
+            .submitted_shares
+            .saturating_sub(health.submitted_before);
+        if accepted > 0 {
             if health.rejects_since_accept >= REJECTS_IN_A_ROW_LIMIT {
                 let reason = health.last_reject.as_deref().unwrap_or("no reason given");
                 let detail = format!(
@@ -253,16 +264,14 @@ impl Order {
             }
             return None;
         }
-        if self.submitted_shares >= UNACCEPTED_SUBMITS_LIMIT {
+        if submitted >= UNACCEPTED_SUBMITS_LIMIT {
             let detail = match &health.last_reject {
-                Some(reason) => format!(
-                    "{} shares submitted, none accepted; pool said: {reason}",
-                    self.submitted_shares
-                ),
-                None => format!(
-                    "{} shares submitted, none accepted; the pool did not answer",
-                    self.submitted_shares
-                ),
+                Some(reason) => {
+                    format!("{submitted} shares submitted, none accepted; pool said: {reason}")
+                }
+                None => {
+                    format!("{submitted} shares submitted, none accepted; the pool did not answer")
+                }
             };
             return Some((EndReason::PoolRejectsShares, Some(detail)));
         }
@@ -530,6 +539,66 @@ impl OrderStore {
             .find(|o| !o.funding_exhausted())
     }
 
+    /// Replace an active order's pools; `None` when the order is not active.
+    /// Everything else about the order stays. The pool rules start over for
+    /// the new pools: the drops, rejects and share counts so far were the
+    /// replaced pool's (see [`PoolHealth`]). Like the rest of the pool health
+    /// this is held in memory, so after a restart the rules judge the order's
+    /// whole counts again.
+    pub async fn set_pools(
+        &self,
+        id: &str,
+        target: &UpstreamTarget,
+        fallback: Option<&UpstreamTarget>,
+    ) -> Result<Option<Order>, sqlx::Error> {
+        let fb_url = fallback.map(|f| f.url.as_str());
+        let fb_user = fallback.map(|f| f.user.as_str());
+        let fb_pass = fallback.map(|f| f.password.as_str());
+        let fb_auth = fallback.and_then(|f| f.authority_pubkey.as_deref());
+        let updated = sqlx::query!(
+            "UPDATE orders SET target_url = ?, target_user = ?, target_password = ?, \
+             target_authority = ?, fallback_url = ?, fallback_user = ?, fallback_password = ?, \
+             fallback_authority = ? WHERE id = ? AND status = 'active'",
+            target.url,
+            target.user,
+            target.password,
+            target.authority_pubkey,
+            fb_url,
+            fb_user,
+            fb_pass,
+            fb_auth,
+            id,
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Ok(None);
+        }
+        Ok(self.restart_pool_rules(id).await)
+    }
+
+    /// Start the pool rules over for an active order from its share counts as
+    /// they stand: the rules leave out what it has accepted and submitted so
+    /// far. Returns the order. Buffered accounting is
+    /// written first; shares a flush already under way is still writing are
+    /// not in the counts read here.
+    pub async fn restart_pool_rules(&self, id: &str) -> Option<Order> {
+        self.flush().await;
+        let order = self.get(id).await?;
+        if order.status == OrderStatus::Active {
+            self.health.lock().unwrap().insert(
+                id.to_string(),
+                PoolHealth {
+                    accepted_before: order.accepted_shares,
+                    submitted_before: order.submitted_shares,
+                    ..PoolHealth::default()
+                },
+            );
+        }
+        Some(order)
+    }
+
     /// Buffer measured delivered work + accepted shares for an order; written to
     /// the DB by [`OrderStore::flush`]. Hot-path: in-memory only, no DB write.
     pub fn add_work(&self, id: &str, work: f64, accepted_shares: u64) {
@@ -730,6 +799,191 @@ mod tests {
         store.note_share(&o.id, 2_000);
         store.note_share(&o.id, 1_000);
         assert_eq!(store.get(&o.id).await.unwrap().last_share_ms, Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn new_pools_replace_an_active_orders_and_leave_the_rest() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let o = store
+            .create("wp".into(), target(), Some(target()), 0, 2.0, 50.0)
+            .await
+            .unwrap();
+        store.add_submitted(&o.id, 3);
+        store.add_work(&o.id, 7.0, 2);
+        store.flush().await;
+        let pool = UpstreamTarget {
+            url: "other:4444".into(),
+            user: "buyer2".into(),
+            password: "pw".into(),
+            authority_pubkey: Some("key".into()),
+        };
+
+        let got = store.set_pools(&o.id, &pool, None).await.unwrap().unwrap();
+        assert_eq!(got.target, pool);
+        assert_eq!(got.fallback, None);
+        let stored = store.get(&o.id).await.unwrap();
+        assert_eq!((stored.target, stored.fallback), (pool.clone(), None));
+        assert_eq!(stored.id, o.id);
+        assert_eq!(stored.created_ms, o.created_ms);
+        assert_eq!((stored.price_per_th_day, stored.budget), (2.0, 50.0));
+        assert_eq!(stored.delivered_work, 7.0);
+        assert_eq!((stored.accepted_shares, stored.submitted_shares), (2, 3));
+
+        // An order that is over keeps the pools it ended on.
+        store.cancel(&o.id).await.unwrap();
+        assert!(store
+            .set_pools(&o.id, &target(), None)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.get(&o.id).await.unwrap().target, pool);
+    }
+
+    #[tokio::test]
+    async fn rejects_from_the_replaced_pool_do_not_count_against_the_new_one() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let run = |id: String, replace: bool| {
+            let store = store.clone();
+            async move {
+                store.add_submitted(&id, 1);
+                store.add_work(&id, 1.0, 1);
+                for _ in 0..REJECTS_IN_A_ROW_LIMIT - 1 {
+                    store.note_rejected(&id, "Stale (21)".into());
+                }
+                if replace {
+                    store
+                        .set_pools(&id, &target(), None)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                store.note_rejected(&id, "Stale (21)".into());
+                store.flush().await;
+            }
+        };
+        let kept = store
+            .create("wk".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let replaced = store
+            .create("wr".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        run(kept.id.clone(), false).await;
+        run(replaced.id.clone(), true).await;
+        let ended = store.take_finished(now_ms()).await;
+        assert_eq!(ended.len(), 1, "only the order that kept its pool ends");
+        assert_eq!(ended[0].id, kept.id);
+    }
+
+    #[tokio::test]
+    async fn the_pool_rules_judge_new_pools_on_their_own_shares() {
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let other = UpstreamTarget {
+            url: "other:4444".into(),
+            ..target()
+        };
+        // The first pool accepted a share; the new one takes none of a full
+        // limit of submits. Without new pools the accepted share spares the
+        // order.
+        let spared = store
+            .create("w1".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let silent = store
+            .create("w2".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        // The first pool took none of a nearly full limit of submits; the new
+        // one gets the whole limit again. Without new pools one more ends it.
+        let used_up = store
+            .create("w3".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let fresh = store
+            .create("w4".into(), target(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+
+        for id in [&spared.id, &silent.id] {
+            store.add_submitted(id, 1);
+            store.add_work(id, 1.0, 1);
+        }
+        for id in [&used_up.id, &fresh.id] {
+            store.add_submitted(id, UNACCEPTED_SUBMITS_LIMIT - 1);
+        }
+        for id in [&silent.id, &fresh.id] {
+            store.set_pools(id, &other, None).await.unwrap().unwrap();
+        }
+        for id in [&spared.id, &silent.id] {
+            store.add_submitted(id, UNACCEPTED_SUBMITS_LIMIT);
+        }
+        for id in [&used_up.id, &fresh.id] {
+            store.add_submitted(id, 1);
+        }
+        store.flush().await;
+
+        let mut ended: Vec<String> = store
+            .take_finished(now_ms())
+            .await
+            .into_iter()
+            .map(|o| o.id)
+            .collect();
+        ended.sort();
+        let mut want = vec![silent.id.clone(), used_up.id.clone()];
+        want.sort();
+        assert_eq!(ended, want);
+        let detail = store.get(&silent.id).await.unwrap().end_detail.unwrap();
+        assert!(
+            detail.starts_with(&format!("{UNACCEPTED_SUBMITS_LIMIT} shares submitted")),
+            "the detail counts the new pool's submits only: {detail}"
+        );
+
+        // The new pool's remaining submits still end the order.
+        store.add_submitted(&fresh.id, UNACCEPTED_SUBMITS_LIMIT - 1);
+        store.flush().await;
+        let ended = store.take_finished(now_ms()).await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].id, fresh.id);
+    }
+
+    #[tokio::test]
+    async fn a_share_the_replaced_pool_accepts_late_is_not_the_new_pools_first() {
+        // An accept from the replaced pool lands after the pools are set and
+        // before the miners are off it. Restarting the rules once they are
+        // leaves it out; otherwise it spares a new pool that accepts nothing.
+        let store = OrderStore::new(crate::db::test_pool().await);
+        let run = |worker: &'static str, restart: bool| {
+            let store = store.clone();
+            async move {
+                let o = store
+                    .create(worker.into(), target(), None, 0, 1.0, 0.0)
+                    .await
+                    .unwrap();
+                store
+                    .set_pools(&o.id, &target(), None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                store.add_submitted(&o.id, 1);
+                store.add_work(&o.id, 1.0, 1);
+                if restart {
+                    store.restart_pool_rules(&o.id).await.unwrap();
+                }
+                store.add_submitted(&o.id, UNACCEPTED_SUBMITS_LIMIT);
+                o.id
+            }
+        };
+        let restarted = run("w1", true).await;
+        let _spared = run("w2", false).await;
+        store.flush().await;
+        let ended = store.take_finished(now_ms()).await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].id, restarted);
+
+        // An order that is over gets no pool rules.
+        store.restart_pool_rules(&restarted).await.unwrap();
+        assert!(!store.health.lock().unwrap().contains_key(&restarted));
     }
 
     #[tokio::test]

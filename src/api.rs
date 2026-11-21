@@ -11,6 +11,7 @@
 //!   POST /api/sellers/{worker}/rentable      list/unlist a rig
 //!   GET  /api/sellers/{worker}/history       hashrate + rental history
 //!   GET|POST|DELETE /api/orders[/{id}]       rentals
+//!   PUT  /api/orders/{id}/pools             replace a running rental's pools
 //!
 //! Rentals are driven through the orders layer (`POST /api/orders`), which gates,
 //! records, bills and auto-reverts. There is no raw session-switch endpoint.
@@ -35,6 +36,7 @@ use crate::chain::Electrum;
 use crate::hashrate::HashrateStore;
 use crate::orders::{now_ms, OrderStatus, OrderStore};
 use crate::probe::{probe_pools, PoolRefusal};
+use crate::proto::sv2::relay::Sv2RigRegistry;
 use crate::registry::Registry;
 use crate::session::UpstreamTarget;
 use crate::store::{Rig, SellerStore};
@@ -50,6 +52,8 @@ pub struct AppState {
     pub api_token: Arc<str>,
     /// The Bitcoin tip source for the pool probe; `None` skips the chain check.
     pub chain: Option<Arc<Electrum>>,
+    /// The SV2 bundle rigs, shared with the relays.
+    pub sv2_rigs: Arc<Sv2RigRegistry>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -68,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sellers/{worker}/history", get(get_seller_history))
         .route("/api/orders", get(list_orders).post(create_order))
         .route("/api/orders/{id}", get(get_order).delete(cancel_order))
+        .route("/api/orders/{id}/pools", put(set_order_pools))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -507,8 +512,9 @@ struct OrderReq {
     budget: f64,
 }
 
-/// A refusal of `POST /api/orders`: a plain API error, or a pool that failed
-/// the probe.
+/// A refusal of an order's pools (`POST /api/orders`,
+/// `PUT /api/orders/{id}/pools`): a plain API error, or a pool that failed the
+/// probe.
 enum Refusal {
     Api(ApiError),
     /// 422 `{error, detail, pool}`; `error` is a [`crate::probe::RefusalCode`] and `pool`
@@ -653,6 +659,55 @@ async fn create_order(
     })))
 }
 
+/// Replace a running order's pools (primary and fallback, as a whole; no
+/// `fallback_url` = no fallback) and move the rig's miners onto them. The
+/// order keeps its id, deadline, budget and counters. The new pools are probed
+/// first, as at creation; a refused pool leaves the order as it was.
+/// `reconnected` counts the sessions dropped.
+async fn set_order_pools(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<PoolsReq>,
+) -> Result<Json<Value>, Refusal> {
+    let (target, fallback) = req.targets()?;
+    let order = s
+        .orders
+        .get(&id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
+    let not_active = || (StatusCode::CONFLICT, "order is not active".to_string());
+    if !order.is_live(now_ms()) {
+        return Err(not_active().into());
+    }
+    if order.target == target && order.fallback == fallback {
+        return Ok(Json(json!({
+            "ok": true,
+            "order": order_json(&order),
+            "reconnected": 0,
+        })));
+    }
+    probe(&s, &target, fallback.as_ref(), &order.worker).await?;
+    let order = s
+        .orders
+        .set_pools(&id, &target, fallback.as_ref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(not_active)?;
+    // The order is stored, so every reconnect resolves the new pools. An SV2
+    // bundle rig is retired first: it is routed to this order already and
+    // would take its miners back onto the replaced pool.
+    let retired = s.sv2_rigs.retire(&s.registry, &order.worker).await;
+    let reconnected = reconnect_all(&s, &order.worker).await + usize::from(retired);
+    // Once more with the miners dropped: a share the replaced pool accepted
+    // since the pools were stored would count as the new pools' first.
+    let order = s.orders.restart_pool_rules(&id).await.unwrap_or(order);
+    Ok(Json(json!({
+        "ok": true,
+        "order": order_json(&order),
+        "reconnected": reconnected,
+    })))
+}
+
 /// Cancel an order; if the worker is connected, revert it to its default pool.
 async fn cancel_order(
     State(s): State<AppState>,
@@ -687,6 +742,7 @@ mod tests {
             hashrate: HashrateStore::new(pool),
             api_token: token.into(),
             chain: None,
+            sv2_rigs: Default::default(),
         })
     }
 
@@ -705,6 +761,7 @@ mod tests {
             hashrate: HashrateStore::new(pool.clone()),
             api_token: TOKEN.into(),
             chain: None,
+            sv2_rigs: Default::default(),
         });
         (app, orders)
     }
@@ -1016,6 +1073,128 @@ mod tests {
         let resp = app.oneshot(post).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert!(body_text(resp).await.contains("future"));
+    }
+
+    fn put_pools(id: &str, body: String) -> Request<Body> {
+        Request::put(format!("/api/orders/{id}/pools"))
+            .header("content-type", "application/json")
+            .header("authorization", BEARER)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_running_orders_pools_are_replaced_after_a_probe() {
+        use crate::probe::tests::{sv1_pool, Sv1Pool};
+        let (app, orders) = app_with_orders().await;
+        let order = orders
+            .create("bc1qA.rig1".to_string(), buyer_target(), None, 0, 2.0, 9.0)
+            .await
+            .unwrap();
+        let live = sv1_pool(Sv1Pool::Job {
+            height: 2,
+            prev: [0; 32],
+        })
+        .await;
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+
+        // A pool that does not answer is refused and the order keeps its pools.
+        let body = format!(r#"{{"url":"{dead}","user":"b2"}}"#);
+        let resp = app
+            .clone()
+            .oneshot(put_pools(&order.id, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "pool-unreachable");
+        assert_eq!(v["pool"], "primary");
+        assert_eq!(orders.get(&order.id).await.unwrap().target, buyer_target());
+
+        // A failing fallback refuses the change as a whole.
+        let body = format!(
+            r#"{{"url":"{}","user":"b2","fallback_url":"{dead}","fallback_user":"b3"}}"#,
+            live.url
+        );
+        let resp = app
+            .clone()
+            .oneshot(put_pools(&order.id, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(resp).await["pool"], "fallback");
+        assert_eq!(orders.get(&order.id).await.unwrap().target, buyer_target());
+
+        // A pool that takes the rig's login replaces the order's.
+        let body = format!(
+            r#"{{"url":"stratum+tcp://{}","user":"b2","pass":"p"}}"#,
+            live.url
+        );
+        let resp = app
+            .clone()
+            .oneshot(put_pools(&order.id, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["order"]["id"], order.id.as_str());
+        assert_eq!(v["order"]["target"]["url"], live.url.as_str());
+        assert_eq!(v["order"]["budget"], 9.0);
+        assert_eq!(v["reconnected"], 0, "no miner is connected");
+        let stored = orders.get(&order.id).await.unwrap();
+        assert_eq!(stored.target.url, live.url);
+        assert_eq!(stored.target.user, "b2");
+        assert_eq!(stored.target.password, "p");
+        assert_eq!(stored.fallback, None);
+    }
+
+    #[tokio::test]
+    async fn an_orders_pools_are_not_replaced_when_the_request_cannot_apply() {
+        let (app, orders) = app_with_orders().await;
+        let order = orders
+            .create("bc1qA.rig1".to_string(), buyer_target(), None, 0, 0.0, 0.0)
+            .await
+            .unwrap();
+        let body = || r#"{"url":"other:3333","user":"b2"}"#.to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(put_pools("o0-0", body()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let bad = r#"{"url":"stratum+ssl://other:3333","user":"b2"}"#.to_string();
+        let resp = app
+            .clone()
+            .oneshot(put_pools(&order.id, bad))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // The pools it already has: nothing to probe, nothing to move. The
+        // pool does not exist, so a probe would have refused it.
+        let same = r#"{"url":"buyer:3333","user":"b","pass":"x"}"#.to_string();
+        let resp = app
+            .clone()
+            .oneshot(put_pools(&order.id, same))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["reconnected"], 0);
+
+        orders.cancel(&order.id).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(put_pools(&order.id, body()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(body_text(resp).await.contains("not active"));
+        assert_eq!(orders.get(&order.id).await.unwrap().target, buyer_target());
     }
 
     #[tokio::test]

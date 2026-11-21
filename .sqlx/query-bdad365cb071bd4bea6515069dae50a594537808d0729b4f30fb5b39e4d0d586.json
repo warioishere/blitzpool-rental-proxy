@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE orders SET target_url = ?, target_user = ?, target_password = ?, target_authority = ?, fallback_url = ?, fallback_user = ?, fallback_password = ?, fallback_authority = ? WHERE id = ? AND status = 'active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "bdad365cb071bd4bea6515069dae50a594537808d0729b4f30fb5b39e4d0d586"
+}

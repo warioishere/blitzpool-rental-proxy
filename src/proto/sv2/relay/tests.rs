@@ -4823,3 +4823,217 @@ async fn an_idle_pool_edit_reaches_a_single_device_rig() {
         "the reconnect lands on the edited idle pool B"
     );
 }
+
+/// Read until the proxy closes the miner's connection.
+async fn await_closed(miner: &mut MockMiner) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while read_one(&mut miner.read).await.is_ok() {}
+    })
+    .await
+    .expect("the proxy should close the miner connection within 5s");
+}
+
+#[tokio::test]
+async fn new_pools_under_a_running_order_reach_the_rig_only_once_it_is_retired() {
+    // The rig is routed to the order by its id. With the order's pools
+    // replaced, a reconnect alone finds the rig still routed to that order and
+    // bundles back onto the replaced pool; retiring the rig makes the
+    // reconnect build a fresh one from the order.
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_addr = pool_b.local_addr().unwrap();
+    let (a_tx, _a_rx) = mpsc::unbounded_channel::<u32>();
+    let (b_tx, _b_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(mock_pool_multi(
+        pool_a,
+        vec![0xAA; 8],
+        7,
+        NoiseKeys::generate(),
+        a_tx,
+    ));
+    tokio::spawn(mock_pool_multi(
+        pool_b,
+        vec![0xBB; 8],
+        99,
+        NoiseKeys::generate(),
+        b_tx,
+    ));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let sv2_rigs: Arc<Sv2RigRegistry> = Default::default();
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: sv2_rigs.clone(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    let worker = "bc1qSELLER.rig1";
+    let order = orders
+        .create(
+            worker.to_string(),
+            ext_target(&a_addr.to_string(), "acctA"),
+            None,
+            crate::orders::now_ms() + 60_000,
+            1.0,
+            1.0,
+        )
+        .await
+        .unwrap();
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (_c, p) = m1.open(worker, 1).await.unwrap();
+    assert_eq!(p, vec![0xAA; 8], "the rental starts on pool A");
+
+    orders
+        .set_pools(&order.id, &ext_target(&b_addr.to_string(), "acctB"), None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A reconnect alone: back onto the replaced pool.
+    for s in registry.get_all(worker).await {
+        s.force_reconnect();
+    }
+    await_closed(&mut m1).await;
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    m2.setup().await.unwrap();
+    let (_c, p) = m2.open(worker, 1).await.unwrap();
+    assert_eq!(p, vec![0xAA; 8], "the rig still holds the replaced pool");
+
+    // Retired: the miner is dropped and its reconnect opens on the new pool.
+    assert!(sv2_rigs.retire(&registry, worker).await);
+    await_closed(&mut m2).await;
+    let mut m3 = MockMiner::connect(proxy_addr).await.unwrap();
+    m3.setup().await.unwrap();
+    let (_c, p) = m3.open(worker, 1).await.unwrap();
+    assert_eq!(
+        p,
+        vec![0xBB; 8],
+        "a fresh rig opens on the order's new pool"
+    );
+
+    let st = registry.aggregated_status(worker).await.unwrap();
+    assert_eq!(st.routing, "rented");
+    assert_eq!(st.order_id.as_deref(), Some(order.id.as_str()));
+    assert!(!sv2_rigs.retire(&registry, "bc1qSELLER.none").await);
+}
+
+#[tokio::test]
+async fn replacing_a_running_orders_pools_over_the_api_moves_its_sv2_miner() {
+    use tower::ServiceExt;
+    let pool_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = pool_a.local_addr().unwrap();
+    let pool_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_addr = pool_b.local_addr().unwrap();
+    // Pools that also hand the probe a job.
+    let (a_tx, _a_rx) = mpsc::unbounded_channel();
+    let (b_tx, _b_rx) = mpsc::unbounded_channel();
+    for (listener, prefix, cid, tx) in [
+        (pool_a, vec![0xAA; 4], 7, a_tx),
+        (pool_b, vec![0xBB; 4], 99, b_tx),
+    ] {
+        tokio::spawn(crate::proto::relay::sv2_translate_tests::mock_sv2_pool(
+            listener,
+            NoiseKeys::generate(),
+            prefix,
+            cid,
+            tx,
+        ));
+    }
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: Default::default(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    let app = crate::api::router(crate::api::AppState {
+        registry: registry.clone(),
+        sellers: ctx.sellers.clone(),
+        orders: orders.clone(),
+        hashrate: crate::hashrate::HashrateStore::new(db.clone()),
+        api_token: "t".into(),
+        chain: None,
+        sv2_rigs: ctx.sv2_rigs.clone(),
+    });
+    let worker = "bc1qSELLER.rig1";
+    let order = orders
+        .create(
+            worker.to_string(),
+            ext_target(&a_addr.to_string(), "acctA"),
+            None,
+            crate::orders::now_ms() + 60_000,
+            1.0,
+            1.0,
+        )
+        .await
+        .unwrap();
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+
+    let mut m1 = MockMiner::connect(proxy_addr).await.unwrap();
+    m1.setup().await.unwrap();
+    let (_c, p) = m1.open(worker, 1).await.unwrap();
+    assert_eq!(p, vec![0xAA; 4], "the rental starts on pool A");
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::put(format!("/api/orders/{}/pools", order.id))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer t")
+                .body(axum::body::Body::from(
+                    json!({"url": b_addr.to_string(), "user": "acctB"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["reconnected"], 1, "the rig's one session is dropped");
+
+    await_closed(&mut m1).await;
+    let mut m2 = MockMiner::connect(proxy_addr).await.unwrap();
+    m2.setup().await.unwrap();
+    let (_c, p) = m2.open(worker, 1).await.unwrap();
+    assert_eq!(p, vec![0xBB; 4], "the miner comes back on the new pool");
+    let st = registry.aggregated_status(worker).await.unwrap();
+    assert_eq!(st.order_id.as_deref(), Some(order.id.as_str()));
+}

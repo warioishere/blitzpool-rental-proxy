@@ -355,7 +355,7 @@ async fn check_chain(job: &PoolJob, chain: &Electrum) -> Result<(), PoolRefusal>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::chain::tests::{mock_electrum, BLOCK1_HEADER};
     use crate::proto::sv2::keys::NoiseKeys;
@@ -368,7 +368,7 @@ mod tests {
 
     /// How the mock SV1 pool behaves after `mining.authorize`.
     #[derive(Clone)]
-    enum Sv1Pool {
+    pub(crate) enum Sv1Pool {
         /// Accept the login and send a job building block `height` on `prev`.
         Job { height: u32, prev: [u8; 32] },
         /// Refuse the login.
@@ -448,7 +448,7 @@ mod tests {
         }
     }
 
-    async fn sv1_pool(mode: Sv1Pool) -> UpstreamTarget {
+    pub(crate) async fn sv1_pool(mode: Sv1Pool) -> UpstreamTarget {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(mock_sv1_pool(listener, mode));

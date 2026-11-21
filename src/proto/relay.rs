@@ -1288,6 +1288,13 @@ pub async fn handle_seller_miner(
                             .await;
                         let auth_reply = RpcMessage::response(msg.id.clone(), json!(true));
                         let _ = to_miner.send(auth_reply.to_line());
+                        // Resolved again now that the session is registered. A
+                        // rent, cancel, change of an order's pools or idle-pool
+                        // edit stored since the admission check above signalled
+                        // the sessions registered then, not this one; one stored
+                        // from here on reaches it through its reconnect signal.
+                        let order = orders.active_for_worker(&w, crate::orders::now_ms()).await;
+                        let rig = sellers.default_pool(&w).await;
                         // Where this worker should mine: its active rental's target,
                         // else its seller default pool.
                         let want = order
@@ -1861,6 +1868,125 @@ pub(crate) mod sv2_translate_tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn replacing_a_running_orders_pools_over_the_api_moves_its_sv1_miner() {
+        use crate::probe::tests::{sv1_pool, Sv1Pool};
+        use tower::ServiceExt;
+        let job = Sv1Pool::Job {
+            height: 2,
+            prev: [0; 32],
+        };
+        let pool_a = sv1_pool(job.clone()).await;
+        let pool_b = sv1_pool(job).await;
+
+        let registry = crate::registry::Registry::new();
+        let db = crate::db::test_pool().await;
+        let orders = crate::orders::OrderStore::new(db.clone());
+        // The handshake runs against pool A, the order's first pool.
+        let ctx = ProxyContext {
+            default_target: Some(pool_a.clone()),
+            registry: registry.clone(),
+            sv2_rigs: Default::default(),
+            sellers: crate::store::SellerStore::new(db.clone()),
+            orders: orders.clone(),
+        };
+        let app = crate::api::router(crate::api::AppState {
+            registry: registry.clone(),
+            sellers: ctx.sellers.clone(),
+            orders: orders.clone(),
+            hashrate: crate::hashrate::HashrateStore::new(db.clone()),
+            api_token: "t".into(),
+            chain: None,
+            sv2_rigs: ctx.sv2_rigs.clone(),
+        });
+        let worker = "bc1qSELLER.rig1";
+        let order = orders
+            .create(worker.into(), pool_a.clone(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = proxy.accept().await.unwrap();
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let _ = handle_seller_miner(sock, peer.to_string(), ctx).await;
+                });
+            }
+        });
+        // An extranonce-capable miner, so the proxy moves it within the
+        // connection when the handshake pool is not the order's.
+        async fn login(proxy_addr: std::net::SocketAddr) -> MockSv1Miner {
+            let mut miner = MockSv1Miner::connect(proxy_addr).await;
+            miner
+                .send(r#"{"id":2,"method":"mining.subscribe","params":["miner/1"]}"#)
+                .await;
+            let _ = miner.read_response(2).await;
+            miner
+                .send(r#"{"id":3,"method":"mining.extranonce.subscribe","params":[]}"#)
+                .await;
+            let _ = miner.read_response(3).await;
+            miner
+                .send(r#"{"id":4,"method":"mining.authorize","params":["bc1qSELLER.rig1","x"]}"#)
+                .await;
+            assert_eq!(miner.read_response(4).await, json!(true));
+            miner
+        }
+        let upstream_of = |want: String| {
+            let registry = registry.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(st) = registry.aggregated_status("bc1qSELLER.rig1").await {
+                            if st.upstream_url == want && st.routing == "rented" {
+                                return st;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the rig should mine the rental on the expected pool within 5s")
+            }
+        };
+
+        let mut m1 = login(proxy_addr).await;
+        upstream_of(pool_a.url.clone()).await;
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::put(format!("/api/orders/{}/pools", order.id))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer t")
+                    .body(axum::body::Body::from(
+                        json!({"url": pool_b.url, "user": pool_b.user, "pass": pool_b.password})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["reconnected"], 1);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(_)) = m1.lines.next_line().await {}
+        })
+        .await
+        .expect("the proxy should close the miner connection within 5s");
+
+        let _m2 = login(proxy_addr).await;
+        let st = upstream_of(pool_b.url.clone()).await;
+        assert_eq!(st.order_id.as_deref(), Some(order.id.as_str()));
     }
 
     #[tokio::test]
