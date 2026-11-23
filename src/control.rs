@@ -12,9 +12,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::session::Routing;
-#[cfg(test)]
-use crate::session::UpstreamTarget;
+use crate::session::{Routing, UpstreamTarget};
 
 /// Minimum submitted-share sample before the accept-ratio is considered
 /// meaningful (avoids flagging on early startup noise).
@@ -110,6 +108,14 @@ impl AnySession {
         }
     }
 
+    /// The session's routing and the pool it relays to, read together.
+    pub async fn upstream(&self) -> (Routing, UpstreamTarget) {
+        match self {
+            AnySession::Sv1(s) => s.upstream().await,
+            AnySession::Sv2(s) => s.upstream().await,
+        }
+    }
+
     /// The order store this session credits its rental work to.
     fn orders(&self) -> &crate::orders::OrderStore {
         match self {
@@ -152,6 +158,20 @@ impl AnySession {
             _ => false,
         }
     }
+}
+
+/// Move every miner of `worker` onto the pools its order names now: retire
+/// its SV2 bundle rig, whose routing names the order and not the pool (a
+/// reconnecting miner would bundle back onto the rig's current upstream), and
+/// drop every session for a fresh handshake. Returns how many connections
+/// were dropped.
+pub async fn reconnect_worker(
+    registry: &crate::registry::Registry,
+    sv2_rigs: &crate::proto::sv2::relay::Sv2RigRegistry,
+    worker: &str,
+) -> usize {
+    let retired = sv2_rigs.retire(registry, worker).await;
+    registry.force_reconnect_all(worker).await + usize::from(retired)
 }
 
 /// Per-session supervisor: when the active upstream drops, re-establish it

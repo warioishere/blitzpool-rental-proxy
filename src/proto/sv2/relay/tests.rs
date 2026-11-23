@@ -5037,3 +5037,140 @@ async fn replacing_a_running_orders_pools_over_the_api_moves_its_sv2_miner() {
     let st = registry.aggregated_status(worker).await.unwrap();
     assert_eq!(st.order_id.as_deref(), Some(order.id.as_str()));
 }
+
+#[tokio::test]
+async fn a_rig_on_its_rentals_fallback_moves_back_to_the_primary_through_a_fresh_rig() {
+    // The rig is routed to the order by its id, so a reconnect alone would
+    // bundle the miner back onto the rig's fallback upstream; the failback
+    // retires the rig, and the fresh one opens on the primary. A primary that
+    // stays down is probed ever less often, and a move that does not hold
+    // counts as a failure.
+    use crate::failback::Round;
+    use crate::probe::tests::switchable;
+    use std::sync::atomic::Ordering;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let pool = |prefix: u8, cid: u32| {
+        let tx = tx.clone();
+        async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(crate::proto::relay::sv2_translate_tests::mock_sv2_pool(
+                listener,
+                NoiseKeys::generate(),
+                vec![prefix; 4],
+                cid,
+                tx,
+            ));
+            addr.to_string()
+        }
+    };
+    let (primary, primary_up) = switchable(&ext_target(&pool(0xAA, 7).await, "acctP")).await;
+    let fallback = ext_target(&pool(0xFB, 99).await, "acctF");
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let registry = crate::registry::Registry::new();
+    let db = crate::db::test_pool().await;
+    let orders = crate::orders::OrderStore::new(db.clone());
+    let sv2_rigs: Arc<Sv2RigRegistry> = Default::default();
+    let ctx = ProxyContext {
+        default_target: None,
+        registry: registry.clone(),
+        sv2_rigs: sv2_rigs.clone(),
+        sellers: crate::store::SellerStore::new(db.clone()),
+        orders: orders.clone(),
+    };
+    let worker = "bc1qSELLER.rig1";
+    let order = orders
+        .create(
+            worker.to_string(),
+            primary,
+            Some(fallback),
+            crate::orders::now_ms() + 60_000,
+            1.0,
+            1.0,
+        )
+        .await
+        .unwrap();
+    let keys = NoiseKeys::generate();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = proxy.accept().await.unwrap();
+            let ctx = ctx.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let _ = handle_seller_miner_sv2(sock, peer.to_string(), ctx, keys).await;
+            });
+        }
+    });
+    let connect = || async {
+        let mut miner = MockMiner::connect(proxy_addr).await.unwrap();
+        miner.setup().await.unwrap();
+        let (_c, prefix) = miner.open(worker, 1).await.unwrap();
+        (miner, prefix)
+    };
+
+    let (mut m1, p) = connect().await;
+    assert_eq!(
+        p,
+        vec![0xFB; 4],
+        "the primary is down: the rental mines on its fallback"
+    );
+
+    let mut failback = crate::failback::Failback::default();
+    let id = order.id.clone();
+    let round = |probed: bool, moved: bool| Round {
+        probed: if probed { vec![id.clone()] } else { vec![] },
+        moved: if moved { vec![id.clone()] } else { vec![] },
+    };
+    let mut rounds = Vec::new();
+    for _ in 0..7 {
+        rounds.push(failback.round(&orders, &registry, &sv2_rigs, None).await);
+    }
+    let (p, w) = (round(true, false), round(false, false));
+    assert_eq!(
+        rounds,
+        vec![
+            p.clone(),
+            p.clone(),
+            w.clone(),
+            p.clone(),
+            w.clone(),
+            w.clone(),
+            w.clone()
+        ],
+        "three failed probes, each followed by a longer wait"
+    );
+
+    primary_up.store(true, Ordering::SeqCst);
+    for pass in 1..3 {
+        let r = failback.round(&orders, &registry, &sv2_rigs, None).await;
+        assert_eq!(r, round(true, false), "pass {pass} of 3");
+    }
+    let r = failback.round(&orders, &registry, &sv2_rigs, None).await;
+    assert_eq!(r, round(true, true), "pass 3 of 3");
+    await_closed(&mut m1).await;
+
+    // The primary is gone again by the time the miner reconnects.
+    primary_up.store(false, Ordering::SeqCst);
+    let (mut m2, p) = connect().await;
+    assert_eq!(p, vec![0xFB; 4], "the move did not hold");
+    let r = failback.round(&orders, &registry, &sv2_rigs, None).await;
+    assert_eq!(
+        r,
+        round(false, false),
+        "a move that did not hold is a failure"
+    );
+
+    primary_up.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        failback.round(&orders, &registry, &sv2_rigs, None).await;
+    }
+    let r = failback.round(&orders, &registry, &sv2_rigs, None).await;
+    assert_eq!(r, round(true, true));
+    await_closed(&mut m2).await;
+    let (_m3, p) = connect().await;
+    assert_eq!(p, vec![0xAA; 4], "the miner comes back on the primary");
+    let st = registry.aggregated_status(worker).await.unwrap();
+    assert_eq!(st.order_id.as_deref(), Some(order.id.as_str()));
+}

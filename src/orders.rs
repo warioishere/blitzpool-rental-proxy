@@ -211,25 +211,31 @@ impl Order {
     }
 
     /// Run `connect` against the order's pool, then against its fallback pool
-    /// when the primary fails. Returns the pool that took the connection.
-    pub async fn connect_with_fallback<F, Fut>(
+    /// when the primary fails. Returns the pool that took the connection and
+    /// what `connect` returned for it.
+    pub async fn connect_with_fallback<F, Fut, T>(
         &self,
         mut connect: F,
-    ) -> anyhow::Result<UpstreamTarget>
+    ) -> anyhow::Result<(UpstreamTarget, T)>
     where
         F: FnMut(UpstreamTarget) -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<()>>,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
         let primary_err = match connect(self.target.clone()).await {
-            Ok(()) => return Ok(self.target.clone()),
+            Ok(t) => return Ok((self.target.clone(), t)),
             Err(e) => e,
         };
         let Some(fallback) = &self.fallback else {
             return Err(primary_err);
         };
         warn!(order = %self.id, error = %primary_err, "primary buyer pool unreachable — using fallback");
-        connect(fallback.clone()).await?;
-        Ok(fallback.clone())
+        let t = connect(fallback.clone()).await?;
+        Ok((fallback.clone(), t))
+    }
+
+    /// Is `pool` one of this order's pools (its primary or its fallback)?
+    pub fn uses_pool(&self, pool: &UpstreamTarget) -> bool {
+        self.target == *pool || self.fallback.as_ref() == Some(pool)
     }
 
     /// True when a budgeted rental has consumed its prepaid credit.
@@ -760,14 +766,11 @@ pub fn spawn_expiry(orders: Arc<OrderStore>, registry: Arc<Registry>) -> JoinHan
             // funding_exhausted sees the just-delivered work.
             orders.flush().await;
             for o in orders.take_finished(now_ms()).await {
-                let sessions = registry.get_all(&o.worker).await;
-                if !sessions.is_empty() {
-                    // The order is already marked ended, so a reconnect resolves
-                    // back to the idle pool. Force it rather than a live re-point.
-                    for session in &sessions {
-                        session.force_reconnect();
-                    }
-                    info!(order = %o.id, worker = %o.worker, sessions = sessions.len(), reason = ?o.end_reason, detail = ?o.end_detail, "rental finished → miners reconnecting to default");
+                // The order is already marked ended, so a reconnect resolves
+                // back to the idle pool. Force it rather than a live re-point.
+                let sessions = registry.force_reconnect_all(&o.worker).await;
+                if sessions > 0 {
+                    info!(order = %o.id, worker = %o.worker, sessions, reason = ?o.end_reason, detail = ?o.end_detail, "rental finished → miners reconnecting to default");
                 }
             }
         }

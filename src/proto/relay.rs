@@ -49,6 +49,9 @@ use stratum_core::sv1_api::{json_rpc as sv1_json, methods::client_to_server, uti
 
 type Tx = mpsc::UnboundedSender<String>;
 
+/// How long a closing miner connection gets to write its last lines.
+const MINER_DRAIN: Duration = Duration::from_secs(1);
+
 /// How long a reconnect-hint stays valid (the miner should reconnect at once).
 const RECONNECT_HINT_TTL: Duration = Duration::from_secs(120);
 
@@ -62,6 +65,19 @@ const RECONNECT_HINT_TTL: Duration = Duration::from_secs(120);
 /// ample margin (50ms is enough only for LAN-local miners).
 const EXTRANONCE_GRACE: Duration = Duration::from_millis(250);
 
+/// Where a reconnecting miner's handshake runs, and as which worker.
+#[derive(Debug, Clone)]
+enum ReconnectHint {
+    /// The seller's idle pool, for `worker`.
+    Pool {
+        pool: UpstreamTarget,
+        worker: String,
+    },
+    /// A rental: the order's primary, or its fallback when the primary is
+    /// unreachable, for the order's worker.
+    Order(String),
+}
+
 /// Per-source-IP reconnect hints. When a miner that can't take a live
 /// extranonce change authorizes onto a pool different from its handshake pool,
 /// we remember that pool here, send `client.reconnect`, and on the reconnect run
@@ -69,8 +85,8 @@ const EXTRANONCE_GRACE: Duration = Duration::from_millis(250);
 /// from its first job and no mid-session switch is needed. Keyed by source IP;
 /// fine for the common one-miner-per-IP case (a NAT farm whose rigs sit on
 /// different pools just costs an extra reconnect to converge).
-fn reconnect_hints() -> &'static Mutex<HashMap<String, (UpstreamTarget, Instant)>> {
-    static HINTS: OnceLock<Mutex<HashMap<String, (UpstreamTarget, Instant)>>> = OnceLock::new();
+fn reconnect_hints() -> &'static Mutex<HashMap<String, (ReconnectHint, Instant)>> {
+    static HINTS: OnceLock<Mutex<HashMap<String, (ReconnectHint, Instant)>>> = OnceLock::new();
     HINTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -273,6 +289,12 @@ impl Session {
     /// Current upstream this session relays to (idle pool or rented target).
     pub async fn active_target(&self) -> UpstreamTarget {
         self.inner.lock().await.active.target.clone()
+    }
+
+    /// The session's routing and the pool it relays to, read together.
+    pub async fn upstream(&self) -> (Routing, UpstreamTarget) {
+        let i = self.inner.lock().await;
+        (i.routing.clone(), i.active.target.clone())
     }
 
     /// Mark this session as serving `order` WITHOUT reconnecting the upstream —
@@ -1028,12 +1050,30 @@ async fn run_vardiff(session: Arc<Session>) {
     }
 }
 
-fn spawn_writer(
+fn spawn_writer(half: OwnedWriteHalf, rx: mpsc::UnboundedReceiver<String>) -> JoinHandle<()> {
+    spawn_draining_writer(half, rx, std::future::pending())
+}
+
+/// Write each line from `rx` to `half`. Once `drain` completes the queue
+/// closes: the lines already in it are written, then the task ends.
+fn spawn_draining_writer(
     mut half: OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<String>,
+    drain: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(line) = rx.recv().await {
+        tokio::pin!(drain);
+        let mut draining = false;
+        loop {
+            let line = tokio::select! {
+                line = rx.recv() => line,
+                () = &mut drain, if !draining => {
+                    draining = true;
+                    rx.close();
+                    continue;
+                }
+            };
+            let Some(line) = line else { break };
             if half.write_all(line.as_bytes()).await.is_err() {
                 break;
             }
@@ -1090,31 +1130,68 @@ pub async fn handle_seller_miner(
     // before the worker is known at mining.authorize, so it falls back to the
     // bootstrap pool. Register-only: unregistered workers are rejected at
     // authorize (below); the bootstrap never serves them.
-    let resolved_target = {
+    let hint = {
         let mut hints = reconnect_hints().lock().await;
         match hints.remove(&ip) {
-            Some((t, at)) if at.elapsed() < RECONNECT_HINT_TTL => Some(t),
+            Some((hint, at)) if at.elapsed() < RECONNECT_HINT_TTL => Some(hint),
             _ => None,
         }
     };
-    let Some(handshake_target) = resolved_target.or(default_target) else {
-        anyhow::bail!(
-            "SV1 needs a handshake bootstrap pool (RENTAL_PROXY_POOL_URL); \
-             register-only SV1 is unavailable without one — use SV2"
-        );
+    // A rental's hint names the order, so its pools are read now: an order
+    // that ended since leaves the handshake on the bootstrap pool, and the
+    // authorize below moves the miner from there.
+    let hinted_order = match &hint {
+        Some(ReconnectHint::Order(id)) => orders
+            .get(id)
+            .await
+            .filter(|o| o.is_live(crate::orders::now_ms())),
+        _ => None,
     };
     let _ = miner.set_nodelay(true);
     let (miner_r, miner_w) = miner.into_split();
 
-    // Connect + handshake the bootstrap upstream (protocol auto-detected). The
-    // worker isn't known until authorize, so an SV2 channel opens under the bare
-    // account here; a later switch (at authorize/rent) re-opens with the worker.
-    let raw = connect_raw(&handshake_target, None, &handshake_target.user)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect upstream {}: {e}", handshake_target.url))?;
+    // Connect + handshake the upstream (protocol auto-detected). A hint names
+    // the worker, so the upstream is authorized as the worker the submits
+    // carry; the bootstrap handshake runs before the worker is known, so an
+    // SV2 channel opens under the bare account there and a later switch (at
+    // authorize/rent) re-opens with the worker.
+    let connect = |target: UpstreamTarget, identity: String| async move {
+        connect_raw(&target, None, &identity)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect upstream {}: {e}", target.url))
+    };
+    let (handshake_target, raw) = match (hint, &hinted_order) {
+        (_, Some(order)) => {
+            order
+                .connect_with_fallback(|target| {
+                    let identity = upstream_worker(&target.user, &order.worker);
+                    connect(target, identity)
+                })
+                .await?
+        }
+        (Some(ReconnectHint::Pool { pool, worker }), _) => {
+            let identity = upstream_worker(&pool.user, &worker);
+            (pool.clone(), connect(pool, identity).await?)
+        }
+        _ => {
+            let Some(target) = default_target else {
+                anyhow::bail!(
+                    "SV1 needs a handshake bootstrap pool (RENTAL_PROXY_POOL_URL); \
+                     register-only SV1 is unavailable without one — use SV2"
+                );
+            };
+            let identity = target.user.clone();
+            (target.clone(), connect(target, identity).await?)
+        }
+    };
+    // The order this handshake chose a pool of, with the primary it tried.
+    let handshake_choice = hinted_order.map(|o| (o.id, o.target));
 
     let (to_miner, to_miner_rx) = mpsc::unbounded_channel::<String>();
-    let miner_writer = spawn_writer(miner_w, to_miner_rx);
+    let (drain_miner, drain_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut miner_writer = spawn_draining_writer(miner_w, to_miner_rx, async {
+        let _ = drain_rx.await;
+    });
 
     let (died_tx, died_rx) = mpsc::unbounded_channel::<u64>();
     let (placeholder_to_up, _placeholder_rx) = mpsc::unbounded_channel::<String>();
@@ -1187,8 +1264,7 @@ pub async fn handle_seller_miner(
                 // Operator-initiated pool change: close the connection so the
                 // miner reconnects and re-handshakes against the updated upstream
                 // (correct extranonce from job 1). A bare close reliably triggers
-                // a reconnect to the same proxy; a client.reconnect notification
-                // would race the writer teardown and be dropped before flushing.
+                // a reconnect to the same proxy.
                 _ = session.reconnect.notified() => {
                     info!(%peer, "forcing miner reconnect for pool change");
                     break;
@@ -1295,22 +1371,41 @@ pub async fn handle_seller_miner(
                         // from here on reaches it through its reconnect signal.
                         let order = orders.active_for_worker(&w, crate::orders::now_ms()).await;
                         let rig = sellers.default_pool(&w).await;
-                        // Where this worker should mine: its active rental's target,
-                        // else its seller default pool.
-                        let want = order
-                            .as_ref()
-                            .map(|o| o.target.clone())
-                            .or_else(|| rig.clone());
+                        // Where this worker should mine: its active rental's
+                        // pools, else its seller default pool.
+                        let want = match (&order, &rig) {
+                            (Some(o), _) => Some(ReconnectHint::Order(o.id.clone())),
+                            (None, Some(rig)) => Some(ReconnectHint::Pool {
+                                pool: rig.clone(),
+                                worker: w.clone(),
+                            }),
+                            (None, None) => None,
+                        };
                         if let Some(want) = want {
-                            if session.active_target().await == want {
+                            let active = session.active_target().await;
+                            // A rental is in place on its primary, and on its
+                            // fallback only when this handshake just chose it over
+                            // the order's current primary: a handshake pool that
+                            // merely equals the fallback gets the primary tried
+                            // first.
+                            let in_place = match &order {
+                                Some(o) => {
+                                    active == o.target
+                                        || (handshake_choice.as_ref().is_some_and(
+                                            |(id, primary)| *id == o.id && *primary == o.target,
+                                        ) && o.uses_pool(&active))
+                                }
+                                None => rig.as_ref() == Some(&active),
+                            };
+                            if in_place {
                                 // Already on the right pool (resolved reconnect, or
                                 // the handshake pool happens to be it). No switch →
                                 // the miner keeps the correct extranonce.
                                 if let Some(o) = &order {
                                     session.attach_order(o.id.clone()).await;
-                                    info!(worker = %w, order = %o.id, "resumed active rental (no switch)");
+                                    info!(worker = %w, order = %o.id, upstream = %active.url, "resumed active rental (no switch)");
                                 } else {
-                                    info!(worker = %w, upstream = %want.url, "on seller default pool");
+                                    info!(worker = %w, upstream = %active.url, "on seller default pool");
                                 }
                             } else {
                                 // A switch is needed. The miner sends
@@ -1356,12 +1451,15 @@ pub async fn handle_seller_miner(
                                 }
                                 if session.inner.lock().await.extranonce_capable {
                                     // Live switch: the miner takes a set_extranonce.
-                                    let res = match &order {
-                                        Some(o) => session.switch_to(o.id.clone(), o.target.clone()).await,
-                                        None => session.set_default(want.clone()).await,
+                                    let res = match &want {
+                                        ReconnectHint::Order(id) => session.switch_to_order(id.clone()).await,
+                                        ReconnectHint::Pool { pool, .. } => session.set_default(pool.clone()).await,
                                     };
                                     match res {
-                                        Ok(()) => info!(worker = %w, upstream = %want.url, "switched upstream (extranonce-capable)"),
+                                        Ok(()) => {
+                                            let upstream = session.active_target().await.url;
+                                            info!(worker = %w, %upstream, "switched upstream (extranonce-capable)")
+                                        }
                                         Err(e) => warn!(worker = %w, error = %e, "upstream switch failed"),
                                     }
                                 } else {
@@ -1404,7 +1502,15 @@ pub async fn handle_seller_miner(
         i.active.reader.abort();
         i.active.writer.abort();
     }
-    miner_writer.abort();
+    // The last lines to the miner (a `client.reconnect`) still go out, unless
+    // the miner stops reading.
+    let _ = drain_miner.send(());
+    if tokio::time::timeout(MINER_DRAIN, &mut miner_writer)
+        .await
+        .is_err()
+    {
+        miner_writer.abort();
+    }
     info!(%peer, "relay closed");
     Ok(())
 }
@@ -1820,7 +1926,15 @@ pub(crate) mod sv2_translate_tests {
 
     impl MockSv1Miner {
         async fn connect(addr: std::net::SocketAddr) -> Self {
-            let tcp = TcpStream::connect(addr).await.unwrap();
+            Self::from_stream(TcpStream::connect(addr).await.unwrap())
+        }
+        /// Connect from the loopback address `from` (any `127.x.y.z`).
+        async fn connect_from(addr: std::net::SocketAddr, from: std::net::IpAddr) -> Self {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind(std::net::SocketAddr::new(from, 0)).unwrap();
+            Self::from_stream(socket.connect(addr).await.unwrap())
+        }
+        fn from_stream(tcp: TcpStream) -> Self {
             let _ = tcp.set_nodelay(true);
             let (r, w) = tcp.into_split();
             Self {
@@ -1870,43 +1984,31 @@ pub(crate) mod sv2_translate_tests {
         }
     }
 
-    #[tokio::test]
-    async fn replacing_a_running_orders_pools_over_the_api_moves_its_sv1_miner() {
-        use crate::probe::tests::{sv1_pool, Sv1Pool};
-        use tower::ServiceExt;
-        let job = Sv1Pool::Job {
-            height: 2,
-            prev: [0; 32],
-        };
-        let pool_a = sv1_pool(job.clone()).await;
-        let pool_b = sv1_pool(job).await;
-
-        let registry = crate::registry::Registry::new();
+    /// A proxy context whose SV1 handshake runs against `bootstrap`, plus the
+    /// control API over the same state.
+    async fn sv1_proxy_state(bootstrap: &UpstreamTarget) -> (ProxyContext, axum::Router) {
         let db = crate::db::test_pool().await;
-        let orders = crate::orders::OrderStore::new(db.clone());
-        // The handshake runs against pool A, the order's first pool.
         let ctx = ProxyContext {
-            default_target: Some(pool_a.clone()),
-            registry: registry.clone(),
+            default_target: Some(bootstrap.clone()),
+            registry: crate::registry::Registry::new(),
             sv2_rigs: Default::default(),
             sellers: crate::store::SellerStore::new(db.clone()),
-            orders: orders.clone(),
+            orders: crate::orders::OrderStore::new(db.clone()),
         };
         let app = crate::api::router(crate::api::AppState {
-            registry: registry.clone(),
+            registry: ctx.registry.clone(),
             sellers: ctx.sellers.clone(),
-            orders: orders.clone(),
-            hashrate: crate::hashrate::HashrateStore::new(db.clone()),
+            orders: ctx.orders.clone(),
+            hashrate: crate::hashrate::HashrateStore::new(db),
             api_token: "t".into(),
             chain: None,
             sv2_rigs: ctx.sv2_rigs.clone(),
         });
-        let worker = "bc1qSELLER.rig1";
-        let order = orders
-            .create(worker.into(), pool_a.clone(), None, 0, 1.0, 0.0)
-            .await
-            .unwrap();
+        (ctx, app)
+    }
 
+    /// Serve SV1 miners on a local port with `ctx`; returns the port's address.
+    async fn spawn_sv1_proxy(ctx: ProxyContext) -> std::net::SocketAddr {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1918,44 +2020,291 @@ pub(crate) mod sv2_translate_tests {
                 });
             }
         });
-        // An extranonce-capable miner, so the proxy moves it within the
-        // connection when the handshake pool is not the order's.
-        async fn login(proxy_addr: std::net::SocketAddr) -> MockSv1Miner {
-            let mut miner = MockSv1Miner::connect(proxy_addr).await;
-            miner
-                .send(r#"{"id":2,"method":"mining.subscribe","params":["miner/1"]}"#)
-                .await;
-            let _ = miner.read_response(2).await;
+        proxy_addr
+    }
+
+    /// Log a miner in as `worker`. An extranonce-capable miner is moved
+    /// within the connection when the handshake pool is not the one it
+    /// should mine on, any other one is sent `client.reconnect`.
+    async fn login_sv1(miner: &mut MockSv1Miner, worker: &str, extranonce: bool) {
+        miner
+            .send(r#"{"id":2,"method":"mining.subscribe","params":["miner/1"]}"#)
+            .await;
+        let _ = miner.read_response(2).await;
+        if extranonce {
             miner
                 .send(r#"{"id":3,"method":"mining.extranonce.subscribe","params":[]}"#)
                 .await;
             let _ = miner.read_response(3).await;
-            miner
-                .send(r#"{"id":4,"method":"mining.authorize","params":["bc1qSELLER.rig1","x"]}"#)
-                .await;
-            assert_eq!(miner.read_response(4).await, json!(true));
-            miner
         }
-        let upstream_of = |want: String| {
-            let registry = registry.clone();
-            async move {
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        if let Some(st) = registry.aggregated_status("bc1qSELLER.rig1").await {
-                            if st.upstream_url == want && st.routing == "rented" {
-                                return st;
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .expect("the rig should mine the rental on the expected pool within 5s")
-            }
-        };
+        miner
+            .send(
+                &json!({"id": 4, "method": "mining.authorize", "params": [worker, "x"]})
+                    .to_string(),
+            )
+            .await;
+        assert_eq!(miner.read_response(4).await, json!(true));
+    }
 
-        let mut m1 = login(proxy_addr).await;
-        upstream_of(pool_a.url.clone()).await;
+    /// Wait until `worker` mines its rental on `url`.
+    async fn await_rented_on(
+        registry: &crate::registry::Registry,
+        worker: &str,
+        url: &str,
+    ) -> crate::control::SessionStatus {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(st) = registry.aggregated_status(worker).await {
+                    if st.upstream_url == url && st.routing == "rented" {
+                        return st;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{worker} should mine its rental on {url} within 5s"))
+    }
+
+    /// Wait until the proxy closes `miner`'s connection.
+    async fn await_sv1_closed(miner: &mut MockSv1Miner) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(_)) = miner.lines.next_line().await {}
+        })
+        .await
+        .expect("the proxy should close the miner connection within 5s");
+    }
+
+    /// A pool that is down: every connection to it is closed at once.
+    async fn down_pool() -> UpstreamTarget {
+        use crate::probe::tests::{sv1_pool, switchable, Sv1Pool};
+        switchable(&sv1_pool(Sv1Pool::Refuse).await).await.0
+    }
+
+    #[tokio::test]
+    async fn an_sv1_miner_mines_a_rental_on_its_fallback_while_the_primary_is_down() {
+        use crate::probe::tests::{sv1_pool, Sv1Pool};
+        let job = Sv1Pool::Job {
+            height: 2,
+            prev: [0; 32],
+        };
+        let bootstrap = sv1_pool(job.clone()).await;
+        let fallback = sv1_pool(job).await;
+        let (ctx, _) = sv1_proxy_state(&bootstrap).await;
+        let worker = "bc1qSELLER.rig1";
+        ctx.orders
+            .create(
+                worker.into(),
+                down_pool().await,
+                Some(fallback.clone()),
+                0,
+                1.0,
+                0.0,
+            )
+            .await
+            .unwrap();
+        let registry = ctx.registry.clone();
+        let proxy_addr = spawn_sv1_proxy(ctx).await;
+
+        let mut miner = MockSv1Miner::connect(proxy_addr).await;
+        login_sv1(&mut miner, worker, true).await;
+        await_rented_on(&registry, worker, &fallback.url).await;
+    }
+
+    #[tokio::test]
+    async fn an_sv1_miner_handshaking_on_its_rentals_fallback_still_gets_the_primary() {
+        use crate::probe::tests::{sv1_pool, Sv1Pool};
+        let job = Sv1Pool::Job {
+            height: 2,
+            prev: [0; 32],
+        };
+        let primary = sv1_pool(job.clone()).await;
+        let fallback = sv1_pool(job).await;
+        // The bootstrap pool is the rental's fallback.
+        let (ctx, _) = sv1_proxy_state(&fallback).await;
+        let worker = "bc1qSELLER.rig4";
+        ctx.orders
+            .create(worker.into(), primary.clone(), Some(fallback), 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let registry = ctx.registry.clone();
+        let proxy_addr = spawn_sv1_proxy(ctx).await;
+
+        let mut miner = MockSv1Miner::connect(proxy_addr).await;
+        login_sv1(&mut miner, worker, true).await;
+        await_rented_on(&registry, worker, &primary.url).await;
+    }
+
+    #[tokio::test]
+    async fn an_sv1_miner_without_extranonce_support_reconnects_onto_the_fallback() {
+        use crate::probe::tests::{sv1_pool, Sv1Pool};
+        let job = Sv1Pool::Job {
+            height: 2,
+            prev: [0; 32],
+        };
+        let bootstrap = sv1_pool(job.clone()).await;
+        let fallback = sv1_pool(job).await;
+        let (ctx, _) = sv1_proxy_state(&bootstrap).await;
+        let worker = "bc1qSELLER.rig2";
+        ctx.orders
+            .create(
+                worker.into(),
+                down_pool().await,
+                Some(fallback.clone()),
+                0,
+                1.0,
+                0.0,
+            )
+            .await
+            .unwrap();
+        let registry = ctx.registry.clone();
+        let proxy_addr = spawn_sv1_proxy(ctx).await;
+
+        // Reconnect hints are kept per source IP; an address of its own keeps
+        // other tests' miners from taking this one's hint.
+        let from = "127.0.0.42".parse().unwrap();
+        let mut first = MockSv1Miner::connect_from(proxy_addr, from).await;
+        login_sv1(&mut first, worker, false).await;
+        first.read_method("client.reconnect").await;
+        await_sv1_closed(&mut first).await;
+
+        let mut second = MockSv1Miner::connect_from(proxy_addr, from).await;
+        login_sv1(&mut second, worker, false).await;
+        await_rented_on(&registry, worker, &fallback.url).await;
+    }
+
+    #[tokio::test]
+    async fn a_reconnected_sv1_miner_logs_in_to_its_rentals_pool_as_its_rig() {
+        // A strict pool takes the login only as the worker the submits carry.
+        use crate::probe::tests::{sv1_pool, Sv1Pool};
+        let job = Sv1Pool::Job {
+            height: 2,
+            prev: [0; 32],
+        };
+        let bootstrap = sv1_pool(job).await;
+        let primary = sv1_pool(Sv1Pool::JobFor {
+            worker: "bc1qBUYER.rig5-bp-proxy".into(),
+            height: 2,
+            prev: [0; 32],
+        })
+        .await;
+        let (ctx, _) = sv1_proxy_state(&bootstrap).await;
+        let worker = "bc1qSELLER.rig5";
+        ctx.orders
+            .create(worker.into(), primary.clone(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let registry = ctx.registry.clone();
+        let proxy_addr = spawn_sv1_proxy(ctx).await;
+
+        let from = "127.0.0.43".parse().unwrap();
+        let mut first = MockSv1Miner::connect_from(proxy_addr, from).await;
+        login_sv1(&mut first, worker, false).await;
+        await_sv1_closed(&mut first).await;
+        let mut second = MockSv1Miner::connect_from(proxy_addr, from).await;
+        login_sv1(&mut second, worker, false).await;
+        await_rented_on(&registry, worker, &primary.url).await;
+    }
+
+    #[tokio::test]
+    async fn a_rental_on_its_fallback_moves_back_once_its_primary_passes_the_probe_in_a_row() {
+        use crate::failback::Round;
+        use crate::probe::tests::{sv1_pool, switchable, Sv1Pool};
+        use std::sync::atomic::Ordering;
+        let job = Sv1Pool::Job {
+            height: 2,
+            prev: [0; 32],
+        };
+        // The primary comes and goes on its address.
+        let (primary, primary_up) = switchable(&sv1_pool(job.clone()).await).await;
+        let bootstrap = sv1_pool(job.clone()).await;
+        let fallback = sv1_pool(job.clone()).await;
+        let (ctx, _) = sv1_proxy_state(&bootstrap).await;
+        let worker = "bc1qSELLER.rig3";
+        let order = ctx
+            .orders
+            .create(
+                worker.into(),
+                primary.clone(),
+                Some(fallback.clone()),
+                0,
+                1.0,
+                0.0,
+            )
+            .await
+            .unwrap();
+        let (registry, orders, sv2_rigs) = (
+            ctx.registry.clone(),
+            ctx.orders.clone(),
+            ctx.sv2_rigs.clone(),
+        );
+        let proxy_addr = spawn_sv1_proxy(ctx).await;
+
+        let mut m1 = MockSv1Miner::connect(proxy_addr).await;
+        login_sv1(&mut m1, worker, true).await;
+        await_rented_on(&registry, worker, &fallback.url).await;
+
+        let mut failback = crate::failback::Failback::default();
+        macro_rules! round {
+            () => {
+                failback.round(&orders, &registry, &sv2_rigs, None).await
+            };
+        }
+        let probed = Round {
+            probed: vec![order.id.clone()],
+            moved: vec![],
+        };
+        assert_eq!(round!(), probed, "the primary is still down");
+        primary_up.store(true, Ordering::SeqCst);
+        assert_eq!(round!(), probed, "one pass");
+        assert_eq!(round!(), probed, "two passes");
+        primary_up.store(false, Ordering::SeqCst);
+        assert_eq!(round!(), probed, "a failed probe starts the count again");
+        primary_up.store(true, Ordering::SeqCst);
+        assert_eq!(round!(), probed, "one pass");
+        assert_eq!(round!(), probed, "two passes");
+        let moved = Round {
+            probed: vec![order.id.clone()],
+            moved: vec![order.id.clone()],
+        };
+        assert_eq!(round!(), moved, "three passes in a row");
+
+        await_sv1_closed(&mut m1).await;
+        let mut m2 = MockSv1Miner::connect(proxy_addr).await;
+        login_sv1(&mut m2, worker, true).await;
+        await_rented_on(&registry, worker, &primary.url).await;
+        assert_eq!(
+            round!(),
+            Round::default(),
+            "a rental on its primary is not probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_a_running_orders_pools_over_the_api_moves_its_sv1_miner() {
+        use crate::probe::tests::{sv1_pool, Sv1Pool};
+        use tower::ServiceExt;
+        let job = Sv1Pool::Job {
+            height: 2,
+            prev: [0; 32],
+        };
+        let pool_a = sv1_pool(job.clone()).await;
+        let pool_b = sv1_pool(job).await;
+
+        // The handshake runs against pool A, the order's first pool.
+        let (ctx, app) = sv1_proxy_state(&pool_a).await;
+        let registry = ctx.registry.clone();
+        let worker = "bc1qSELLER.rig1";
+        let order = ctx
+            .orders
+            .create(worker.into(), pool_a.clone(), None, 0, 1.0, 0.0)
+            .await
+            .unwrap();
+        let proxy_addr = spawn_sv1_proxy(ctx).await;
+
+        let mut m1 = MockSv1Miner::connect(proxy_addr).await;
+        login_sv1(&mut m1, worker, true).await;
+        await_rented_on(&registry, worker, &pool_a.url).await;
 
         let resp = app
             .oneshot(
@@ -1978,14 +2327,11 @@ pub(crate) mod sv2_translate_tests {
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["reconnected"], 1);
 
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Ok(Some(_)) = m1.lines.next_line().await {}
-        })
-        .await
-        .expect("the proxy should close the miner connection within 5s");
+        await_sv1_closed(&mut m1).await;
 
-        let _m2 = login(proxy_addr).await;
-        let st = upstream_of(pool_b.url.clone()).await;
+        let mut m2 = MockSv1Miner::connect(proxy_addr).await;
+        login_sv1(&mut m2, worker, true).await;
+        let st = await_rented_on(&registry, worker, &pool_b.url).await;
         assert_eq!(st.order_id.as_deref(), Some(order.id.as_str()));
     }
 

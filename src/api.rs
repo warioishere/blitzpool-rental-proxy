@@ -233,20 +233,6 @@ async fn get_seller_history(
     })))
 }
 
-/// Force every connected miner of `worker` to reconnect; returns how many
-/// were connected. Each session re-resolves its upstream from current state on
-/// reconnect (a new rental's buyer pool, or the idle pool after a rental
-/// ends), so the caller MUST persist that state first. A clean reconnect —
-/// rather than a live re-point — avoids miners that ignore a mid-session
-/// extranonce change and keep wasting shares on the old pool.
-async fn reconnect_all(s: &AppState, worker: &str) -> usize {
-    let sessions = s.registry.get_all(worker).await;
-    for sess in &sessions {
-        sess.force_reconnect();
-    }
-    sessions.len()
-}
-
 #[derive(Deserialize)]
 struct SellerQuery {
     /// Filter to one seller's rigs (`<address>` + its `<address>.<label>` rigs).
@@ -651,7 +637,7 @@ async fn create_order(
     // buyer pool (failover handled at the connect path). Billing is
     // pay-as-you-hash on measured delivered work, so a miner that doesn't come
     // back simply delivers less.
-    let reconnected = reconnect_all(&s, &req.worker).await;
+    let reconnected = s.registry.force_reconnect_all(&req.worker).await;
     Ok(Json(json!({
         "ok": true,
         "order": order_json(&order),
@@ -696,8 +682,8 @@ async fn set_order_pools(
     // The order is stored, so every reconnect resolves the new pools. An SV2
     // bundle rig is retired first: it is routed to this order already and
     // would take its miners back onto the replaced pool.
-    let retired = s.sv2_rigs.retire(&s.registry, &order.worker).await;
-    let reconnected = reconnect_all(&s, &order.worker).await + usize::from(retired);
+    let reconnected =
+        crate::control::reconnect_worker(&s.registry, &s.sv2_rigs, &order.worker).await;
     // Once more with the miners dropped: a share the replaced pool accepted
     // since the pools were stored would count as the new pools' first.
     let order = s.orders.restart_pool_rules(&id).await.unwrap_or(order);
@@ -718,7 +704,7 @@ async fn cancel_order(
         .cancel(&id)
         .await
         .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
-    let reconnected = reconnect_all(&s, &order.worker).await;
+    let reconnected = s.registry.force_reconnect_all(&order.worker).await;
     Ok(Json(json!({"ok": true, "reconnected": reconnected})))
 }
 

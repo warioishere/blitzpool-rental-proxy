@@ -13,6 +13,7 @@ mod chain;
 mod config;
 mod control;
 mod db;
+mod failback;
 mod hashrate;
 mod orders;
 mod probe;
@@ -94,6 +95,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let sv2_rigs: Arc<proto::sv2::relay::Sv2RigRegistry> = Default::default();
+    // Move rentals on their fallback pool back once their primary works again.
+    failback::spawn_failback(
+        orders.clone(),
+        registry.clone(),
+        sv2_rigs.clone(),
+        chain.clone(),
+    );
     let api_addr = std::env::var("RENTAL_PROXY_API").unwrap_or_else(|_| "127.0.0.1:8080".into());
     {
         let state = api::AppState {

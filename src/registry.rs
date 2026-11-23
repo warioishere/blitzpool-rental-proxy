@@ -67,6 +67,20 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    /// Force every session of `worker` to reconnect; returns how many were
+    /// connected. Each session re-resolves its upstream from current state on
+    /// reconnect (a new rental's buyer pool, or the idle pool after a rental
+    /// ends), so the caller MUST persist that state first. A clean reconnect,
+    /// rather than a live re-point, avoids miners that ignore a mid-session
+    /// extranonce change and keep wasting shares on the pool they left.
+    pub async fn force_reconnect_all(&self, worker: &str) -> usize {
+        let sessions = self.get_all(worker).await;
+        for session in &sessions {
+            session.force_reconnect();
+        }
+        sessions.len()
+    }
+
     /// Aggregated status of a rig: sums hashrate/work across its sessions, with
     /// routing/order taken from a rented session if any (the rig is "rented"
     /// when any session is). `None` if the rig has no connected sessions.

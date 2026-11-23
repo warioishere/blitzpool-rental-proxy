@@ -820,6 +820,12 @@ impl Sv2Session {
         self.reconnect.subscribe()
     }
 
+    /// The session's routing and the pool it relays to, read together.
+    pub async fn upstream(&self) -> (Routing, UpstreamTarget) {
+        let i = self.inner.lock().await;
+        (i.routing.clone(), i.active.target.clone())
+    }
+
     /// The rig's routing, if `generation` is still its active upstream.
     pub async fn routing_if_active(&self, generation: u64) -> Option<Routing> {
         let i = self.inner.lock().await;
@@ -2372,7 +2378,7 @@ pub async fn handle_seller_miner_sv2(
                 )
             };
             let upstream = match &active_order {
-                Some(o) => o.connect_with_fallback(install).await?,
+                Some(o) => o.connect_with_fallback(install).await?.0,
                 None => {
                     install(open_target.clone()).await?;
                     open_target.clone()

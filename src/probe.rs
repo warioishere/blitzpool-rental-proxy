@@ -375,6 +375,12 @@ pub(crate) mod tests {
         Refuse,
         /// Accept the login and never send a job.
         Silent,
+        /// Like `Job`, for a login as `worker` only; refuse any other.
+        JobFor {
+            worker: String,
+            height: u32,
+            prev: [u8; 32],
+        },
     }
 
     /// The SV1 `prevhash` field: the internal byte order with every 4-byte
@@ -410,9 +416,10 @@ pub(crate) mod tests {
                                 .to_string()
                         }
                         Some("mining.authorize") => match &mode {
+                            Sv1Pool::JobFor { worker, .. } if req["params"][0] != json!(worker) => json!({"id": id, "result": false, "error": [24, "Unauthorized worker", null]}).to_string(),
                             Sv1Pool::Refuse => json!({"id": id, "result": false, "error": [24, "Unauthorized worker", null]}).to_string(),
                             Sv1Pool::Silent => json!({"id": id, "result": true, "error": null}).to_string(),
-                            Sv1Pool::Job { height, prev } => {
+                            Sv1Pool::Job { height, prev } | Sv1Pool::JobFor { height, prev, .. } => {
                                 let h = height.to_le_bytes();
                                 let coinb1 = format!(
                                     "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2003{:02x}{:02x}{:02x}",
@@ -453,6 +460,42 @@ pub(crate) mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(mock_sv1_pool(listener, mode));
         target(addr)
+    }
+
+    /// `pool` behind a switch: while on, each connection is passed through to
+    /// `pool`; while off, each is closed at once. A pool that goes down and
+    /// comes back on one address, without freeing the port. Starts off.
+    pub(crate) async fn switchable(
+        pool: &UpstreamTarget,
+    ) -> (
+        UpstreamTarget,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let on = std::sync::Arc::new(AtomicBool::new(false));
+        let (switch, behind) = (on.clone(), pool.url.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                if !switch.load(Ordering::SeqCst) {
+                    continue; // dropped: closed
+                }
+                let behind = behind.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut up) = tokio::net::TcpStream::connect(behind).await {
+                        let _ = tokio::io::copy_bidirectional(&mut sock, &mut up).await;
+                    }
+                });
+            }
+        });
+        (
+            UpstreamTarget {
+                url: addr.to_string(),
+                ..pool.clone()
+            },
+            on,
+        )
     }
 
     /// An Electrum mock whose tip is block 1 (its header is the only one it
